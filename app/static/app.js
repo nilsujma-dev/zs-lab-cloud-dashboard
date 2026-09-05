@@ -1700,18 +1700,28 @@ function renderProbe(d) {
   block.appendChild(h('div', { class: 'section-title', style: 'margin-bottom:8px' }, 'Status probe'));
   const s = d.status;
   if (!s || typeof s !== 'object') { block.appendChild(h('div', { style: 'color:var(--text-faint);font-size:13px' }, 'No status probe output. It runs on demand and every interval while the use case is on.')); return block; }
-  const items = [];
+  const items = [], tables = [];
+  const tone = (v) => /authenticated|healthy|running|ok|^true$|enrolled/i.test(v) ? ' good' : /fail|error|down|^false$|unauth|missing|not enrolled/i.test(v) ? ' poor' : '';
+  const cell = (v) => v == null ? '—' : typeof v === 'object' ? JSON.stringify(v) : String(v);
   function walk(prefix, v) {
     if (v && typeof v === 'object' && !Array.isArray(v)) { for (const k of Object.keys(v)) walk(prefix ? prefix + '.' + k : k, v[k]); }
-    else if (Array.isArray(v)) items.push([prefix, v.map(x => typeof x === 'object' ? JSON.stringify(x) : String(x)).join(', ')]);
-    else items.push([prefix, String(v)]);
+    else if (Array.isArray(v) && v.length && v.every(x => x && typeof x === 'object' && !Array.isArray(x))) tables.push([prefix, v]);   // list of records -> table
+    else if (Array.isArray(v)) items.push([prefix, v.map(cell).join(', ')]);
+    else items.push([prefix, cell(v)]);
   }
   walk('', s);
   if (items.length > 24) { block.appendChild(h('pre', { class: 'probe-raw' }, JSON.stringify(s, null, 2))); return block; }
-  block.appendChild(h('div', { class: 'probe' }, items.map(([k, v]) => {
-    const good = /authenticated|healthy|running|ok|true|enrolled/i.test(v), poor = /fail|error|down|false|unauth|missing/i.test(v);
-    return h('div', { class: 'probe-item' }, h('span', { class: 'k' }, k), h('span', { class: 'v' + (good ? ' good' : poor ? ' poor' : '') }, v));
-  })));
+  block.appendChild(h('div', { class: 'probe' }, items.map(([k, v]) =>
+    h('div', { class: 'probe-item' }, h('span', { class: 'k' }, k), h('span', { class: 'v' + tone(v) }, v)))));
+  for (const [name, rows] of tables) {
+    // Columns in first-seen order; drop ids that only mean something to the backend.
+    const cols = [...new Set(rows.flatMap(r => Object.keys(r)))].filter(c => !/^(group_id|id)$/.test(c));
+    const t = h('table', { class: 'drawer-table probe-table' },
+      h('thead', null, h('tr', null, cols.map(c => h('th', null, c.replace(/_/g, ' '))))),
+      h('tbody', null, rows.map(r => h('tr', null, cols.map(c => { const v = cell(r[c]); return h('td', { class: /_ip$|^version$|enrolled_as/.test(c) ? 'mono' : '' }, h('span', { class: 'v' + tone(v) }, v)); })))));
+    block.appendChild(h('div', { class: 'section-title', style: 'margin:12px 0 6px' }, name + ' (' + rows.length + ')'));
+    block.appendChild(h('div', { class: 'table-scroll' }, t));
+  }
   return block;
 }
 

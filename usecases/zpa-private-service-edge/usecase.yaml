@@ -14,10 +14,10 @@ description: |                          # markdown; the card shows it
   PrivateLink, no VPN. Each route table holds one `0.0.0.0/0` entry plus its own
   implicit `local` route, so neither VPC has a route to the other.
 
-  | VPC | CIDR | Holds |
-  |---|---|---|
-  | **A** | `10.91.0.0/16` | The Private Service Edge (`10.91.10.5`, elastic IP) and a co-located App Connector (`10.91.10.64`), one public subnet |
-  | **B** | `10.90.0.0/16` | A NAT gateway (`10.90.0.0/24`), a **PRIV** zone (`10.90.20.0/24`: App Connector + nginx server) and an **MCU** zone (`10.90.30.0/24`: Windows client) |
+  - **VPC A — `10.91.0.0/16`.** The Private Service Edge (`10.91.10.5`, elastic IP) and a
+    co-located App Connector (`10.91.10.64`), one public subnet.
+  - **VPC B — `10.90.0.0/16`.** A NAT gateway (`10.90.0.0/24`), a PRIV zone (`10.90.20.0/24`:
+    App Connector + nginx server) and an MCU zone (`10.90.30.0/24`: Windows client).
 
   Traffic from VPC B reaches the PSE by leaving through the NAT gateway, crossing
   the public internet and arriving at the PSE's elastic IP. VPC A's own connector

@@ -1000,3 +1000,10 @@ tr.is-flash td { animation: flash-row 1.6s var(--ease); }
 .confirm-outline .ocol { padding-top: 4px; }
 .modal .ocol .steps { border: 0; padding: 0; }
 .modal-wide .modal-body { max-height: none; }
+
+/* status probe: arrays of records as tables */
+.probe-table { width: 100%; font-size: 12.5px; }
+.probe-table th { text-align: left; font-family: var(--mono); font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--text-muted); font-weight: 500; padding: 6px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+.probe-table td { padding: 6px 8px; border-bottom: 1px solid var(--border-soft, var(--border)); vertical-align: top; }
+.probe-table td.mono { font-family: var(--mono); }
+.table-scroll { overflow-x: auto; }
