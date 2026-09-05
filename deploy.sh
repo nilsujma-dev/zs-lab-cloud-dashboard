@@ -88,7 +88,9 @@ if [[ ! -f .env ]]; then
   # Fernet key: 32 random bytes, urlsafe base64.
   secret_key="$(openssl rand -base64 32 | tr '+/' '-_')"
   # 24-char alphanumeric operator password.
-  password="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)"
+  # cut consumes all of its input; a head(1) here would SIGPIPE tr and, under
+  # pipefail + errexit, abort the whole remote script without a message.
+  password="$(openssl rand -base64 36 | tr -dc 'A-Za-z0-9' | cut -c1-24)"
   [[ ${#password} -eq 24 ]] || die "password generation failed"
 
   umask 077
