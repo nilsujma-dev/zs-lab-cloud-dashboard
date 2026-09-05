@@ -283,3 +283,154 @@ gradients-for-the-sake-of-it. Keyboard focus visible. Works at 1280 and at 1920.
   for enrolment. Both verified once, end to end.
 - Nothing in `/data`, logs, or any API response contains a credential. Verified by grep.
 - `README.md` in the house format; repo indexed on the profile README; every commit pushed.
+
+---
+
+# v1.1 delta — region drawer, procedure outline, credentials for every cloud
+
+Three changes requested after v1 went live. Everything in v1 stands unless amended here.
+
+## A. Region drawer (Clouds page)
+
+Clicking a region tile that has resources opens a **drawer from the right edge** (not the
+full-width table below the grid, which is removed). The drawer is the detailed inventory for
+that region: every resource, with as much detail as the API gives us. Regions with nothing are
+not clickable.
+
+### Backend — richer inventory
+`GET /api/providers/aws/inventory` grows. Per region, in addition to v1 fields:
+
+```
+instances[]: + ami, ami_name, az, platform, architecture, iam_instance_profile,
+             key_name, security_groups:[{id,name}], subnet, vpc, root_device,
+             monitoring, ebs_optimized, volumes:[volume_id...], launched, uptime_h,
+             monthly_usd (this instance's compute line), user_data_present: bool
+volumes[]:   + az, iops, throughput, encrypted, attached_to (instance id|null), device,
+             created, monthly_usd
+vpcs[]:      + subnets:[{id,name,cidr,az,public:bool,route_table}], igw, nat_gateways:[ids],
+             route_tables:[{id,name,routes:[{dest,target}],subnets:[ids]}], dns_hostnames
+nat_gateways[]: + subnet, private_ip, connectivity_type, created, monthly_usd
+eips[]:      + allocation_id, association:{instance|nat|eni}|null, monthly_usd
+security_groups[]: NEW — {id,name,vpc,description,ingress:[{proto,from,to,source}],
+                          egress:[...], attached_to:[instance ids]}
+region.monthly_usd, region.resource_count
+```
+Every monetary field derives from the same Pricing lookups as `cost.lines`; the region total
+must equal the sum of its lines. Extra describe calls run inside the existing per-region thread.
+Keep the 10-minute cache. Do not add new API endpoints for this — it is the same inventory.
+
+### Frontend — the drawer
+- Slides in from the right, ~640px at 1280 / ~760px at 1920, backdrop dims the page, Esc and
+  the backdrop close it, focus is trapped inside while open, the trigger tile regains focus on
+  close. URL hash carries `#/clouds/aws/eu-central-1` so a drawer is deep-linkable and survives
+  refresh.
+- Header: region, monthly cost for the region, resource count, `generated_at`.
+- Body: collapsible sections **Instances · VPCs & subnets · NAT gateways · Elastic IPs ·
+  Volumes · Security groups**, each with a count in the heading, expanded by default only when
+  non-empty. Instances render as cards (name, id, type, state lamp, AZ, private/public IP,
+  launched + uptime, monthly cost) that expand to the full attribute set as a definition list,
+  with attached volumes and security groups linked to their sections. VPCs show subnets as a
+  table with their route table's default route (`0.0.0.0/0 → igw|nat|none`) so public vs
+  private is visible at a glance. Security groups show rules as a table.
+- Group by `Project` tag is preserved as a filter chip row at the top of the drawer.
+- A copy control on every id. Tags shown as chips. Idle EIPs and unattached volumes flagged.
+- Empty section states designed, not omitted.
+
+## B. Procedure outline (Use cases page)
+
+Before anything runs, the operator sees exactly what ON or OFF will do — from a real plan, plus
+what the manifest declares happens outside OpenTofu.
+
+### Manifest — declared effects
+```yaml
+effects:
+  "on":
+    creates:                      # outside terraform, in prose; the tofu plan supplies the rest
+      - "ZPA Service Edge Group, App Connector Groups and provisioning keys — reused by name if present"
+      - "Three SSM SecureString parameters under /zpa-lab/ holding the provisioning keys"
+    retains: []
+  "off":
+    destroys:
+      - "Everything OpenTofu manages in this use case (see plan)"
+    retains:
+      - "ZPA groups and provisioning keys — deleting them is deliberately manual"
+      - "SSM parameters under /zpa-lab/"
+      - "The S3 state object (versioned) and the remote lock"
+      - "Enrolled Service Edge / App Connector entries in ZPA, which show as disconnected"
+```
+`manifest.py` validates this block; both keys optional, lists of strings.
+
+### Backend — plan endpoint
+```
+GET /api/usecases/{id}/outline?action=on|off        (cached 60 s per action; 409 if a job runs)
+  -> {"action":"on",
+      "plan": {"ok":true, "generated_at":"…",
+               "create":[{"address":"aws_instance.pse","type":"aws_instance","name":"pse"}],
+               "update":[…], "destroy":[…], "unchanged":[…],
+               "summary":{"create":N,"update":N,"destroy":N,"unchanged":N}}
+              | {"ok":false,"error":"…"},
+      "declared": {…the manifest effects block for this action…},
+      "steps": [{"name":…,"run":…}],
+      "retained_state": {"backend":"s3","bucket":…,"key":…}}
+```
+`on` runs `tofu plan -json -input=false`; `off` runs `tofu plan -destroy -json -input=false`.
+Parse the JSON stream's `planned_change` records (`change.action`) and the final
+`change_summary`. Resources are grouped by `type` in the response order they arrive. A plan
+against a use case that is already **on** with no drift yields `create:[]` and
+`unchanged:[all]` — that is the correct answer, not an error. Run it in the checkout with the
+same env as a step. Never `apply`.
+
+### Frontend
+- The expanded card gets an **Outline** section with two columns, ON and OFF, each loading its
+  plan on expand (spinner, then content; a failed plan shows the error verbatim and still
+  shows the declared effects and steps).
+- Each column: **Steps** (numbered, as now) · **Generated / Destroyed** — the plan's resources
+  grouped by type with counts, e.g. `aws_instance × 5`, expandable to the addresses · **Already
+  present / Unchanged** count · **Outside OpenTofu** — the declared `creates`/`destroys` · **Kept**
+  — the declared `retains` plus the remote state line. For ON when the use case is on and the
+  plan is empty, the column reads *"Nothing to generate — 49 resources already present."*
+- The **confirmation modal** shows the same outline for the chosen action, not just the step
+  list, with a summary sentence at the top: *"OFF will destroy 49 AWS resources across 2 VPCs and
+  keep 4 things outside OpenTofu."* The confirm button is disabled until the plan has loaded.
+
+## C. Credentials for every cloud, rotatable
+
+- **AWS:** a connected jack shows **Rotate credentials** (as well as Disconnect). It opens the
+  same connect form; submitting runs the full checklist and, on success, replaces the stored
+  credentials atomically — inventory and use cases keep working throughout. On failure the old
+  credentials remain. `POST /api/providers/aws/connect` already does this; the UI just needs to
+  offer it while connected. Show "credentials updated <time>" on the jack.
+- **GCP and Azure become real providers** at the *connect* level: the jack's **Plug in** opens
+  a credential form, the backend validates and stores, the jack shows connected identity.
+  Inventory and cost for them return `{"supported": false, "reason": "…"}` and the UI shows a
+  designed "inventory not built for this provider yet" state — connected, honest, not disabled.
+  - `providers/gcp.py`: form = service-account JSON (pasted or uploaded) + optional project id.
+    Checks: JSON parses and is a service account; token obtainable; project resolvable
+    (`cloudresourcemanager.projects.get`); Compute API enabled (`compute.regions.list` on the
+    project, or a clear "API not enabled" detail). Identity: `client_email`, `project_id`.
+    Deps: `google-auth`, `google-api-python-client`.
+  - `providers/azure.py`: form = tenant id, client id, client secret, optional subscription id.
+    Checks: token from `ClientSecretCredential`; subscriptions listable; the chosen (or only)
+    subscription readable; Resource Manager reachable. Identity: tenant, subscription name +
+    id, client id. Deps: `azure-identity`, `azure-mgmt-resource`.
+  - Registry: `{"aws","gcp","azure"}`. `GET /api/providers` returns all three with
+    `capabilities: {"inventory": bool, "usecases": bool}` so the UI can be honest per provider.
+  - The provider form shape is described by the backend: `GET /api/providers/{id}/form`
+    → `{"fields":[{"name","label","type":"text|password|textarea|file","required","help"}]}`.
+    The UI renders forms from this; no provider-specific form code in the frontend.
+- Use cases whose `provider` has `capabilities.usecases == false` show why the switch is
+  unavailable, as now.
+
+## Definition of done (v1.1)
+- Clicking `eu-central-1` opens the drawer showing all five instances with full attributes,
+  both VPCs with subnets and default routes, the NAT, the EIPs with association, volumes, and
+  the security groups with rules; region cost equals the sum of its lines.
+- The PSE card's Outline shows ON = *nothing to generate, 49 present* and OFF = *destroy 49*,
+  grouped by type, with the four declared retentions; the OFF modal's summary sentence is
+  correct. No apply was run to produce this.
+- AWS: Rotate credentials with the same keys succeeds and nothing is interrupted; with a bad
+  secret it fails and the old credentials still work.
+- GCP and Azure: Plug in opens a rendered form; submitting empty fields is rejected client-side
+  with the field's help text; a fake credential fails the checklist with a clear detail.
+- Tests updated; `?mock=1` covers the drawer, the outline (both actions, plus a failed plan), and
+  all three provider forms.
