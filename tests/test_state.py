@@ -185,3 +185,9 @@ def test_tofu_init_failure_raises(engine_env) -> None:
     engine = _FakeTofuEngine(store, providers, JobRunner(store), root, output="Error: bad backend", code=1)
     with pytest.raises(TofuError, match="tofu init failed"):
         engine.tofu_init(manifest, {"PATH": "/usr/bin"})
+
+
+def test_parse_state_list_drops_data_sources():
+    from app.usecases.engine import UseCaseEngine
+    out = "aws_vpc.lab\ndata.aws_ami.al2023\nmodule.net.data.aws_caller_identity.me\naws_instance.pse\n"
+    assert UseCaseEngine.parse_state_list(out) == ["aws_vpc.lab", "aws_instance.pse"]

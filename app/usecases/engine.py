@@ -297,6 +297,12 @@ class Engine:
             line = raw.strip()
             if not line or line.startswith(("Warning:", "Error:", "│", "╷", "╵")):
                 continue
+            # Data sources live in state but are not infrastructure: never created by ON,
+            # never destroyed by OFF. Counting them would show "4 unchanged" on a destroy
+            # plan and inflate the card's resource count. Address forms: `data.x.y` or
+            # `module.m.data.x.y`.
+            if line.startswith("data.") or ".data." in line:
+                continue
             resources.append(line)
         return resources
 
