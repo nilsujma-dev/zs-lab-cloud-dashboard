@@ -158,7 +158,7 @@ def test_step_env_is_minimal(engine_env, monkeypatch: pytest.MonkeyPatch, tmp_pa
     monkeypatch.setenv("ZSCALER_API_KEY_FILE", str(key_file))
     engine = Engine(store, providers, JobRunner(store), root)
     env = engine.step_env(manifest, store.provider_credentials("aws"))
-    assert set(env) == {"PATH", "HOME", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_DEFAULT_REGION", "ZS_ISSUER", "ZS_CLIENT_ID", "ZPA_CUSTOMER_ID"}
+    assert set(env) == {"PATH", "HOME", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_DEFAULT_REGION", "ZS_ISSUER", "ZS_CLIENT_ID", "ZPA_CUSTOMER_ID", "NO_COLOR", "TF_IN_AUTOMATION", "TF_CLI_ARGS"}
     assert env["HOME"] == str(store.usecase_dir(manifest.id))
     assert env["AWS_SECRET_ACCESS_KEY"] == "s3cr3t-value"
     link = Path(env["HOME"]) / ".zscaler_api_key"

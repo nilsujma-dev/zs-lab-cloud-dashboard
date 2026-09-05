@@ -136,6 +136,10 @@ class Engine:
         env: dict[str, str] = {
             "PATH": os.environ.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
             "HOME": str(home),
+            # Non-interactive tooling: no ANSI colour in logs, no tofu prompts.
+            "NO_COLOR": "1",
+            "TF_IN_AUTOMATION": "1",
+            "TF_CLI_ARGS": "-no-color",
         }
         if credentials:
             env.update(self._providers[manifest.provider].credential_env(credentials))
