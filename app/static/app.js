@@ -119,7 +119,9 @@ function toast(msg, isError) {
   setTimeout(() => { t.style.opacity = '0'; t.style.transition = 'opacity .3s'; setTimeout(() => t.remove(), 320); }, isError ? 7000 : 3500);
 }
 
-/** Modal with focus trap; resolves true on confirm, false on cancel/escape. */
+/** Modal with focus trap; resolves true on confirm, false on cancel/escape.
+ *  opts.setup(ctl) runs after mount; ctl.enableConfirm(bool) gates the confirm button
+ *  (used while a plan is still loading), ctl.close(v) ends the modal programmatically. */
 function modal(opts) {
   return new Promise(resolve => {
     const root = $('#modal-root');
@@ -133,8 +135,8 @@ function modal(opts) {
       resolve(v);
     }
     const cancelBtn = h('button', { class: 'btn', type: 'button', onclick: () => finish(false) }, opts.cancelLabel || 'Cancel');
-    const okBtn = h('button', { class: 'btn ' + (opts.danger ? 'btn-danger' : 'btn-primary'), type: 'button', onclick: () => finish(true) }, opts.confirmLabel || 'Confirm');
-    const dlg = h('div', { class: 'modal', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'modal-title' },
+    const okBtn = h('button', { class: 'btn ' + (opts.danger ? 'btn-danger' : 'btn-primary'), type: 'button', disabled: !!opts.confirmDisabled, onclick: () => finish(true) }, opts.confirmLabel || 'Confirm');
+    const dlg = h('div', { class: 'modal' + (opts.wide ? ' modal-wide' : ''), role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'modal-title' },
       h('div', { class: 'modal-head' },
         h('div', { class: 'modal-title', id: 'modal-title' }, opts.title),
         opts.sub ? h('div', { class: 'modal-sub' }, opts.sub) : null),
@@ -144,7 +146,7 @@ function modal(opts) {
     function onKey(e) {
       if (e.key === 'Escape') { e.preventDefault(); finish(false); }
       if (e.key === 'Tab') {
-        const f = $$('button, [href], input, textarea, select, [tabindex]:not([tabindex="-1"])', dlg).filter(x => !x.disabled);
+        const f = $$('button, a[href], input, textarea, select, summary, [tabindex]:not([tabindex="-1"])', dlg).filter(x => !x.disabled);
         if (!f.length) return;
         const first = f[0], last = f[f.length - 1];
         if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
@@ -153,8 +155,33 @@ function modal(opts) {
     }
     document.addEventListener('keydown', onKey, true);
     root.appendChild(back);
-    (opts.confirmLabel === null ? cancelBtn : okBtn).focus();
+    (opts.confirmLabel === null || okBtn.disabled ? cancelBtn : okBtn).focus();
+    if (opts.setup) opts.setup({
+      enableConfirm(on) { okBtn.disabled = !on; okBtn.setAttribute('aria-disabled', String(!on)); },
+      close: finish, okBtn, cancelBtn, dialog: dlg,
+    });
   });
+}
+
+/** Copy-on-click control for an id. Falls back to a selection range when the clipboard API is unavailable. */
+function copyable(text, opts) {
+  opts = opts || {};
+  const btn = h('button', { class: 'copy' + (opts.cls ? ' ' + opts.cls : ''), type: 'button', title: 'Copy ' + text, 'aria-label': 'Copy ' + text, dataset: opts.fk ? { fk: opts.fk } : null,
+    onclick: async e => {
+      e.stopPropagation();
+      let ok = false;
+      try { await navigator.clipboard.writeText(text); ok = true; }
+      catch (err) {
+        try {
+          const ta = h('textarea', { style: 'position:fixed;opacity:0', 'aria-hidden': 'true' }, text);
+          document.body.appendChild(ta); ta.select(); ok = document.execCommand('copy'); ta.remove();
+        } catch (err2) { ok = false; }
+      }
+      btn.classList.add('is-copied'); setTimeout(() => btn.classList.remove('is-copied'), 1200);
+      toast(ok ? 'Copied ' + text : 'Could not copy — select it by hand.', !ok);
+    } },
+    h('span', { class: 'copy-text' }, opts.label || text), icon('copy', 'copy-ic'));
+  return btn;
 }
 
 /* ==========================================================================
@@ -198,11 +225,13 @@ const liveApi = {
   login:      (password) => request('POST', '/api/auth/login', { password }),
   logout:     () => request('POST', '/api/auth/logout'),
   providers:  () => request('GET', '/api/providers'),
-  connect:    (id, creds) => request('POST', '/api/providers/' + id + '/connect', creds),
-  disconnect: (id) => request('DELETE', '/api/providers/' + id),
-  inventory:  (id, refresh) => request('GET', '/api/providers/' + id + '/inventory?refresh=' + (refresh ? 1 : 0)),
+  providerForm: (id) => request('GET', '/api/providers/' + encodeURIComponent(id) + '/form'),
+  connect:    (id, creds) => request('POST', '/api/providers/' + encodeURIComponent(id) + '/connect', creds),
+  disconnect: (id) => request('DELETE', '/api/providers/' + encodeURIComponent(id)),
+  inventory:  (id, refresh) => request('GET', '/api/providers/' + encodeURIComponent(id) + '/inventory?refresh=' + (refresh ? 1 : 0)),
   usecases:   () => request('GET', '/api/usecases'),
   usecase:    (id) => request('GET', '/api/usecases/' + encodeURIComponent(id)),
+  outline:    (id, action) => request('GET', '/api/usecases/' + encodeURIComponent(id) + '/outline?action=' + encodeURIComponent(action)),
   flip:       (id, action) => request('POST', '/api/usecases/' + encodeURIComponent(id) + '/' + action),
   refreshUsecase: (id) => request('POST', '/api/usecases/' + encodeURIComponent(id) + '/refresh'),
   codeTree:   (id) => request('GET', '/api/usecases/' + encodeURIComponent(id) + '/code'),
@@ -221,12 +250,14 @@ const state = {
   route: 'clouds',
   authed: null,                 // null = unknown (booting)
   providers: null, providersErr: null, providersLoading: false,
-  inventory: null, invErr: null, invLoading: false,
-  connect: null,                // {stage:'form'|'checking'|'done', report, shown, error, busy}
-  openRegion: null,
+  inventories: {},              // providerId -> {data, err, loading}
+  connect: null,                // {provider, mode:'connect'|'rotate', stage:'loading'|'form'|'checking'|'done'|'error', fields, report, shown, error, busy}
+  openRegion: null,             // {provider, region} — mirrored in the URL hash
+  drawer: { sections: {}, inst: {}, project: null, focusKey: null },
   usecases: null, ucErr: null, ucLoading: false,
   expanded: null,               // use case id
   details: {},                  // id -> detail (+ _loading/_err)
+  outlines: {},                 // id -> {on:{loading,data,err}, off:{…}}
   jobs: {},                     // jobId -> {job, lines, next}
   jobFor: {},                   // usecaseId -> jobId being tailed
   code: {},                     // usecaseId -> {open, tree, commit, active, file, loading, err}
@@ -247,10 +278,17 @@ function onUnauthorised() {
 }
 
 function routeFromHash() {
-  const m = /^#\/([a-z]+)/.exec(location.hash);
+  const m = /^#\/([a-z]+)(?:\/([a-z0-9-]+)(?:\/([a-z0-9-]+))?)?/.exec(location.hash);
   return m ? m[1] : null;
 }
+/** #/clouds/<provider>/<region> -> {provider, region} | null */
+function regionFromHash() {
+  const m = /^#\/clouds\/([a-z0-9-]+)\/([a-z0-9-]+)/.exec(location.hash);
+  return m ? { provider: m[1], region: m[2] } : null;
+}
 function navigate(route) { location.hash = '#/' + route; }
+function openRegionDrawer(providerId, region) { location.hash = '#/clouds/' + providerId + '/' + region; }
+function closeRegionDrawer() { if (state.openRegion) location.hash = '#/clouds'; }
 
 async function boot() {
   const theme = PARAMS.get('theme');
@@ -294,11 +332,23 @@ function onRoute() {
   } else {
     stopJobTimers();
   }
-  if (state.route === 'clouds') {
-    if (!state.providers) loadProviders();
-  }
+  if (!state.providers && !state.providersLoading) loadProviders();
+  // region drawer follows the hash so it is deep-linkable and survives refresh
+  const wasOpen = state.openRegion;
+  const next = state.route === 'clouds' ? regionFromHash() : null;
+  const changed = JSON.stringify(wasOpen) !== JSON.stringify(next);
+  state.openRegion = next;
+  if (changed && wasOpen) { state.drawer = { sections: {}, inst: {}, project: null, focusKey: null }; } // switching regions starts fresh; a first open keeps deep-link state
   render();
-  $('#view').focus({ preventScroll: true });
+  if (next) {
+    if (changed) focusDrawer();
+  } else if (wasOpen) {
+    // closing: the tile that opened the drawer regains focus
+    const tile = $('[data-region-tile="' + CSS.escape(wasOpen.region) + '"]');
+    if (tile) tile.focus({ preventScroll: true }); else $('#view').focus({ preventScroll: true });
+  } else {
+    $('#view').focus({ preventScroll: true });
+  }
 }
 
 function tickClock() {
@@ -323,6 +373,7 @@ function render() {
   if (state.route === 'login') view.appendChild(renderLogin());
   else if (state.route === 'clouds') view.appendChild(renderClouds());
   else view.appendChild(renderUsecases());
+  renderDrawerRoot();
 }
 
 function renderLogin() {
@@ -356,31 +407,47 @@ function renderLogin() {
    5. render/clouds
    ========================================================================== */
 
+/* Display order and names for the patch panel while /api/providers is still loading.
+   Everything behavioural (status, identity, capabilities, form) comes from the API. */
 const PROVIDER_DEFS = [
-  { id: 'aws',   name: 'Amazon Web Services', wired: true },
-  { id: 'gcp',   name: 'Google Cloud',         wired: false },
-  { id: 'azure', name: 'Microsoft Azure',      wired: false },
+  { id: 'aws',   name: 'Amazon Web Services' },
+  { id: 'gcp',   name: 'Google Cloud' },
+  { id: 'azure', name: 'Microsoft Azure' },
 ];
+const DEFAULT_CAPS = { inventory: false, usecases: false };
 
 async function loadProviders() {
   state.providersLoading = true; state.providersErr = null;
   if (state.route === 'clouds') render();
   try {
     state.providers = await api.providers();
-    const aws = providerById('aws');
-    if (aws && aws.status === 'connected' && !state.inventory) loadInventory(false);
+    for (const p of state.providers) {
+      if (p.status === 'connected' && !state.inventories[p.id]) loadInventory(p.id, false);
+    }
   } catch (e) { if (e.status !== 401) state.providersErr = e.message; }
   state.providersLoading = false;
-  if (state.route === 'clouds') render();
+  render();
 }
 function providerById(id) { return (state.providers || []).find(p => p.id === id) || null; }
+function providerCaps(p) { return Object.assign({}, DEFAULT_CAPS, (p && p.capabilities) || {}); }
+function providerName(id) { const p = providerById(id); if (p && p.name) return p.name; const d = PROVIDER_DEFS.find(x => x.id === id); return d ? d.name : id; }
+function providerShort(id) { return id === 'aws' ? 'AWS' : id === 'gcp' ? 'GCP' : id === 'azure' ? 'Azure' : String(id).toUpperCase(); }
+/** The list the panel shows: API order, with any provider the API does not know about omitted. */
+function panelProviders() {
+  if (!state.providers) return PROVIDER_DEFS.map(d => Object.assign({ status: 'loading' }, d));
+  const known = new Map(state.providers.map(p => [p.id, p]));
+  const ordered = PROVIDER_DEFS.filter(d => known.has(d.id)).map(d => known.get(d.id));
+  for (const p of state.providers) if (!ordered.includes(p)) ordered.push(p);
+  return ordered;
+}
 
-async function loadInventory(refresh) {
-  state.invLoading = true; state.invErr = null;
+async function loadInventory(providerId, refresh) {
+  const slot = state.inventories[providerId] || (state.inventories[providerId] = { data: null, err: null, loading: false });
+  slot.loading = true; slot.err = null;
   if (state.route === 'clouds') render();
-  try { state.inventory = await api.inventory('aws', refresh); }
-  catch (e) { if (e.status !== 401) state.invErr = e.message; }
-  state.invLoading = false;
+  try { slot.data = await api.inventory(providerId, refresh); }
+  catch (e) { if (e.status !== 401) slot.err = e.message; }
+  slot.loading = false;
   if (state.route === 'clouds') render();
 }
 
@@ -400,30 +467,59 @@ function renderClouds() {
 
   // Patch panel
   const patch = h('div', { class: 'patch', role: 'list' });
-  for (const def of PROVIDER_DEFS) patch.appendChild(renderJack(def, providerById(def.id)));
+  for (const p of panelProviders()) patch.appendChild(renderJack(p));
   root.appendChild(patch);
 
   if (state.connect) root.appendChild(renderConnect());
 
-  const aws = providerById('aws');
-  if (aws && aws.status === 'connected' && !(state.connect && state.connect.stage !== 'done')) {
-    root.appendChild(renderInventory(aws));
+  const connected = (state.providers || []).filter(p => p.status === 'connected');
+  // a first connect takes the stage; a rotation keeps the inventory on screen — nothing is interrupted
+  const formBusy = state.connect && state.connect.stage !== 'done' && state.connect.mode !== 'rotate';
+  if (connected.length && !formBusy) {
+    // the honest "not built yet" strip sits right under the patch panel, then the real inventories
+    const rest = connected.filter(p => !providerCaps(p).inventory);
+    if (rest.length) root.appendChild(renderUnsupportedInventories(rest));
+    for (const p of connected.filter(p => providerCaps(p).inventory)) root.appendChild(renderInventory(p));
   } else if (!state.connect && state.providers) {
+    const first = state.providers.find(p => providerCaps(p).inventory) || state.providers[0];
     root.appendChild(h('div', { class: 'section' },
       h('div', { class: 'state-box' },
         h('div', { class: 'title' }, 'No line connected'),
-        h('div', null, 'Plug in AWS to validate credentials and pull an inventory across every enabled region.'),
-        h('button', { class: 'btn btn-primary', type: 'button', onclick: () => openConnect() }, icon('plug'), 'Plug in AWS'))));
+        h('div', null, 'Plug in a provider to validate credentials' + (first && providerCaps(first).inventory ? ' and pull an inventory across every enabled region.' : '.')),
+        first ? h('button', { class: 'btn btn-primary', type: 'button', onclick: () => openConnect(first.id, 'connect') }, icon('plug'), 'Plug in ' + providerShort(first.id)) : null)));
   } else if (!state.providers) {
     root.appendChild(h('div', { class: 'section' }, h('div', { class: 'skeleton', style: 'height:140px' })));
   }
   return root;
 }
 
-function socketSvg(live) {
+function renderUnsupportedInventories(providers) {
+  const wrap = h('div', { class: 'section' });
+  wrap.appendChild(h('div', { class: 'section-head' }, h('span', { class: 'section-title' }, providers.length === 1 ? 'Inventory · ' + providers[0].name : 'Inventory · other lines')));
+  const grid = h('div', { class: 'unsupported-grid' });
+  for (const p of providers) {
+    const slot = state.inventories[p.id] || {};
+    const d = slot.data;
+    const reason = d && d.supported === false && d.reason ? d.reason : 'Switchboard holds and validates the credentials, but the resource scan and cost estimate only exist for providers whose module declares the inventory capability.';
+    grid.appendChild(h('div', { class: 'unsupported panel', role: 'status' },
+      h('div', { class: 'unsupported-mark', 'aria-hidden': 'true' }, socketSvg(true, true)),
+      h('div', null,
+        h('div', { class: 'unsupported-title' }, 'Inventory not built for ', p.name, ' yet'),
+        h('div', { class: 'unsupported-sub' }, reason),
+        h('div', { class: 'unsupported-caps' },
+          capChip('connect', true), capChip('inventory', providerCaps(p).inventory), capChip('cost', providerCaps(p).inventory), capChip('use cases', providerCaps(p).usecases)))));
+  }
+  wrap.appendChild(grid);
+  return wrap;
+}
+function capChip(label, on) {
+  return h('span', { class: 'chip cap' + (on ? ' is-on' : ' is-off'), title: label + (on ? ': available' : ': not built yet') }, h('span', { class: 'lamp ' + (on ? 'ok' : '') }), label);
+}
+
+function socketSvg(live, small) {
   const ns = 'http://www.w3.org/2000/svg';
   const svg = document.createElementNS(ns, 'svg');
-  svg.setAttribute('viewBox', '0 0 72 72'); svg.setAttribute('class', 'jack-socket'); svg.setAttribute('aria-hidden', 'true');
+  svg.setAttribute('viewBox', '0 0 72 72'); svg.setAttribute('class', 'jack-socket' + (small ? ' sm' : '')); svg.setAttribute('aria-hidden', 'true');
   const mk = (tag, attrs) => { const e = document.createElementNS(ns, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); svg.appendChild(e); return e; };
   mk('circle', { cx: 36, cy: 36, r: 30, class: 'ring' });
   mk('circle', { cx: 36, cy: 36, r: 18, class: 'bore' });
@@ -436,142 +532,265 @@ function socketSvg(live) {
   return svg;
 }
 
-function renderJack(def, p) {
-  const connected = !!(p && p.status === 'connected');
-  const cls = 'jack' + (connected ? ' is-live' : '') + (!def.wired ? ' is-dead' : '');
-  const jack = h('div', { class: cls, role: 'listitem', 'aria-label': def.name + (connected ? ', connected' : def.wired ? ', unplugged' : ', not wired yet') });
+/** Identity lines for a connected jack: the API's identity_label first, then whatever else the identity carries. */
+function identityLines(p) {
+  const idn = p.identity || {};
+  const label = p.identity_label || idn.account || idn.client_email || idn.subscription_name || idn.name || idn.id || null;
+  const lines = [];
+  if (label) lines.push({ text: label, strong: true });
+  const seen = new Set([label]);
+  const order = ['alias', 'project_id', 'project_name', 'subscription_id', 'tenant_name', 'tenant', 'client_id', 'arn'];
+  const pretty = { alias: 'alias', project_id: 'project', project_name: null, subscription_id: 'subscription', tenant_name: 'tenant', tenant: 'tenant id', client_id: 'client', arn: null };
+  for (const k of order) {
+    const v = idn[k];
+    if (!v || seen.has(v)) continue;
+    seen.add(v);
+    lines.push({ text: String(v), key: pretty[k], long: k === 'arn' });
+    if (lines.length >= 4) break;
+  }
+  return lines;
+}
+
+function renderJack(p) {
+  const loading = p.status === 'loading';
+  const connected = p.status === 'connected';
+  const caps = providerCaps(p);
+  const cls = 'jack' + (connected ? ' is-live' : '') + (loading ? ' is-loading' : '');
+  const jack = h('div', { class: cls, role: 'listitem', 'aria-label': p.name + (connected ? ', connected' : loading ? ', reading' : ', unplugged') });
   jack.appendChild(socketSvg(connected));
-  const body = h('div');
-  body.appendChild(h('div', { class: 'jack-name' }, def.name));
-  if (!def.wired) {
-    body.appendChild(h('div', { class: 'jack-status' }, h('span', { class: 'lamp unknown' }), 'Not wired yet'));
-    body.appendChild(h('div', { class: 'jack-note' }, 'Provider module not built. The jack is here so the panel is honest about what it can and cannot connect.'));
-    body.appendChild(h('div', { class: 'jack-actions' }, h('button', { class: 'btn btn-sm', type: 'button', disabled: true, 'aria-disabled': 'true' }, icon('plug'), 'Plug in')));
+  const body = h('div', { class: 'jack-body' });
+  body.appendChild(h('div', { class: 'jack-name' }, p.name));
+  if (loading) {
+    body.appendChild(h('div', { class: 'jack-status' }, h('span', { class: 'lamp unknown' }), h('span', { class: 'state-word unknown' }, 'Reading')));
+    body.appendChild(h('div', { class: 'skeleton', style: 'height:12px;width:70%;margin-top:10px' }));
   } else if (connected) {
     body.appendChild(h('div', { class: 'jack-status' }, h('span', { class: 'lamp on' }), h('span', { class: 'state-word on' }, 'Line connected'),
-      p.connected_at ? h('span', { class: 'mono', style: 'color:var(--text-faint);font-size:12px' }, 'since ', h('span', { dataset: { rel: p.connected_at } }, fmtRel(p.connected_at))) : null));
-    const idn = p.identity || {};
-    body.appendChild(h('div', { class: 'jack-id' }, h('div', null, 'account ', idn.account || '—', idn.alias ? ' (' + idn.alias + ')' : ''), h('div', { class: 'jack-arn', title: idn.arn || '' }, idn.arn || '')));
+      p.connected_at ? h('span', { class: 'mono jack-since' }, 'since ', h('span', { dataset: { rel: p.connected_at }, title: fmtTime(p.connected_at) }, fmtRel(p.connected_at))) : null));
+    const lines = identityLines(p);
+    body.appendChild(h('div', { class: 'jack-id' }, lines.length ? lines.map(l => h('div', { class: l.long ? 'jack-arn' : '', title: l.long ? l.text : null },
+      l.key ? h('span', { class: 'k' }, l.key + ' ') : null, l.strong ? h('b', null, l.text) : l.text)) : h('div', { class: 'k' }, 'identity not reported')));
+    if (p.credentials_updated_at && p.credentials_updated_at !== p.connected_at) {
+      body.appendChild(h('div', { class: 'jack-note jack-rotated' }, icon('rotate'), 'credentials updated ', h('span', { dataset: { rel: p.credentials_updated_at }, title: fmtTime(p.credentials_updated_at) }, fmtRel(p.credentials_updated_at))));
+    }
+    if (!caps.inventory || !caps.usecases) {
+      body.appendChild(h('div', { class: 'jack-caps' },
+        capChip('inventory', caps.inventory), capChip('use cases', caps.usecases)));
+    }
     body.appendChild(h('div', { class: 'jack-actions' },
-      h('button', { class: 'btn btn-sm btn-danger', type: 'button', onclick: () => disconnectAws() }, 'Disconnect')));
+      h('button', { class: 'btn btn-sm', type: 'button', onclick: () => openConnect(p.id, 'rotate') }, icon('rotate'), 'Rotate credentials'),
+      h('button', { class: 'btn btn-sm btn-danger', type: 'button', onclick: () => disconnectProvider(p) }, 'Disconnect')));
   } else {
     body.appendChild(h('div', { class: 'jack-status' }, h('span', { class: 'lamp' }), h('span', { class: 'state-word off' }, 'Unplugged')));
-    body.appendChild(h('div', { class: 'jack-note' }, 'Access key, secret and an optional session token. Checked live, stored encrypted.'));
+    body.appendChild(h('div', { class: 'jack-note' }, caps.inventory
+      ? 'Credentials are checked live before anything is stored, then an inventory is pulled across every enabled region.'
+      : 'Credentials are checked live and stored encrypted. Inventory and use cases for this provider are not built yet; the connection is real.'));
     body.appendChild(h('div', { class: 'jack-actions' },
-      h('button', { class: 'btn btn-sm btn-primary', type: 'button', onclick: () => openConnect() }, icon('plug'), 'Plug in')));
+      h('button', { class: 'btn btn-sm btn-primary', type: 'button', onclick: () => openConnect(p.id, 'connect') }, icon('plug'), 'Plug in')));
   }
   jack.appendChild(body);
   return jack;
 }
 
-function openConnect() {
-  state.connect = { stage: 'form', report: null, shown: 0, error: null, busy: false };
+/** Open the credential form for a provider. mode = 'connect' | 'rotate' (same form, same checklist; rotate keeps the old credentials on failure). */
+async function openConnect(providerId, mode) {
+  const c = { provider: providerId, mode: mode || 'connect', stage: 'loading', fields: null, values: {}, fieldErrors: {}, report: null, shown: 0, error: null, busy: false };
+  state.connect = c;
   render();
-  setTimeout(() => { const i = $('#ak'); if (i) i.focus(); }, 0);
+  try {
+    const f = await api.providerForm(providerId);
+    if (state.connect !== c) return;
+    c.fields = (f && f.fields) || [];
+    c.stage = 'form';
+  } catch (e) {
+    if (e.status === 401) return;
+    if (state.connect !== c) return;
+    c.stage = 'error'; c.error = 'Could not load the credential form: ' + e.message;
+  }
+  render();
+  setTimeout(() => { const i = $('.connect [data-first-field]'); if (i) i.focus(); }, 0);
 }
 
-async function disconnectAws() {
+async function disconnectProvider(p) {
   const ok = await modal({
-    title: 'Disconnect AWS?',
+    title: 'Disconnect ' + p.name + '?',
     sub: 'Switchboard forgets the stored credentials and the cached inventory. Nothing in the cloud is touched.',
-    body: h('p', { style: 'color:var(--text-dim)' }, 'Use cases on this provider become unavailable until a line is plugged in again.'),
+    body: h('p', { style: 'color:var(--text-dim)' }, providerCaps(p).usecases ? 'Use cases on this provider become unavailable until a line is plugged in again.' : 'The jack goes back to unplugged; plug it in again with new credentials at any time.'),
     confirmLabel: 'Disconnect', danger: true,
   });
   if (!ok) return;
   try {
-    await api.disconnect('aws');
-    state.inventory = null; state.openRegion = null; state.connect = null;
-    toast('AWS line disconnected.');
+    await api.disconnect(p.id);
+    delete state.inventories[p.id];
+    state.connect = null;
+    if (state.openRegion && state.openRegion.provider === p.id) closeRegionDrawer();
+    toast(p.name + ' line disconnected.');
     await loadProviders();
   } catch (e) { if (e.status !== 401) toast(e.message, true); }
 }
 
 function renderConnect() {
   const c = state.connect;
-  const wrap = h('div', { class: 'connect panel' });
+  const p = providerById(c.provider) || { id: c.provider, name: providerName(c.provider) };
+  const caps = providerCaps(p);
+  const rotate = c.mode === 'rotate';
+  const wrap = h('div', { class: 'connect panel', 'aria-label': (rotate ? 'Rotate credentials for ' : 'Plug in ') + p.name });
+  const title = rotate ? 'Rotate credentials for ' + p.name : 'Plug in ' + p.name;
+  const sub = rotate
+    ? 'The full checklist runs against the new credentials. On success they replace the stored ones atomically; on failure the old ones stay and nothing is interrupted.'
+    : 'Every check runs live before anything is stored. Credentials are Fernet-encrypted at rest and never leave the server.';
+
+  if (c.stage === 'loading') {
+    wrap.appendChild(h('div', { class: 'panel-body' },
+      h('div', { class: 'connect-title' }, title),
+      h('div', { class: 'connect-sub' }, sub),
+      h('div', { class: 'form-grid' }, [1, 2, 3].map(() => h('div', { class: 'field' }, h('div', { class: 'skeleton', style: 'height:12px;width:40%' }), h('div', { class: 'skeleton', style: 'height:34px' })))),
+      h('div', { class: 'form-actions' }, h('span', { class: 'loading' }, 'Loading form'))));
+    return wrap;
+  }
+
   if (c.stage === 'form') {
     const err = h('div', { class: 'form-error', role: 'alert', hidden: !c.error }, c.error || '');
-    const f = {};
-    const form = h('form', { onsubmit: e => { e.preventDefault(); submitConnect(f); } },
-      h('div', { class: 'connect-title' }, 'Plug in Amazon Web Services'),
-      h('div', { class: 'connect-sub' }, 'Paste the credentials from your SSO session. They are checked against STS, EC2, Pricing and the state bucket before anything is stored.'),
-      h('div', { class: 'form-grid' },
-        h('div', { class: 'field' }, h('label', { for: 'ak' }, 'Access key ID'), f.ak = h('input', { class: 'input', id: 'ak', autocomplete: 'off', spellcheck: 'false', required: true, placeholder: 'ASIA…' })),
-        h('div', { class: 'field' }, h('label', { for: 'sk' }, 'Secret access key'), f.sk = h('input', { class: 'input', id: 'sk', type: 'password', autocomplete: 'off', required: true, placeholder: '••••••••' })),
-        h('div', { class: 'field span-2' }, h('label', { for: 'st' }, 'Session token ', h('span', { class: 'hint' }, '(optional — required for SSO / temporary credentials)')), f.st = h('textarea', { class: 'input', id: 'st', rows: 3, autocomplete: 'off', spellcheck: 'false', placeholder: 'IQoJb3JpZ2luX2Vj…' })),
-        h('div', { class: 'field span-2' }, h('label', { for: 'rg' }, 'Regions ', h('span', { class: 'hint' }, '(optional, comma separated; blank = every enabled region)')), f.rg = h('input', { class: 'input', id: 'rg', autocomplete: 'off', spellcheck: 'false', placeholder: 'eu-central-1, eu-west-1' }))),
+    const inputs = {};
+    const fields = (c.fields || []).map((f, i) => renderField(f, c, inputs, i === 0));
+    const extra = [];
+    if (caps.inventory) {
+      // Regions to scan are part of the connect body for inventory-capable providers; blank = every enabled region.
+      extra.push(h('div', { class: 'field span-2' },
+        h('label', { for: 'cf-regions' }, 'Regions ', h('span', { class: 'hint' }, '(optional, comma separated; blank = every enabled region)')),
+        inputs.__regions = h('input', { class: 'input', id: 'cf-regions', autocomplete: 'off', spellcheck: 'false', placeholder: 'eu-central-1, eu-west-1', value: c.values.__regions || '' })));
+    }
+    const form = h('form', { novalidate: true, onsubmit: e => { e.preventDefault(); submitConnect(inputs); } },
+      h('div', { class: 'connect-title' }, title),
+      h('div', { class: 'connect-sub' }, sub),
+      h('div', { class: 'form-grid' }, fields, extra),
       err,
       h('div', { class: 'form-actions' },
-        f.btn = h('button', { class: 'btn btn-primary' + (c.busy ? ' is-busy' : ''), type: 'submit', disabled: c.busy }, icon('plug'), 'Plug in and check'),
-        h('button', { class: 'btn btn-ghost', type: 'button', onclick: () => { state.connect = null; render(); } }, 'Cancel')));
+        inputs.__btn = h('button', { class: 'btn btn-primary' + (c.busy ? ' is-busy' : ''), type: 'submit', disabled: c.busy }, icon(rotate ? 'rotate' : 'plug'), rotate ? 'Rotate and check' : 'Plug in and check'),
+        h('button', { class: 'btn btn-ghost', type: 'button', onclick: () => { state.connect = null; render(); } }, 'Cancel'),
+        h('span', { class: 'form-req-note' }, 'Required fields are marked')));
     wrap.appendChild(h('div', { class: 'panel-body' }, form));
     return wrap;
   }
-  // checking / done
+
+  // checking / done / error
   const rep = c.report;
   const list = h('ol', { class: 'checks', 'aria-live': 'polite' });
-  const names = rep ? rep.checks.map(x => x.name) : PLACEHOLDER_CHECKS;
-  names.forEach((name, i) => {
-    const chk = rep ? rep.checks[i] : null;
-    let cls = 'check';
-    if (i < c.shown && chk) cls += ' is-done ' + (chk.ok ? 'ok' : 'bad');
-    else if (i === c.shown && c.stage === 'checking') cls += ' is-running';
-    list.appendChild(h('li', { class: cls },
-      h('span', { class: 'check-mark' }, chk && i < c.shown ? icon(chk.ok ? 'check' : 'x') : null),
-      h('span', { class: 'check-name' }, name),
-      h('span', { class: 'check-detail' }, chk && i < c.shown ? (chk.detail || '') : '')));
-  });
+  if (rep) {
+    rep.checks.forEach((chk, i) => {
+      let cls = 'check';
+      if (i < c.shown) cls += ' is-done ' + (chk.ok ? 'ok' : 'bad');
+      else if (i === c.shown && c.stage === 'checking') cls += ' is-running';
+      list.appendChild(h('li', { class: cls },
+        h('span', { class: 'check-mark' }, i < c.shown ? icon(chk.ok ? 'check' : 'x') : null),
+        h('span', { class: 'check-name' }, chk.name),
+        h('span', { class: 'check-detail', title: chk.detail || '' }, i < c.shown ? (chk.detail || '') : '')));
+    });
+  } else if (c.stage === 'checking') {
+    list.appendChild(h('li', { class: 'check is-running' }, h('span', { class: 'check-mark' }), h('span', { class: 'check-name' }, 'Contacting ' + p.name), h('span', { class: 'check-detail' }, '')));
+  }
+  const idLabel = rep && rep.identity ? (rep.identity.account || rep.identity.client_email || rep.identity.subscription_name || rep.identity.project_id || null) : null;
   const body = h('div', { class: 'panel-body' },
-    h('div', { class: 'connect-title' }, 'Checking the line'),
-    h('div', { class: 'connect-sub' }, rep && rep.identity && rep.identity.account ? ['account ', h('span', { class: 'mono' }, rep.identity.account)] : 'Running each check against AWS…'),
+    h('div', { class: 'connect-title' }, rotate ? 'Checking the new credentials' : 'Checking the line'),
+    h('div', { class: 'connect-sub' }, idLabel ? ['identity ', h('span', { class: 'mono' }, idLabel)] : 'Running each check against ' + p.name + '…'),
     list);
+  const back = () => { state.connect = Object.assign({}, c, { stage: 'form', report: null, shown: 0, error: null, busy: false, fieldErrors: {} }); render(); };
   if (c.stage === 'done' && rep) {
     const failed = rep.checks.filter(x => !x.ok);
     if (rep.ok) {
       body.appendChild(h('div', { class: 'check-summary ok' },
-        h('div', null, h('strong', null, 'Line connected'), h('div', { class: 'sub' }, 'Credentials stored encrypted. Pulling the inventory now.')),
+        h('div', null, h('strong', null, rotate ? 'Credentials updated' : 'Line connected'),
+          h('div', { class: 'sub' }, rotate ? 'The new credentials replaced the old ones. Nothing was interrupted.' : caps.inventory ? 'Credentials stored encrypted. Pulling the inventory now.' : 'Credentials stored encrypted. Inventory is not built for this provider yet.')),
         h('span', { class: 'lamp on lg' })));
     } else {
       body.appendChild(h('div', { class: 'check-summary bad' },
-        h('div', null, h('strong', null, failed.length === 1 ? 'One check failed — nothing was stored' : failed.length + ' checks failed — nothing was stored'),
+        h('div', null, h('strong', null, (failed.length === 1 ? 'One check failed' : failed.length + ' checks failed') + (rotate ? ' — the old credentials remain in place' : ' — nothing was stored')),
           h('div', { class: 'sub' }, failed.map(x => x.name + (x.detail ? ': ' + x.detail : '')).join(' · '))),
         h('div', { style: 'display:flex;gap:8px' },
-          h('button', { class: 'btn', type: 'button', onclick: () => { state.connect = { stage: 'form', report: null, shown: 0, error: null, busy: false }; render(); } }, 'Try again'),
+          h('button', { class: 'btn', type: 'button', onclick: back }, 'Try again'),
           h('button', { class: 'btn btn-ghost', type: 'button', onclick: () => { state.connect = null; render(); } }, 'Close'))));
     }
   } else if (c.stage === 'error') {
     body.appendChild(h('div', { class: 'check-summary bad' },
       h('div', null, h('strong', null, 'Could not run the checks'), h('div', { class: 'sub' }, c.error)),
-      h('button', { class: 'btn', type: 'button', onclick: () => { state.connect = { stage: 'form', report: null, shown: 0, error: null, busy: false }; render(); } }, 'Back')));
+      h('div', { style: 'display:flex;gap:8px' },
+        c.fields ? h('button', { class: 'btn', type: 'button', onclick: back }, 'Back') : h('button', { class: 'btn', type: 'button', onclick: () => openConnect(c.provider, c.mode) }, 'Retry'),
+        h('button', { class: 'btn btn-ghost', type: 'button', onclick: () => { state.connect = null; render(); } }, 'Close'))));
   }
   wrap.appendChild(body);
   return wrap;
 }
 
-const PLACEHOLDER_CHECKS = ['Credentials valid (STS)', 'Can list regions', 'Can describe EC2', 'Pricing API reachable', 'State bucket ready', 'Session token expiry'];
+/** One form field from the provider's form description. Types: text | password | textarea | file.
+ *  `file` is a textarea plus an upload control that reads the chosen file into the textarea client-side. */
+function renderField(f, c, inputs, first) {
+  const id = 'cf-' + f.name;
+  const errId = id + '-err';
+  const fieldErr = c.fieldErrors[f.name];
+  const wide = f.type === 'textarea' || f.type === 'file';
+  const common = { class: 'input' + (fieldErr ? ' is-invalid' : ''), id, autocomplete: 'off', spellcheck: 'false', 'aria-invalid': fieldErr ? 'true' : null, 'aria-describedby': errId, 'aria-required': f.required ? 'true' : null, 'data-first-field': first ? '' : null };
+  let input;
+  if (f.type === 'textarea' || f.type === 'file') input = h('textarea', Object.assign(common, { rows: f.type === 'file' ? 6 : 3, placeholder: f.type === 'file' ? 'Paste the file contents, or upload it' : '' }), c.values[f.name] || '');
+  else input = h('input', Object.assign(common, { type: f.type === 'password' ? 'password' : 'text', value: c.values[f.name] || '' }));
+  inputs[f.name] = input;
+  const label = h('label', { for: id }, f.label, f.required ? h('span', { class: 'req', title: 'required', 'aria-hidden': 'true' }, ' *') : h('span', { class: 'hint' }, ' (optional)'));
+  const parts = [label];
+  if (f.type === 'file') {
+    const fileIn = h('input', { type: 'file', id: id + '-file', class: 'visually-hidden', accept: '.json,.txt,.pem,.key,application/json,text/plain', tabindex: '-1',
+      onchange: e => {
+        const file = e.target.files && e.target.files[0];
+        if (!file) return;
+        if (file.size > 512 * 1024) { setFieldError(c, f.name, 'That file is larger than 512 KB, which is not a credential file.'); render(); return; }
+        const rd = new FileReader();
+        rd.onload = () => { input.value = String(rd.result || ''); c.values[f.name] = input.value; clearFieldError(c, f.name); nameEl.textContent = file.name + ' · ' + fmtSize(file.size); nameEl.hidden = false; };
+        rd.onerror = () => { setFieldError(c, f.name, 'Could not read ' + file.name + '.'); render(); };
+        rd.readAsText(file);
+      } });
+    const nameEl = h('span', { class: 'file-name mono', hidden: true });
+    parts.push(h('div', { class: 'file-row' },
+      h('button', { class: 'btn btn-sm', type: 'button', onclick: () => fileIn.click() }, icon('upload'), 'Upload file'),
+      fileIn, nameEl,
+      h('span', { class: 'hint' }, 'Read in the browser; only the contents are sent.')));
+  }
+  parts.push(input);
+  parts.push(h('div', { class: 'field-msg' + (fieldErr ? ' is-error' : ''), id: errId, role: fieldErr ? 'alert' : null }, fieldErr || f.help || ''));
+  return h('div', { class: 'field' + (wide ? ' span-2' : '') + (fieldErr ? ' has-error' : '') }, parts);
+}
+function setFieldError(c, name, msg) { c.fieldErrors[name] = msg; }
+function clearFieldError(c, name) { delete c.fieldErrors[name]; }
 
-async function submitConnect(f) {
+async function submitConnect(inputs) {
   const c = state.connect;
-  const regions = f.rg.value.split(',').map(s => s.trim()).filter(Boolean);
-  const creds = {
-    access_key_id: f.ak.value.trim(),
-    secret_access_key: f.sk.value,
-    session_token: f.st.value.trim() || null,
-    regions: regions.length ? regions : null,
-  };
-  c.busy = true; c.error = null; f.btn.classList.add('is-busy'); f.btn.disabled = true;
-  // Show the checklist immediately, spinning on line 1, while the request is in flight.
-  state.connect = { stage: 'checking', report: null, shown: 0, error: null, busy: true };
+  const fields = c.fields || [];
+  // remember what was typed so a failed attempt can be corrected rather than retyped
+  for (const f of fields) c.values[f.name] = inputs[f.name].value;
+  if (inputs.__regions) c.values.__regions = inputs.__regions.value;
+  // client-side required-field validation: the field's own help text is the error
+  c.fieldErrors = {};
+  let firstBad = null;
+  for (const f of fields) {
+    const v = (inputs[f.name].value || '').trim();
+    if (f.required && !v) { c.fieldErrors[f.name] = f.help || (f.label + ' is required.'); if (!firstBad) firstBad = f.name; }
+  }
+  if (firstBad) {
+    c.error = 'Fill in the required fields.'; render();
+    setTimeout(() => { const el = $('#cf-' + CSS.escape(firstBad)); if (el) el.focus(); }, 0);
+    return;
+  }
+  const body = {};
+  for (const f of fields) { const v = inputs[f.name].value; body[f.name] = f.type === 'password' ? v : v.trim(); if (!body[f.name]) body[f.name] = null; }
+  if (inputs.__regions) { const rg = inputs.__regions.value.split(',').map(s => s.trim()).filter(Boolean); body.regions = rg.length ? rg : null; }
+  const cc = Object.assign({}, c, { stage: 'checking', report: null, shown: 0, error: null, busy: true });
+  state.connect = cc;
   render();
   let report;
-  try { report = await api.connect('aws', creds); }
+  try { report = await api.connect(c.provider, body); }
   catch (e) {
     if (e.status === 401) return;
-    state.connect = { stage: 'error', report: null, shown: 0, error: e.message, busy: false };
+    if (state.connect !== cc) return;
+    state.connect = Object.assign({}, cc, { stage: 'error', error: e.message, busy: false });
     render(); return;
   }
-  const cc = state.connect;
-  if (!cc || cc.stage !== 'checking') return; // cancelled meanwhile
+  if (state.connect !== cc) return; // cancelled meanwhile
   cc.report = report;
   // Fill in one line at a time. Stop early on the first failure so the eye lands on it.
   for (let i = 0; i < report.checks.length; i++) {
@@ -581,8 +800,7 @@ async function submitConnect(f) {
     cc.shown = i + 1; render();
     if (!report.checks[i].ok && report.ok === false) {
       const rest = report.checks.slice(i + 1);
-      // Non-required checks that still ran are shown after a beat; required failures end the sequence.
-      if (rest.some(x => !x.ok)) { /* continue to reveal others */ } else { break; }
+      if (!rest.some(x => !x.ok)) break;
     }
     await sleep(90);
   }
@@ -593,41 +811,45 @@ async function submitConnect(f) {
     await sleep(900);
     if (state.connect !== cc) return;
     state.connect = null;
+    if (cc.mode === 'rotate') toast('Credentials updated for ' + providerName(cc.provider) + '.');
     await loadProviders();
-    await loadInventory(true);
+    const p = providerById(cc.provider);
+    if (p && p.status === 'connected' && cc.mode !== 'rotate') await loadInventory(cc.provider, providerCaps(p).inventory);
   }
 }
 
 function renderInventory(p) {
-  const wrap = h('div', { class: 'section' });
-  const inv = state.inventory;
+  const wrap = h('div', { class: 'section', dataset: { inventory: p.id } });
+  const slot = state.inventories[p.id] || {};
+  const inv = slot.data && slot.data.supported !== false ? slot.data : null;
   const head = h('div', { class: 'section-head' },
     h('div', { class: 'inv-toolbar' },
-      h('span', { class: 'section-title' }, 'Inventory'),
+      h('span', { class: 'section-title' }, 'Inventory · ', providerShort(p.id)),
       inv ? h('span', { class: 'inv-meta' },
         'generated ', h('span', { class: 'mono', title: inv.generated_at }, fmtTime(inv.generated_at)),
         h('span', { style: 'color:var(--text-faint)' }, '(', h('span', { dataset: { rel: inv.generated_at } }, fmtRel(inv.generated_at)), ')'),
-        inv.stale ? h('span', { class: 'badge badge-stale', title: 'Served from cache older than 10 minutes' }, 'STALE') : null) : null,
-      state.invLoading ? h('span', { class: 'loading' }, 'Scanning regions') : null),
-    h('button', { class: 'btn btn-sm', type: 'button', disabled: state.invLoading, onclick: () => loadInventory(true) }, icon('refresh'), 'Refresh'));
+        inv.stale ? h('span', { class: 'badge badge-stale', title: inv.error || 'Served from cache older than 10 minutes' }, 'STALE') : null) : null,
+      slot.loading ? h('span', { class: 'loading' }, 'Scanning regions') : null),
+    h('button', { class: 'btn btn-sm', type: 'button', disabled: !!slot.loading, onclick: () => loadInventory(p.id, true) }, icon('refresh'), 'Refresh'));
   wrap.appendChild(head);
 
-  if (state.invErr) {
+  if (slot.err && !inv) {
     wrap.appendChild(h('div', { class: 'state-box is-error' },
-      h('div', { class: 'title' }, 'Inventory failed'), h('div', null, state.invErr),
-      h('button', { class: 'btn', type: 'button', onclick: () => loadInventory(true) }, 'Retry')));
+      h('div', { class: 'title' }, 'Inventory failed'), h('div', null, slot.err),
+      h('button', { class: 'btn', type: 'button', onclick: () => loadInventory(p.id, true) }, 'Retry')));
     return wrap;
   }
   if (!inv) {
     wrap.appendChild(h('div', { class: 'totals' }, [1, 2, 3, 4, 5, 6].map(() => h('div', { class: 'total' }, h('div', { class: 'skeleton', style: 'height:12px;width:60%' }), h('div', { class: 'skeleton', style: 'height:26px;width:40%;margin-top:8px' })))));
-    wrap.appendChild(h('div', { class: 'regions', style: 'margin-top:16px' }, (p.regions || new Array(8).fill('')).map(() => h('div', { class: 'skeleton', style: 'height:90px' }))));
+    wrap.appendChild(h('div', { class: 'regions', style: 'margin-top:16px' }, (p.regions && p.regions.length ? p.regions : new Array(8).fill('')).map(() => h('div', { class: 'skeleton', style: 'height:90px' }))));
     return wrap;
   }
+  if (slot.err) wrap.appendChild(h('div', { class: 'form-error', style: 'margin-bottom:12px' }, 'Last refresh failed: ' + slot.err + ' — showing the previous scan.'));
 
   const t = inv.totals || {};
   wrap.appendChild(h('div', { class: 'totals' },
     total('Instances', t.instances, typeof t.running === 'number' ? (t.running === t.instances && t.instances > 0 ? 'all running' : t.running + ' running') : null),
-    total('VPCs', t.vpcs),
+    total('VPCs', t.vpcs, typeof t.subnets === 'number' ? t.subnets + ' subnets' : null),
     total('NAT gateways', t.nat_gateways),
     total('Elastic IPs', t.eips),
     total('Volumes', t.volumes_gb, 'GB'),
@@ -635,14 +857,12 @@ function renderInventory(p) {
 
   const grid = h('div', { class: 'grid-2', style: 'margin-top:20px' });
   const left = h('div');
-  // region grid: union of scanned regions (inventory) and provider regions, so empty tiles are present
-  const regionMap = new Map();
-  (p.regions || []).forEach(r => regionMap.set(r, { region: r, instances: [], vpcs: [], nat_gateways: [], eips: [], volumes: [] }));
-  (inv.regions || []).forEach(r => regionMap.set(r.region, r));
-  const regions = Array.from(regionMap.values()).sort((a, b) => weight(b) - weight(a) || a.region.localeCompare(b.region));
-  left.appendChild(h('div', { class: 'section-head' }, h('span', { class: 'section-title' }, regions.length + ' regions scanned')));
+  const regions = regionList(p, inv);
+  left.appendChild(h('div', { class: 'section-head' },
+    h('span', { class: 'section-title' }, regions.length + ' regions scanned'),
+    h('span', { class: 'inv-hint' }, 'Open a region for every resource in it')));
   const rg = h('div', { class: 'regions' });
-  for (const r of regions) rg.appendChild(renderRegionTile(r));
+  for (const r of regions) rg.appendChild(renderRegionTile(p, r));
   left.appendChild(rg);
   grid.appendChild(left);
 
@@ -651,9 +871,14 @@ function renderInventory(p) {
   right.appendChild(renderGroups(inv));
   grid.appendChild(right);
   wrap.appendChild(grid);
-  const open = regions.find(r => r.region === state.openRegion);
-  if (open) wrap.appendChild(renderRegionDetail(open));
   return wrap;
+}
+/** Union of scanned regions and the provider's enabled regions, so empty tiles are present. */
+function regionList(p, inv) {
+  const regionMap = new Map();
+  (p.regions || []).forEach(r => regionMap.set(r, { region: r, instances: [], vpcs: [], nat_gateways: [], eips: [], volumes: [], security_groups: [] }));
+  (inv.regions || []).forEach(r => regionMap.set(r.region, r));
+  return Array.from(regionMap.values()).sort((a, b) => weight(b) - weight(a) || a.region.localeCompare(b.region));
 }
 function total(k, v, sub) {
   return h('div', { class: 'total' }, h('div', { class: 'total-k' }, k), h('div', { class: 'total-v' }, typeof v === 'number' ? fmtNum(v) : (v == null ? '—' : v), sub ? h('small', null, sub) : null));
@@ -662,67 +887,35 @@ function weight(r) { return (r.instances || []).length * 10 + (r.vpcs || []).fil
 function isEmptyRegion(r) {
   return !(r.instances || []).length && !(r.vpcs || []).some(v => !v.default) && !(r.nat_gateways || []).length && !(r.eips || []).length && !(r.volumes || []).length;
 }
+function regionCost(r) {
+  if (typeof r.monthly_usd === 'number') return r.monthly_usd;
+  let sum = 0, any = false;
+  for (const k of ['instances', 'nat_gateways', 'eips', 'volumes']) for (const x of (r[k] || [])) if (typeof x.monthly_usd === 'number') { sum += x.monthly_usd; any = true; }
+  return any ? sum : null;
+}
+function regionResourceCount(r) {
+  if (typeof r.resource_count === 'number') return r.resource_count;
+  return ['instances', 'vpcs', 'nat_gateways', 'eips', 'volumes', 'security_groups'].reduce((n, k) => n + (r[k] || []).length, 0);
+}
 
-function renderRegionTile(r) {
+function renderRegionTile(p, r) {
   const empty = isEmptyRegion(r);
   const defaultOnly = empty && (r.vpcs || []).some(v => v.default);
-  const isOpen = state.openRegion === r.region;
-  const tile = h('button', { class: 'region' + (empty ? ' is-empty' : '') + (isOpen ? ' is-open' : ''), type: 'button', 'aria-expanded': String(isOpen), disabled: empty,
-    onclick: () => { state.openRegion = isOpen ? null : r.region; render(); } },
-    h('div', { class: 'region-name' }, r.region, (r.instances || []).some(i => i.state === 'running') ? h('span', { class: 'lamp on', title: 'running instances' }) : null),
+  const isOpen = !!(state.openRegion && state.openRegion.provider === p.id && state.openRegion.region === r.region);
+  const cost = regionCost(r);
+  const tile = h('button', { class: 'region' + (empty ? ' is-empty' : '') + (isOpen ? ' is-open' : ''), type: 'button', disabled: empty,
+    'aria-haspopup': empty ? null : 'dialog', 'aria-expanded': empty ? null : String(isOpen), dataset: { regionTile: r.region },
+    title: empty ? '' : 'Open ' + r.region,
+    onclick: () => { if (isOpen) closeRegionDrawer(); else openRegionDrawer(p.id, r.region); } },
+    h('div', { class: 'region-name' }, r.region,
+      (r.instances || []).some(i => i.state === 'running') ? h('span', { class: 'lamp on', title: 'running instances' }) : (empty ? null : h('span', { class: 'region-open-ic' }, icon('chev')))),
     h('div', { class: 'region-counts' },
       cnt((r.instances || []).length, 'inst'), cnt((r.vpcs || []).length, 'vpc'), cnt((r.nat_gateways || []).length, 'nat'), cnt((r.eips || []).length, 'eip')),
-    empty ? h('div', { class: 'region-empty-note' }, defaultOnly ? 'default VPC only' : 'nothing running') : null);
+    empty ? h('div', { class: 'region-empty-note' }, defaultOnly ? 'default VPC only' : 'nothing running')
+      : h('div', { class: 'region-foot' }, h('span', { class: 'mono' }, cost !== null ? fmtUsd(cost) + ' /mo' : ''), h('span', { class: 'mono dim' }, regionResourceCount(r) + ' resources')));
   return tile;
 }
 function cnt(n, k) { return h('div', { class: 'region-count' }, h('b', null, n), h('span', null, k)); }
-
-function renderRegionDetail(r) {
-  const p = h('div', { class: 'region-detail panel' });
-  p.appendChild(h('div', { class: 'panel-head' }, h('span', { class: 'section-title' }, r.region),
-    h('button', { class: 'btn btn-ghost btn-sm', type: 'button', onclick: () => { state.openRegion = null; render(); } }, 'Close')));
-  const body = h('div', { class: 'panel-body' });
-  const tbl = h('table', { class: 'tbl' });
-  const rows = [];
-  if ((r.instances || []).length) {
-    rows.push(groupRow('Instances'));
-    rows.push(h('tr', null, h('th', null, 'Name'), h('th', null, 'ID'), h('th', null, 'Type'), h('th', null, 'State'), h('th', null, 'Private IP'), h('th', null, 'Public IP'), h('th', null, 'Launched')));
-    for (const i of r.instances) {
-      const tags = Object.entries(i.tags || {}).filter(([k]) => k !== 'Name').map(([k, v]) => k + '=' + v).join('  ');
-      rows.push(h('tr', null,
-        h('td', null, i.name || h('span', { class: 'dim' }, 'unnamed'), tags ? h('div', { class: 'mono dim', style: 'font-size:11px;margin-top:2px' }, tags) : null),
-        h('td', { class: 'mono' }, i.id), h('td', { class: 'mono' }, i.type),
-        h('td', null, h('span', { class: 'state-word ' + (i.state === 'running' ? 'on' : i.state === 'stopped' ? 'off' : 'unknown') }, i.state)),
-        h('td', { class: 'mono' }, i.private_ip || '—'), h('td', { class: 'mono' }, i.public_ip || h('span', { class: 'dim' }, '—')),
-        h('td', { class: 'dim' }, h('span', { dataset: { rel: i.launched }, title: fmtTime(i.launched) }, fmtRel(i.launched)))));
-    }
-  }
-  if ((r.vpcs || []).length) {
-    rows.push(groupRow('VPCs'));
-    rows.push(h('tr', null, h('th', null, 'Name'), h('th', null, 'ID'), h('th', null, 'CIDR'), h('th', null, '')));
-    for (const v of r.vpcs) rows.push(h('tr', null, h('td', null, v.name || h('span', { class: 'dim' }, 'unnamed')), h('td', { class: 'mono' }, v.id), h('td', { class: 'mono' }, v.cidr), h('td', { class: 'dim' }, v.default ? 'default VPC' : '')));
-  }
-  if ((r.nat_gateways || []).length) {
-    rows.push(groupRow('NAT gateways'));
-    rows.push(h('tr', null, h('th', null, 'ID'), h('th', null, 'VPC'), h('th', null, 'State'), h('th', null, 'Public IP')));
-    for (const n of r.nat_gateways) rows.push(h('tr', null, h('td', { class: 'mono' }, n.id), h('td', { class: 'mono' }, n.vpc), h('td', null, n.state), h('td', { class: 'mono' }, n.public_ip || '—')));
-  }
-  if ((r.eips || []).length) {
-    rows.push(groupRow('Elastic IPs'));
-    rows.push(h('tr', null, h('th', null, 'IP'), h('th', null, 'Attached'), h('th', null, 'Instance')));
-    for (const e of r.eips) rows.push(h('tr', null, h('td', { class: 'mono' }, e.ip), h('td', null, e.attached ? 'yes' : h('span', { class: 'state-word bad' }, 'no — billed idle')), h('td', { class: 'mono' }, e.instance || '—')));
-  }
-  if ((r.volumes || []).length) {
-    rows.push(groupRow('Volumes'));
-    rows.push(h('tr', null, h('th', null, 'ID'), h('th', null, 'Type'), h('th', { class: 'num' }, 'Size'), h('th', null, 'Attached')));
-    for (const v of r.volumes) rows.push(h('tr', null, h('td', { class: 'mono' }, v.id), h('td', { class: 'mono' }, v.type), h('td', { class: 'num' }, v.size_gb + ' GB'), h('td', null, v.attached ? 'yes' : 'no')));
-  }
-  tbl.appendChild(h('tbody', null, rows));
-  body.appendChild(h('div', { style: 'overflow-x:auto' }, tbl));
-  p.appendChild(body);
-  return p;
-}
-function groupRow(t) { return h('tr', null, h('td', { class: 'tbl-group', colspan: 8 }, t)); }
 
 function renderCost(inv) {
   const c = inv.cost;
@@ -762,6 +955,421 @@ function renderGroups(inv) {
       h('span', { class: 'group-cost' }, fmtUsd(g.monthly_usd)));
   })));
   return p;
+}
+
+/* ==========================================================================
+   5b. region drawer — the detailed inventory for one region. Opens from the
+       right, follows the hash (#/clouds/<provider>/<region>), traps focus,
+       returns focus to the tile on close. Re-rendered with the page; scroll
+       position and the focused control (by data-fk) survive re-renders.
+   ========================================================================== */
+
+const SECTIONS = [
+  { key: 'instances',       title: 'Instances' },
+  { key: 'vpcs',            title: 'VPCs & subnets' },
+  { key: 'nat_gateways',    title: 'NAT gateways' },
+  { key: 'eips',            title: 'Elastic IPs' },
+  { key: 'volumes',         title: 'Volumes' },
+  { key: 'security_groups', title: 'Security groups' },
+];
+
+function drawerRegion() {
+  const o = state.openRegion; if (!o) return null;
+  const slot = state.inventories[o.provider];
+  const inv = slot && slot.data && slot.data.supported !== false ? slot.data : null;
+  if (!inv) return null;
+  return (inv.regions || []).find(r => r.region === o.region) || null;
+}
+
+function focusDrawer() {
+  setTimeout(() => { const b = $('#drawer-root .rdrawer-close'); if (b) b.focus(); }, 0);
+}
+
+function renderDrawerRoot() {
+  const root = $('#drawer-root');
+  const o = state.openRegion;
+  document.documentElement.classList.toggle('has-drawer', !!o);
+  if (!o) { clear(root); return; }
+  // preserve scroll + focus across the re-render
+  const prevBody = $('.rdrawer-body', root);
+  const scrollTop = prevBody ? prevBody.scrollTop : 0;
+  const active = document.activeElement;
+  const fk = active && root.contains(active) ? (active.dataset.fk || (active.classList.contains('rdrawer-close') ? '__close' : null)) : null;
+  clear(root);
+
+  const p = providerById(o.provider) || { id: o.provider, name: providerName(o.provider) };
+  const slot = state.inventories[o.provider] || {};
+  const inv = slot.data && slot.data.supported !== false ? slot.data : null;
+  const r = drawerRegion();
+
+  const closeBtn = h('button', { class: 'btn btn-ghost rdrawer-close', type: 'button', 'aria-label': 'Close region drawer', title: 'Close (Esc)' }, icon('x'));
+  closeBtn.addEventListener('click', () => closeRegionDrawer());
+  const cost = r ? regionCost(r) : null;
+  const head = h('header', { class: 'rdrawer-head' },
+    h('div', { class: 'rdrawer-headings' },
+      h('div', { class: 'rdrawer-kicker' }, providerShort(p.id), ' · region'),
+      h('h2', { class: 'rdrawer-title', id: 'rdrawer-title' }, o.region),
+      h('div', { class: 'rdrawer-meta' },
+        r ? [
+          h('span', { class: 'rdrawer-cost' }, cost !== null ? fmtUsd(cost) : '—', h('small', null, ' /mo')),
+          h('span', { class: 'sep' }), h('span', null, fmtNum(regionResourceCount(r)), ' resources'),
+          h('span', { class: 'sep' }), h('span', { class: 'dim', title: inv.generated_at }, 'generated ', fmtTime(inv.generated_at), ' (', h('span', { dataset: { rel: inv.generated_at } }, fmtRel(inv.generated_at)), ')'),
+          inv.stale ? h('span', { class: 'badge badge-stale' }, 'STALE') : null,
+        ] : h('span', { class: 'dim' }, slot.loading ? 'Loading inventory' : 'No inventory for this region'))),
+    closeBtn);
+
+  const body = h('div', { class: 'rdrawer-body', tabindex: '-1' });
+  let filter = null;
+  if (r) {
+    filter = renderProjectFilter(r);
+    for (const sec of SECTIONS) body.appendChild(renderSection(p, r, sec));
+  } else if (slot.loading || (!slot.data && !slot.err)) {
+    body.appendChild(h('div', { class: 'rdrawer-loading' }, h('span', { class: 'loading' }, 'Loading inventory for ' + o.region)));
+    [1, 2, 3].forEach(() => body.appendChild(h('div', { class: 'skeleton', style: 'height:64px;margin:0 20px 12px' })));
+  } else if (slot.err) {
+    body.appendChild(h('div', { class: 'state-box is-error', style: 'margin:20px' }, h('div', { class: 'title' }, 'Inventory failed'), h('div', null, slot.err),
+      h('button', { class: 'btn', type: 'button', onclick: () => loadInventory(p.id, true) }, 'Retry')));
+  } else if (!p.status || p.status !== 'connected') {
+    body.appendChild(h('div', { class: 'state-box', style: 'margin:20px' }, h('div', { class: 'title' }, p.name + ' is not connected'), h('div', null, 'Plug the line in to scan ' + o.region + '.'),
+      h('button', { class: 'btn', type: 'button', onclick: () => closeRegionDrawer() }, 'Close')));
+  } else {
+    body.appendChild(h('div', { class: 'state-box', style: 'margin:20px' }, h('div', { class: 'title' }, 'Nothing scanned for ' + o.region), h('div', null, 'This region is not in the last inventory. It may not be enabled for the account, or the name is wrong.'),
+      h('button', { class: 'btn', type: 'button', onclick: () => closeRegionDrawer() }, 'Close')));
+  }
+
+  const aside = h('aside', { class: 'rdrawer', role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': 'rdrawer-title' }, head, filter, body);
+  aside.addEventListener('keydown', e => {
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeRegionDrawer(); return; }
+    if (e.key !== 'Tab') return;
+    const f = $$('button, a[href], input, textarea, select, summary, [tabindex]:not([tabindex="-1"])', aside).filter(x => !x.disabled && x.offsetParent !== null);
+    if (!f.length) return;
+    const first = f[0], last = f[f.length - 1];
+    if (e.shiftKey && (document.activeElement === first || document.activeElement === aside || document.activeElement === body)) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+  });
+  const backdrop = h('div', { class: 'rdrawer-backdrop', onclick: () => closeRegionDrawer() });
+  root.appendChild(backdrop);
+  root.appendChild(aside);
+  body.scrollTop = scrollTop;
+  if (fk) {
+    const el = fk === '__close' ? closeBtn : $('[data-fk="' + CSS.escape(fk) + '"]', aside);
+    if (el) el.focus({ preventScroll: true });
+  }
+  const flash = state.drawer.flash;
+  if (flash) {
+    state.drawer.flash = null;
+    setTimeout(() => {
+      const el = $('[data-res-id="' + CSS.escape(flash) + '"]', aside);
+      if (!el) return;
+      el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      el.classList.add('is-flash'); setTimeout(() => el.classList.remove('is-flash'), 1600);
+      const focusable = $('[data-fk]', el); if (focusable) focusable.focus({ preventScroll: true });
+    }, 30);
+  }
+}
+
+/* ---- project filter ---- */
+
+function projectOf(x) { return x && x.tags && x.tags.Project ? String(x.tags.Project) : null; }
+function instanceById(r, id) { return (r.instances || []).find(i => i.id === id) || null; }
+/** Projects a resource belongs to: its own Project tag, else those of the instance(s) it is attached to. */
+function effectiveProjects(r, x) {
+  const own = projectOf(x);
+  if (own) return [own];
+  let ids = [];
+  if (Array.isArray(x.attached_to)) ids = x.attached_to;
+  else if (x.attached_to || x.instance) ids = [x.attached_to || x.instance];
+  else if (x.association && x.association.kind === 'instance') ids = [x.association.id];
+  else if (x.association && x.association.kind === 'nat') { const n = (r.nat_gateways || []).find(g => g.id === x.association.id); return n ? effectiveProjects(r, n) : []; }
+  return Array.from(new Set(ids.map(id => projectOf(instanceById(r, id))).filter(Boolean)));
+}
+function matchesProject(r, x, project) {
+  if (!project) return true;
+  const pjs = effectiveProjects(r, x);
+  if (project === '__untagged') return pjs.length === 0;
+  return pjs.includes(project);
+}
+function renderProjectFilter(r) {
+  const counts = new Map();
+  let untagged = 0;
+  for (const sec of SECTIONS) for (const x of (r[sec.key] || [])) {
+    const pjs = effectiveProjects(r, x);
+    if (!pjs.length) untagged++;
+    for (const pj of pjs) counts.set(pj, (counts.get(pj) || 0) + 1);
+  }
+  const cur = state.drawer.project;
+  const chip = (label, value, n) => h('button', { class: 'fchip' + (cur === value ? ' is-on' : ''), type: 'button', role: 'radio', 'aria-checked': String(cur === value), dataset: { fk: 'pj:' + (value || 'all') },
+    onclick: () => { state.drawer.project = value; render(); } }, label, typeof n === 'number' ? h('span', { class: 'fchip-n' }, n) : null);
+  const row = h('div', { class: 'rdrawer-filter', role: 'radiogroup', 'aria-label': 'Filter by Project tag' },
+    h('span', { class: 'fchip-k' }, 'Project'),
+    chip('All', null),
+    Array.from(counts.entries()).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([k, n]) => chip(k, k, n)),
+    untagged ? chip('untagged', '__untagged', untagged) : null);
+  return row;
+}
+/* ---- sections ---- */
+
+function sectionOpen(key, items) {
+  const s = state.drawer.sections;
+  if (Object.prototype.hasOwnProperty.call(s, key)) return s[key];
+  return items.length > 0; // expanded by default only when non-empty
+}
+function renderSection(p, r, sec) {
+  const all = r[sec.key] || [];
+  const project = state.drawer.project;
+  const items = all.filter(x => matchesProject(r, x, project));
+  const open = sectionOpen(sec.key, items);
+  const count = project && items.length !== all.length ? items.length + ' of ' + all.length : String(all.length);
+  const el = h('section', { class: 'dsec' + (open ? ' is-open' : '') + (all.length ? '' : ' is-empty'), dataset: { sec: sec.key } });
+  const headBtn = h('button', { class: 'dsec-head', type: 'button', 'aria-expanded': String(open), 'aria-controls': 'dsec-' + sec.key, dataset: { fk: 'sec:' + sec.key },
+    onclick: () => { state.drawer.sections[sec.key] = !open; render(); } },
+    icon('chev', 'dsec-chev'), h('span', { class: 'dsec-title' }, sec.title), h('span', { class: 'dsec-n' + (all.length ? '' : ' is-zero') }, count));
+  el.appendChild(headBtn);
+  if (open) {
+    const bodyEl = h('div', { class: 'dsec-body', id: 'dsec-' + sec.key });
+    if (!all.length) bodyEl.appendChild(sectionEmpty(sec.key, r.region));
+    else if (!items.length) bodyEl.appendChild(h('div', { class: 'dsec-empty' }, 'Nothing here tagged ', h('span', { class: 'mono' }, 'Project=' + (project === '__untagged' ? '(untagged)' : project)), '.'));
+    else bodyEl.appendChild(renderers[sec.key](r, items));
+    el.appendChild(bodyEl);
+  }
+  return el;
+}
+function sectionEmpty(key, region) {
+  const t = {
+    instances: ['No instances in ' + region + '.', 'Nothing here is running, so the only recurring cost is storage, addresses and gateways.'],
+    vpcs: ['No VPCs in ' + region + '.', 'Not even a default VPC; instances cannot be launched here without one.'],
+    nat_gateways: ['No NAT gateways.', 'Private subnets in this region have no egress unless they route through something else.'],
+    eips: ['No elastic IPs allocated.', 'Nothing idle is being billed for addresses here.'],
+    volumes: ['No EBS volumes.', 'No instances means no root volumes, and nothing unattached is lingering.'],
+    security_groups: ['No security groups.', 'Every VPC normally carries a default group; none was returned.'],
+  }[key] || ['Nothing here.', ''];
+  return h('div', { class: 'dsec-empty' }, h('div', { class: 'title' }, t[0]), h('div', null, t[1]));
+}
+/** Cross-link into another section: opens it, scrolls to and flashes the resource. */
+function link(sec, id, label) {
+  return h('button', { class: 'xlink mono', type: 'button', title: 'Show ' + id, dataset: { fk: 'x:' + id },
+    onclick: () => { state.drawer.sections[sec] = true; state.drawer.flash = id; render(); } }, label || id, icon('link', 'xlink-ic'));
+}
+function tagChips(tags) {
+  const ents = Object.entries(tags || {}).filter(([k]) => k !== 'Name');
+  if (!ents.length) return h('span', { class: 'dim' }, 'no tags');
+  return h('div', { class: 'tags' }, ents.map(([k, v]) => h('span', { class: 'tag', title: k + '=' + v }, h('span', { class: 'tag-k' }, k), h('span', { class: 'tag-v' }, String(v)))));
+}
+function yesno(v) { return v === true ? 'yes' : v === false ? 'no' : '—'; }
+function lampFor(stateWord) {
+  return stateWord === 'running' || stateWord === 'available' || stateWord === 'in-use' ? 'on' : stateWord === 'stopped' ? '' : /pend|shut|delet|fail/.test(stateWord || '') ? 'busy' : 'unknown';
+}
+function dl(rows) {
+  const el = h('dl', { class: 'ddl' });
+  for (const [k, v] of rows) { if (v === undefined) continue; el.appendChild(h('div', { class: 'ddl-row' }, h('dt', null, k), h('dd', null, v === null || v === '' ? h('span', { class: 'dim' }, '—') : v))); }
+  return el;
+}
+
+const renderers = {
+  instances(r, items) {
+    const wrap = h('div', { class: 'insts' });
+    for (const i of items) wrap.appendChild(renderInstance(r, i));
+    return wrap;
+  },
+  vpcs(r, items) {
+    const wrap = h('div', { class: 'vpcs' });
+    for (const v of items) wrap.appendChild(renderVpc(r, v));
+    return wrap;
+  },
+  nat_gateways(r, items) {
+    const wrap = h('div', { class: 'nats' });
+    for (const n of items) {
+      wrap.appendChild(h('div', { class: 'res', dataset: { resId: n.id } },
+        h('div', { class: 'res-head' }, h('span', { class: 'lamp ' + lampFor(n.state) }), h('b', null, n.name || 'NAT gateway'), copyable(n.id, { fk: 'c:' + n.id }), h('span', { class: 'state-word ' + (n.state === 'available' ? 'on' : 'unknown') }, n.state || 'unknown'),
+          typeof n.monthly_usd === 'number' ? h('span', { class: 'res-cost mono' }, fmtUsd(n.monthly_usd), h('small', null, ' /mo')) : null),
+        dl([
+          ['VPC', n.vpc ? link('vpcs', n.vpc, vpcLabel(r, n.vpc)) : null],
+          ['Subnet', n.subnet ? link('vpcs', n.subnet, subnetLabel(r, n.subnet)) : null],
+          ['Public IP', n.public_ip ? copyable(n.public_ip, { fk: 'c:' + n.id + ':pub' }) : null],
+          ['Private IP', n.private_ip ? h('span', { class: 'mono' }, n.private_ip) : null],
+          ['Connectivity', n.connectivity_type || null],
+          ['Created', n.created ? [fmtTime(n.created), ' ', h('span', { class: 'dim', dataset: { rel: n.created } }, '(' + fmtRel(n.created) + ')')] : null],
+          ['Tags', tagChips(n.tags)],
+        ])));
+    }
+    return wrap;
+  },
+  eips(r, items) {
+    const tbl = h('table', { class: 'tbl dtbl' });
+    tbl.appendChild(h('thead', null, h('tr', null, h('th', null, 'Address'), h('th', null, 'Allocation'), h('th', null, 'Associated with'), h('th', null, 'Private IP'), h('th', { class: 'num' }, 'Monthly'))));
+    tbl.appendChild(h('tbody', null, items.map(e => {
+      const a = e.association;
+      let assoc;
+      if (a && a.kind === 'instance') assoc = link('instances', a.id, instLabel(r, a.id));
+      else if (a && a.kind === 'nat') assoc = link('nat_gateways', a.id);
+      else if (a && a.kind === 'eni') assoc = h('span', { class: 'mono' }, 'ENI ', a.id);
+      else if (e.attached && e.instance) assoc = link('instances', e.instance, instLabel(r, e.instance));
+      else if (e.attached) assoc = h('span', { class: 'dim' }, 'attached');
+      else assoc = h('span', { class: 'flag' }, icon('flag'), 'idle — billed hourly');
+      return h('tr', { class: e.attached ? '' : 'is-flagged', dataset: { resId: e.allocation_id || e.ip } },
+        h('td', null, copyable(e.ip, { fk: 'c:' + e.ip }), e.name ? h('div', { class: 'dim', style: 'font-size:12px' }, e.name) : null),
+        h('td', { class: 'mono dim' }, e.allocation_id || '—'),
+        h('td', null, assoc),
+        h('td', { class: 'mono' }, e.private_ip || h('span', { class: 'dim' }, '—')),
+        h('td', { class: 'num' }, typeof e.monthly_usd === 'number' ? fmtUsd(e.monthly_usd) : '—'));
+    })));
+    return h('div', { class: 'tbl-wrap' }, tbl);
+  },
+  volumes(r, items) {
+    const tbl = h('table', { class: 'tbl dtbl' });
+    tbl.appendChild(h('thead', null, h('tr', null, h('th', null, 'Volume'), h('th', { class: 'num' }, 'Size'), h('th', null, 'Type'), h('th', null, 'Attached to'), h('th', null, 'AZ'), h('th', null, 'Encrypted'), h('th', { class: 'num' }, 'Monthly'))));
+    tbl.appendChild(h('tbody', null, items.map(v => h('tr', { class: v.attached ? '' : 'is-flagged', dataset: { resId: v.id } },
+      h('td', null, copyable(v.id, { fk: 'c:' + v.id }), v.name ? h('div', { class: 'dim', style: 'font-size:12px' }, v.name) : null,
+        v.created ? h('div', { class: 'dim', style: 'font-size:11px' }, 'created ', h('span', { dataset: { rel: v.created }, title: fmtTime(v.created) }, fmtRel(v.created))) : null),
+      h('td', { class: 'num' }, fmtNum(v.size_gb), ' GB'),
+      h('td', { class: 'mono' }, v.type || '—', (v.iops || v.throughput) ? h('div', { class: 'dim', style: 'font-size:11px' }, [v.iops ? v.iops + ' IOPS' : null, v.throughput ? v.throughput + ' MB/s' : null].filter(Boolean).join(' · ')) : null),
+      h('td', null, v.attached && (v.attached_to || v.instance)
+        ? [link('instances', v.attached_to || v.instance, instLabel(r, v.attached_to || v.instance)), v.device ? h('div', { class: 'mono dim', style: 'font-size:11px' }, v.device) : null]
+        : h('span', { class: 'flag' }, icon('flag'), 'unattached — billed')),
+      h('td', { class: 'mono dim' }, v.az || '—'),
+      h('td', null, yesno(v.encrypted)),
+      h('td', { class: 'num' }, typeof v.monthly_usd === 'number' ? fmtUsd(v.monthly_usd) : '—')))));
+    return h('div', { class: 'tbl-wrap' }, tbl);
+  },
+  security_groups(r, items) {
+    const wrap = h('div', { class: 'sgs' });
+    for (const g of items) wrap.appendChild(renderSg(r, g));
+    return wrap;
+  },
+};
+
+function instLabel(r, id) { const i = instanceById(r, id); return i && i.name ? i.name : id; }
+function vpcLabel(r, id) { const v = (r.vpcs || []).find(x => x.id === id); return v && v.name ? v.name : id; }
+function subnetLabel(r, id) { for (const v of (r.vpcs || [])) for (const s of (v.subnets || [])) if (s.id === id) return s.name || id; return id; }
+function sgLabel(r, id) { const g = (r.security_groups || []).find(x => x.id === id); return g && g.name ? g.name : id; }
+
+function renderInstance(r, i) {
+  const open = !!state.drawer.inst[i.id];
+  const card = h('article', { class: 'inst' + (open ? ' is-open' : ''), dataset: { resId: i.id } });
+  const toggle = h('button', { class: 'inst-toggle', type: 'button', 'aria-expanded': String(open), dataset: { fk: 'inst:' + i.id },
+    onclick: () => { state.drawer.inst[i.id] = !open; render(); } },
+    icon('chev', 'inst-chev'), h('span', { class: 'lamp ' + lampFor(i.state), title: i.state }), h('span', { class: 'inst-name' }, i.name || h('span', { class: 'dim' }, 'unnamed')));
+  const head = h('div', { class: 'inst-head' },
+    toggle,
+    h('div', { class: 'inst-cell' }, h('span', { class: 'k' }, 'id'), copyable(i.id, { fk: 'c:' + i.id })),
+    h('div', { class: 'inst-cell' }, h('span', { class: 'k' }, 'type'), h('span', { class: 'mono' }, i.type || '—')),
+    h('div', { class: 'inst-cell' }, h('span', { class: 'k' }, 'az'), h('span', { class: 'mono' }, i.az || '—')),
+    h('div', { class: 'inst-cell' }, h('span', { class: 'k' }, 'private'), h('span', { class: 'mono' }, i.private_ip || '—')),
+    h('div', { class: 'inst-cell' }, h('span', { class: 'k' }, 'public'), h('span', { class: 'mono' + (i.public_ip ? '' : ' dim') }, i.public_ip || '—')),
+    h('div', { class: 'inst-cell' }, h('span', { class: 'k' }, 'launched'), h('span', { class: 'mono', title: fmtTime(i.launched) }, h('span', { dataset: { rel: i.launched } }, fmtRel(i.launched)), typeof i.uptime_h === 'number' ? h('span', { class: 'dim' }, ' · up ' + fmtUptime(i.uptime_h)) : null)),
+    h('div', { class: 'inst-cell num' }, h('span', { class: 'k' }, 'monthly'), h('span', { class: 'mono' }, typeof i.monthly_usd === 'number' ? fmtUsd(i.monthly_usd) : '—')));
+  card.appendChild(head);
+  if (open) {
+    const vols = (i.volumes || []);
+    const sgs = (i.security_groups || []);
+    card.appendChild(h('div', { class: 'inst-body' },
+      dl([
+        ['Instance id', copyable(i.id, { fk: 'c2:' + i.id })],
+        ['Name', i.name || null],
+        ['State', h('span', { class: 'state-word ' + (i.state === 'running' ? 'on' : i.state === 'stopped' ? 'off' : 'unknown') }, i.state || 'unknown')],
+        ['Type', h('span', { class: 'mono' }, i.type || '—')],
+        ['Platform', [i.platform || null, i.architecture ? h('span', { class: 'dim' }, ' · ' + i.architecture) : null]],
+        ['Availability zone', h('span', { class: 'mono' }, i.az || '—')],
+        ['VPC', i.vpc ? link('vpcs', i.vpc, vpcLabel(r, i.vpc)) : null],
+        ['Subnet', i.subnet ? link('vpcs', i.subnet, subnetLabel(r, i.subnet)) : null],
+        ['Private IP', i.private_ip ? copyable(i.private_ip, { fk: 'c:' + i.id + ':priv' }) : null],
+        ['Public IP', i.public_ip ? copyable(i.public_ip, { fk: 'c:' + i.id + ':pub' }) : h('span', { class: 'dim' }, 'none — private only')],
+        ['Launched', i.launched ? [fmtTime(i.launched), typeof i.uptime_h === 'number' ? h('span', { class: 'dim' }, ' · up ' + fmtUptime(i.uptime_h)) : null] : null],
+        ['AMI', i.ami ? [copyable(i.ami, { fk: 'c:' + i.id + ':ami' }), i.ami_name ? h('div', { class: 'dim mono', style: 'font-size:11.5px;margin-top:2px;word-break:break-all' }, i.ami_name) : null] : null],
+        ['IAM instance profile', i.iam_instance_profile ? h('span', { class: 'mono' }, i.iam_instance_profile) : h('span', { class: 'dim' }, 'none')],
+        ['Key pair', i.key_name ? h('span', { class: 'mono' }, i.key_name) : h('span', { class: 'dim' }, 'none')],
+        ['Root device', i.root_device ? h('span', { class: 'mono' }, i.root_device) : null],
+        ['Detailed monitoring', yesno(i.monitoring)],
+        ['EBS optimized', yesno(i.ebs_optimized)],
+        ['User data', i.user_data_present === true ? 'present' : i.user_data_present === false ? 'none' : '—'],
+        ['Monthly cost', typeof i.monthly_usd === 'number' ? h('span', { class: 'mono' }, fmtUsd(i.monthly_usd), h('span', { class: 'dim' }, ' compute only')) : null],
+        ['Volumes', vols.length ? h('div', { class: 'linkrow' }, vols.map(id => link('volumes', id, volLabel(r, id)))) : h('span', { class: 'dim' }, 'none')],
+        ['Security groups', sgs.length ? h('div', { class: 'linkrow' }, sgs.map(g => link('security_groups', g.id, g.name || g.id))) : h('span', { class: 'dim' }, 'none')],
+        ['Tags', tagChips(i.tags)],
+      ])));
+  }
+  return card;
+}
+function volLabel(r, id) { const v = (r.volumes || []).find(x => x.id === id); return v ? id + ' · ' + v.size_gb + ' GB' : id; }
+function fmtUptime(hrs) {
+  if (hrs < 48) return Math.round(hrs) + ' h';
+  const d = Math.floor(hrs / 24), hh = Math.round(hrs - d * 24);
+  return d + ' d' + (hh ? ' ' + hh + ' h' : '');
+}
+
+function renderVpc(r, v) {
+  const el = h('div', { class: 'res vpc' + (v.default ? ' is-default' : ''), dataset: { resId: v.id } });
+  el.appendChild(h('div', { class: 'res-head' },
+    h('b', null, v.name || (v.default ? 'default VPC' : 'unnamed VPC')), copyable(v.id, { fk: 'c:' + v.id }), h('span', { class: 'mono' }, v.cidr),
+    v.default ? h('span', { class: 'chip' }, 'default') : null,
+    v.igw ? h('span', { class: 'mono dim', title: 'internet gateway' }, 'igw ', v.igw) : h('span', { class: 'dim' }, 'no internet gateway'),
+    v.dns_hostnames === true ? h('span', { class: 'dim' }, 'DNS hostnames on') : v.dns_hostnames === false ? h('span', { class: 'dim' }, 'DNS hostnames off') : null));
+  const subnets = v.subnets || [];
+  if (subnets.length) {
+    const tbl = h('table', { class: 'tbl dtbl' });
+    tbl.appendChild(h('thead', null, h('tr', null, h('th', null, 'Subnet'), h('th', null, 'CIDR'), h('th', null, 'AZ'), h('th', null, 'Default route'))));
+    tbl.appendChild(h('tbody', null, subnets.map(s => {
+      const target = s.default_route !== undefined ? s.default_route : defaultRouteFor(v, s.route_table);
+      const kind = !target ? 'none' : /^igw-/.test(target) ? 'igw' : /^nat-/.test(target) ? 'nat' : 'other';
+      return h('tr', { dataset: { resId: s.id } },
+        h('td', null, h('div', null, s.name || h('span', { class: 'dim' }, 'unnamed')), copyable(s.id, { fk: 'c:' + s.id, cls: 'copy-sm' })),
+        h('td', { class: 'mono' }, s.cidr),
+        h('td', { class: 'mono dim' }, s.az ? s.az.replace(/^.*-(\d[a-z])$/, '$1') : '—'),
+        h('td', null, h('span', { class: 'route route-' + kind },
+          h('span', { class: 'route-badge' }, kind === 'igw' ? 'public' : kind === 'nat' ? 'private' : kind === 'none' ? 'isolated' : 'routed'),
+          h('span', { class: 'mono' }, '0.0.0.0/0 → ', target ? (kind === 'nat' ? link('nat_gateways', target) : target) : 'none')),
+          s.route_table ? h('div', { class: 'mono dim', style: 'font-size:11px;margin-top:2px' }, 'via ', s.route_table) : null));
+    })));
+    el.appendChild(h('div', { class: 'tbl-wrap' }, tbl));
+  } else {
+    el.appendChild(h('div', { class: 'dsec-empty' }, 'No subnets — nothing can be launched into this VPC yet.'));
+  }
+  const rts = v.route_tables || [];
+  if (rts.length) {
+    el.appendChild(h('details', { class: 'rts' },
+      h('summary', { dataset: { fk: 'rts:' + v.id } }, rts.length + (rts.length === 1 ? ' route table' : ' route tables')),
+      h('div', { class: 'rts-body' }, rts.map(rt => h('div', { class: 'rt', dataset: { resId: rt.id } },
+        h('div', { class: 'rt-head' }, h('span', null, rt.name || (rt.main ? 'main' : 'route table')), copyable(rt.id, { fk: 'c:' + rt.id, cls: 'copy-sm' }), rt.main ? h('span', { class: 'chip' }, 'main') : null,
+          h('span', { class: 'dim' }, (rt.subnets || []).length + ' subnet' + ((rt.subnets || []).length === 1 ? '' : 's'))),
+        h('ul', { class: 'routes mono' }, (rt.routes || []).map(x => h('li', null, h('span', null, x.dest || '—'), h('span', { class: 'dim' }, ' → '), x.target || 'local', x.state && x.state !== 'active' ? h('span', { class: 'bad' }, ' ' + x.state) : null))))))));
+  }
+  return el;
+}
+function defaultRouteFor(v, rtId) {
+  const rt = (v.route_tables || []).find(x => x.id === rtId);
+  if (!rt) return null;
+  const d = (rt.routes || []).find(x => x.dest === '0.0.0.0/0');
+  return d ? d.target : null;
+}
+
+function renderSg(r, g) {
+  const el = h('div', { class: 'res sg', dataset: { resId: g.id } });
+  const attached = g.attached_to || [];
+  el.appendChild(h('div', { class: 'res-head' },
+    h('b', null, g.name || 'security group'), copyable(g.id, { fk: 'c:' + g.id }),
+    g.vpc ? link('vpcs', g.vpc, vpcLabel(r, g.vpc)) : null,
+    h('span', { class: 'dim' }, attached.length ? attached.length + ' instance' + (attached.length === 1 ? '' : 's') : 'not attached to any instance')));
+  if (g.description) el.appendChild(h('div', { class: 'res-sub' }, g.description));
+  if (attached.length) el.appendChild(h('div', { class: 'linkrow', style: 'margin:6px 0 2px' }, attached.map(id => link('instances', id, instLabel(r, id)))));
+  el.appendChild(rulesTable('Ingress', g.ingress || [], 'Source', 'No ingress rules — nothing can reach members of this group.'));
+  el.appendChild(rulesTable('Egress', g.egress || [], 'Destination', 'No egress rules — members cannot initiate anything.'));
+  return el;
+}
+function rulesTable(title, rules, srcLabel, emptyText) {
+  const box = h('div', { class: 'rules' });
+  box.appendChild(h('div', { class: 'rules-title' }, title, h('span', { class: 'dim' }, ' ' + rules.length)));
+  if (!rules.length) { box.appendChild(h('div', { class: 'dsec-empty compact' }, emptyText)); return box; }
+  const tbl = h('table', { class: 'tbl dtbl' });
+  tbl.appendChild(h('thead', null, h('tr', null, h('th', null, 'Proto'), h('th', null, 'Ports'), h('th', null, srcLabel))));
+  tbl.appendChild(h('tbody', null, rules.map(x => {
+    const open = x.source === '0.0.0.0/0' || x.source === '::/0';
+    return h('tr', null,
+      h('td', { class: 'mono' }, x.proto === 'all' || x.proto == null ? 'all' : x.proto),
+      h('td', { class: 'mono' }, x.from == null && x.to == null ? 'all' : x.from === x.to ? String(x.from) : x.from + '–' + x.to),
+      h('td', { class: 'mono' + (open ? ' is-open-world' : '') }, x.source == null ? h('span', { class: 'dim' }, '—') : /^sg-/.test(x.source) ? link('security_groups', x.source) : x.source, open ? h('span', { class: 'dim' }, ' anywhere') : null));
+  })));
+  box.appendChild(h('div', { class: 'tbl-wrap' }, tbl));
+  return box;
 }
 
 /* ==========================================================================
@@ -849,8 +1457,10 @@ async function pollJob(ucId, jobId) {
       clearInterval(timers.jobs[jobId]); delete timers.jobs[jobId];
       entry.live = false;
       toast((ucById(ucId) ? ucById(ucId).name : ucId) + ': ' + (job.action === 'on' ? 'turn-on' : 'turn-off') + ' ' + job.state + '.', job.state === 'failed');
+      delete state.outlines[ucId]; // the plan is stale once a job has run
       await loadUsecases(true);
       await loadDetail(ucId, true);
+      if (state.expanded === ucId) { loadOutline(ucId, 'on'); loadOutline(ucId, 'off'); }
     }
   } catch (e) {
     if (e.status === 401) return;
@@ -944,7 +1554,16 @@ const STATE_INFO = {
   unknown:     { lamp: 'unknown', word: 'unknown', cls: 'unknown' },
 };
 
-function providerName(id) { const d = PROVIDER_DEFS.find(p => p.id === id); return d ? d.name : id; }
+/** Why a switch cannot be flipped, from the provider's connection state and capabilities. */
+function switchBlocker(uc) {
+  const p = providerById(uc.provider);
+  const caps = p ? providerCaps(p) : null;
+  if (caps && !caps.usecases) {
+    return providerName(uc.provider) + (uc.provider_connected ? ' is connected, but use cases are not built for this provider yet — nothing can be operated from Switchboard.' : ' cannot run use cases yet — the provider module only supports connecting.');
+  }
+  if (!uc.provider_connected) return providerName(uc.provider) + ' line is unplugged — plug it in on the Clouds page to operate this use case.';
+  return null;
+}
 
 function renderCard(uc) {
   const info = STATE_INFO[uc.state] || STATE_INFO.unknown;
@@ -952,11 +1571,7 @@ function renderCard(uc) {
   const open = state.expanded === uc.id;
   const card = h('div', { class: 'card' + (uc.state === 'on' || busy ? ' is-live' : '') + (uc.state === 'error' ? ' is-error' : '') + (open ? ' is-open' : ''), dataset: { uc: uc.id } });
 
-  const disabledReason = !uc.provider_connected
-    ? (PROVIDER_DEFS.find(p => p.id === uc.provider && p.wired)
-        ? providerName(uc.provider) + ' line is unplugged — plug it in on the Clouds page to operate this use case.'
-        : providerName(uc.provider) + ' is not wired yet — this use case cannot be operated from Switchboard.')
-    : null;
+  const disabledReason = switchBlocker(uc);
 
   const checked = uc.state === 'on' ? 'true' : uc.state === 'off' ? 'false' : 'mixed';
   const toggle = h('button', {
@@ -987,7 +1602,7 @@ function renderCard(uc) {
     onclick: () => toggleExpand(uc.id) }, icon('chev'));
 
   const head = h('div', { class: 'card-head' }, sw, title, meta, expand);
-  if (disabledReason) head.appendChild(h('div', { class: 'card-warn' }, disabledReason, ' ', uc.provider === 'aws' ? h('a', { href: KEEP_QUERY + '#/clouds' }, 'Open Clouds') : null));
+  if (disabledReason) head.appendChild(h('div', { class: 'card-warn' }, disabledReason, ' ', h('a', { href: KEEP_QUERY + '#/clouds' }, 'Open Clouds')));
   card.appendChild(head);
   if (open) card.appendChild(renderDetail(uc));
   return card;
@@ -1002,6 +1617,8 @@ function toggleExpand(id) {
   state.expanded = id;
   render();
   loadDetail(id);
+  loadOutline(id, 'on');
+  loadOutline(id, 'off');
 }
 
 function renderDetail(uc) {
@@ -1021,20 +1638,16 @@ function renderDetail(uc) {
     h('div', { class: 'md', html: SB.markdown.render(d.description || '_No description in the manifest._') })));
   if (d.source) left.appendChild(h('div', { class: 'detail-block' }, h('div', { class: 'section-title', style: 'margin-bottom:6px' }, 'Source'),
     h('div', { class: 'mono', style: 'font-size:12px;color:var(--text-dim);word-break:break-all' }, d.source.git || '', d.source.ref ? ' @ ' + d.source.ref : '', d.source.commit ? ' · ' + String(d.source.commit).slice(0, 10) : ' · not checked out')));
-  left.appendChild(renderProbe(d));
   grid.appendChild(left);
+  // right: status probe
+  grid.appendChild(h('div', null, renderProbe(d)));
+  wrap.appendChild(grid);
 
-  // right: procedure
-  const right = h('div');
-  right.appendChild(h('div', { class: 'section-title', style: 'margin-bottom:8px' }, 'Procedure'));
+  // outline: what ON and OFF will do — steps + a real plan + declared effects
   const jobId = state.jobFor[uc.id];
   const entry = jobId ? state.jobs[jobId] : null;
   const job = entry && entry.job;
-  right.appendChild(h('div', { class: 'procedure' },
-    renderStepList('on', (d.procedure && d.procedure.on) || [], job),
-    renderStepList('off', (d.procedure && d.procedure.off) || [], job)));
-  grid.appendChild(right);
-  wrap.appendChild(grid);
+  wrap.appendChild(renderOutline(uc, d, job));
 
   // job panel
   wrap.appendChild(renderJobPanel(uc, d, entry));
@@ -1046,26 +1659,6 @@ function renderDetail(uc) {
     d.source && d.source.commit ? h('span', { class: 'mono', style: 'font-size:12px;color:var(--text-faint)' }, 'checkout ', String(d.source.commit).slice(0, 10)) : null));
   if (cs.open) wrap.appendChild(renderDrawer(uc, cs));
   return wrap;
-}
-
-function renderStepList(action, steps, job) {
-  const active = job && job.action === action;
-  const col = h('div');
-  const st = STATE_INFO[action === 'on' ? 'turning_on' : 'turning_off'];
-  col.appendChild(h('div', { class: 'proc-col-title' }, h('span', { class: 'state-word' }, action === 'on' ? 'Turn on' : 'Turn off'),
-    h('span', { style: 'color:var(--text-faint);font-size:12px' }, steps.length + (steps.length === 1 ? ' step' : ' steps'))));
-  if (!steps.length) { col.appendChild(h('div', { style: 'color:var(--text-faint);font-size:13px' }, 'No steps declared.')); return col; }
-  const ol = h('ol', { class: 'steps' + (active && job.state === 'running' ? ' is-active' : ''), dataset: { action } });
-  steps.forEach((s, i) => {
-    const js = active && job.steps && job.steps[i];
-    ol.appendChild(h('li', { class: 'step' + (js ? ' ' + js.state : '') },
-      h('span', { class: 'step-n', 'aria-hidden': 'true' }),
-      h('div', null, h('div', { class: 'step-name' }, s.name), h('div', { class: 'step-run' }, s.run)),
-      h('span', { class: 'step-t' }, js && js.started ? fmtDur(js.started, js.ended) : '')));
-  });
-  col.appendChild(ol);
-  void st;
-  return col;
 }
 
 function renderJobPanel(uc, d, entry) {
@@ -1122,6 +1715,171 @@ function renderProbe(d) {
   return block;
 }
 
+/* ---- outline: steps + a real plan + declared effects, per action ---- */
+
+async function loadOutline(id, action, force) {
+  const o = state.outlines[id] || (state.outlines[id] = {});
+  const cur = o[action];
+  if (cur && !force && (cur.loading || cur.data)) return cur.promise || cur;
+  const slot = { loading: true, data: null, err: null, status: null, promise: null };
+  o[action] = slot;
+  slot.promise = (async () => {
+    if (state.route === 'usecases') render();
+    try { slot.data = await api.outline(id, action); }
+    catch (e) { if (e.status === 401) return slot; slot.err = e.message; slot.status = e.status; }
+    slot.loading = false;
+    if (state.route === 'usecases' && state.outlines[id][action] === slot) render();
+    return slot;
+  })();
+  return slot.promise;
+}
+
+function stepsOl(action, steps, job) {
+  const active = job && job.action === action;
+  const ol = h('ol', { class: 'steps' + (active && job.state === 'running' ? ' is-active' : ''), dataset: { action } });
+  steps.forEach((s, i) => {
+    const js = active && job.steps && job.steps[i];
+    ol.appendChild(h('li', { class: 'step' + (js ? ' ' + js.state : '') },
+      h('span', { class: 'step-n', 'aria-hidden': 'true' }),
+      h('div', null, h('div', { class: 'step-name' }, s.name), h('div', { class: 'step-run' }, s.run)),
+      h('span', { class: 'step-t' }, js && js.started ? fmtDur(js.started, js.ended) : '')));
+  });
+  return ol;
+}
+
+/** Plan entries grouped by resource type, in the order the plan reported them. */
+function planGroups(list) {
+  const m = new Map();
+  for (const e of list || []) { const t = e.type || 'unknown'; if (!m.has(t)) m.set(t, []); m.get(t).push(e); }
+  return Array.from(m.entries()).map(([type, items]) => ({ type, items }));
+}
+/** Distinct network containers in a plan list — not AWS-shaped: aws_vpc, google_compute_network, azurerm_virtual_network. */
+function countNetworks(list) { return (list || []).filter(e => /(_vpc|_network|virtual_network)$/.test(e.type || '')).length; }
+function plural(n, one, many) { return n === 1 ? one : (many || one + 's'); }
+
+function outlinePart(title, count, body, tone) {
+  return h('div', { class: 'opart' + (tone ? ' tone-' + tone : '') },
+    h('div', { class: 'opart-head' }, h('span', { class: 'opart-title' }, title), count !== null && count !== undefined ? h('span', { class: 'opart-n' }, typeof count === 'number' ? fmtNum(count) : count) : null),
+    body);
+}
+function planError(msg, onRetry) {
+  return h('div', { class: 'plan-error', role: 'alert' },
+    h('div', { class: 'plan-error-title' }, 'Plan failed'),
+    h('pre', { class: 'plan-error-msg' }, msg),
+    onRetry ? h('button', { class: 'btn btn-sm', type: 'button', onclick: onRetry }, icon('refresh'), 'Retry plan') : null);
+}
+function renderPlanGroup(g, action) {
+  return h('li', { class: 'ptype' },
+    h('details', null,
+      h('summary', null, h('span', { class: 'mono ptype-t' }, g.type), h('span', { class: 'ptype-x' }, ' × '), h('span', { class: 'ptype-n' }, g.items.length)),
+      h('ul', { class: 'paddrs mono' }, g.items.map(e => h('li', null, e.address || (e.type + '.' + e.name), e.replace ? h('span', { class: 'dim' }, ' (replace)') : null)))));
+}
+
+function renderOutline(uc, d, job) {
+  const block = h('div', { class: 'detail-block outline-block' });
+  block.appendChild(h('div', { class: 'section-head', style: 'margin-bottom:10px' },
+    h('span', { class: 'section-title' }, 'Outline'),
+    h('span', { class: 'outline-hint' }, 'Steps and a live plan for each direction. Nothing is applied to produce this.')));
+  block.appendChild(h('div', { class: 'outline' },
+    renderOutlineColumn(uc, d, 'on', job, { onRetry: () => loadOutline(uc.id, 'on', true) }),
+    renderOutlineColumn(uc, d, 'off', job, { onRetry: () => loadOutline(uc.id, 'off', true) })));
+  return block;
+}
+
+function renderOutlineColumn(uc, d, action, job, opts) {
+  opts = opts || {};
+  const o = (state.outlines[uc.id] || {})[action] || null;
+  const data = o && o.data;
+  const plan = data && data.plan;
+  const declared = (data && data.declared) || null;
+  const steps = (data && data.steps) || (d && d.procedure && d.procedure[action]) || [];
+  const col = h('div', { class: 'ocol ocol-' + action });
+  if (!opts.noTitle) {
+    col.appendChild(h('div', { class: 'proc-col-title' },
+      h('span', { class: 'state-word ' + (action === 'on' ? 'on' : 'bad') }, action === 'on' ? 'Turn on' : 'Turn off'),
+      plan && plan.ok && plan.generated_at ? h('span', { class: 'dim mono ocol-when', title: plan.generated_at }, 'planned ', h('span', { dataset: { rel: plan.generated_at } }, fmtRel(plan.generated_at))) : null));
+  }
+
+  // 1. steps
+  col.appendChild(outlinePart('Steps', steps.length, steps.length ? stepsOl(action, steps, job) : h('div', { class: 'opart-empty' }, 'No steps declared.')));
+
+  // 2. plan: generated / destroyed
+  const genTitle = action === 'on' ? 'Generated' : 'Destroyed';
+  const tone = action === 'on' ? 'accent' : 'bad';
+  if (!o || o.loading) {
+    col.appendChild(outlinePart(genTitle, null, h('div', { class: 'oplan-loading' }, h('span', { class: 'loading' }, action === 'on' ? 'Planning the build' : 'Planning the destroy'))));
+    col.appendChild(outlinePart(action === 'on' ? 'Already present' : 'Unchanged', null, h('div', { class: 'opart-empty' }, 'Waiting for the plan.')));
+  } else if (o.err) {
+    const msg = o.status === 409 ? o.err + ' The outline is available again when it finishes.' : o.err;
+    col.appendChild(outlinePart(genTitle, null, planError(msg, opts.onRetry)));
+    col.appendChild(outlinePart(action === 'on' ? 'Already present' : 'Unchanged', '?', h('div', { class: 'opart-empty' }, 'Unknown until a plan succeeds.')));
+  } else if (!plan || !plan.ok) {
+    col.appendChild(outlinePart(genTitle, null, planError(plan && plan.error ? plan.error : 'The response carried no plan.', opts.onRetry)));
+    col.appendChild(outlinePart(action === 'on' ? 'Already present' : 'Unchanged', '?', h('div', { class: 'opart-empty' }, 'Unknown until a plan succeeds.')));
+  } else {
+    const list = (action === 'on' ? plan.create : plan.destroy) || [];
+    const present = (plan.unchanged || []).length;
+    const body = h('div');
+    if (!list.length) {
+      body.appendChild(h('div', { class: 'oplan-none' }, action === 'on'
+        ? (present ? 'Nothing to generate — ' + fmtNum(present) + ' ' + plural(present, 'resource') + ' already present.' : 'Nothing to generate — the plan is empty.')
+        : (present ? 'Nothing to destroy — the plan leaves all ' + fmtNum(present) + ' ' + plural(present, 'resource') + ' in place.' : 'Nothing to destroy — no resources in state.')));
+    } else {
+      body.appendChild(h('ul', { class: 'ptypes' }, planGroups(list).map(g => renderPlanGroup(g, action))));
+    }
+    const upd = plan.update || [];
+    if (upd.length) body.appendChild(h('div', { class: 'oplan-extra' }, h('ul', { class: 'ptypes' }, [h('li', { class: 'ptype' }, h('details', null, h('summary', null, h('span', { class: 'ptype-t' }, 'updated in place'), h('span', { class: 'ptype-x' }, ' × '), h('span', { class: 'ptype-n' }, upd.length)), h('ul', { class: 'paddrs mono' }, upd.map(e => h('li', null, e.address)))))])));
+    col.appendChild(outlinePart(genTitle, list.length, body, list.length ? tone : null));
+    col.appendChild(outlinePart(action === 'on' ? 'Already present' : 'Unchanged', present,
+      h('div', { class: 'opart-empty' }, present ? fmtNum(present) + ' ' + plural(present, 'resource') + (action === 'on' ? ' already in state and untouched by this plan.' : ' stay as they are.') : 'Nothing in state is left untouched.')));
+  }
+
+  // 3. outside OpenTofu (declared)
+  const outsideKey = action === 'on' ? 'creates' : 'destroys';
+  const outside = declared ? (declared[outsideKey] || []) : null;
+  col.appendChild(outlinePart('Outside OpenTofu', outside ? outside.length : null,
+    outside === null ? h('div', { class: 'opart-empty' }, o && o.loading ? 'Loading the manifest’s declared effects.' : 'Declared effects unavailable.')
+      : outside.length ? h('ul', { class: 'declared' }, outside.map(t => h('li', null, t)))
+      : h('div', { class: 'opart-empty' }, 'Nothing declared outside OpenTofu for ' + action.toUpperCase() + '.')));
+
+  // 4. kept: declared retains + remote state
+  const retains = declared ? (declared.retains || []) : null;
+  const rs = data && data.retained_state;
+  const keptBody = h('div');
+  if (retains === null) keptBody.appendChild(h('div', { class: 'opart-empty' }, o && o.loading ? 'Loading.' : 'Unavailable.'));
+  else {
+    const ul = h('ul', { class: 'declared kept' }, retains.map(t => h('li', null, t)));
+    if (rs) ul.appendChild(h('li', { class: 'kept-state' }, 'Remote state: ', h('span', { class: 'mono' }, (rs.backend || 's3') + '://' + (rs.bucket || '<bucket>') + '/' + (rs.key || '')), rs.region ? h('span', { class: 'dim' }, ' (' + rs.region + ')') : null, h('span', { class: 'dim' }, ' — versioned object and the remote lock')));
+    else ul.appendChild(h('li', { class: 'kept-state' }, 'Remote state in the S3 backend'));
+    keptBody.appendChild(ul);
+  }
+  col.appendChild(outlinePart('Kept', retains === null ? null : retains.length + (rs ? 1 : 0), keptBody));
+  return col;
+}
+
+/** The sentence at the top of the confirmation modal, computed from the plan and the declared effects. */
+function outlineSentence(uc, action, o) {
+  const prov = providerShort(uc.provider);
+  const A = action.toUpperCase();
+  if (!o || o.loading) return 'Planning ' + A + ' to count exactly what it touches…';
+  const data = o.data, plan = data && data.plan;
+  const declared = (data && data.declared) || {};
+  const kept = (declared.retains || []).length;
+  const keptTxt = kept ? ' and keep ' + kept + ' ' + plural(kept, 'thing') + ' outside OpenTofu' : '';
+  if (o.err || !plan || !plan.ok) return 'The ' + A + ' plan failed, so the exact resource list is unknown. ' + (data ? A + ' would' + (keptTxt ? keptTxt.replace(' and keep', ' keep') : ' keep nothing') + ' outside OpenTofu.' : 'Retry the plan before confirming.');
+  const list = (action === 'on' ? plan.create : plan.destroy) || [];
+  const n = list.length, nets = countNetworks(list);
+  const across = nets ? ' across ' + nets + ' ' + plural(nets, 'VPC') : '';
+  const outside = (declared[action === 'on' ? 'creates' : 'destroys'] || []).length;
+  const present = (plan.unchanged || []).length;
+  if (action === 'off') {
+    if (!n) return 'OFF will destroy nothing — no resources are in state' + keptTxt + '.';
+    return 'OFF will destroy ' + fmtNum(n) + ' ' + prov + ' ' + plural(n, 'resource') + across + keptTxt + '.';
+  }
+  if (!n) return 'ON will generate nothing — ' + fmtNum(present) + ' ' + plural(present, 'resource') + ' already present' + (outside ? '; ' + outside + ' ' + plural(outside, 'thing') + ' still ' + (outside === 1 ? 'happens' : 'happen') + ' outside OpenTofu' : '') + '.';
+  return 'ON will generate ' + fmtNum(n) + ' ' + prov + ' ' + plural(n, 'resource') + across + (present ? ', leave ' + fmtNum(present) + ' already present' : '') + (outside ? ' and do ' + outside + ' ' + plural(outside, 'thing') + ' outside OpenTofu' : '') + '.';
+}
+
 /* ---- flipping ---- */
 
 async function requestFlip(uc) {
@@ -1131,30 +1889,39 @@ async function requestFlip(uc) {
   if (!d || !d.procedure) { toast('Could not load the procedure for ' + uc.name + '.', true); return; }
 
   let action = uc.state === 'on' ? 'off' : uc.state === 'off' ? 'on' : null;
-  const body = h('div');
-  let picker = null;
+  const body = h('div', { class: 'confirm' });
   if (!action) {
     action = 'off';
-    picker = h('div', { style: 'display:flex;gap:18px;margin-bottom:12px' },
-      h('label', { style: 'display:flex;gap:6px;align-items:center' }, h('input', { type: 'radio', name: 'act', value: 'off', checked: true, onchange: () => rebuild('off') }), 'Turn off (destroy)'),
-      h('label', { style: 'display:flex;gap:6px;align-items:center' }, h('input', { type: 'radio', name: 'act', value: 'on', onchange: () => rebuild('on') }), 'Turn on (rebuild)'));
-    body.appendChild(h('p', { style: 'color:var(--text-dim);margin-bottom:10px' }, 'The state is ', h('b', null, uc.state), '. Choose which procedure to run.'));
-    body.appendChild(picker);
+    body.appendChild(h('p', { style: 'color:var(--text-dim);margin-bottom:8px' }, 'The state is ', h('b', null, uc.state), '. Choose which procedure to run.'));
+    body.appendChild(h('div', { class: 'confirm-pick' },
+      h('label', null, h('input', { type: 'radio', name: 'act', value: 'off', checked: true, onchange: () => rebuild('off') }), 'Turn off (destroy)'),
+      h('label', null, h('input', { type: 'radio', name: 'act', value: 'on', onchange: () => rebuild('on') }), 'Turn on (rebuild)')));
   }
-  const listHost = h('div');
-  body.appendChild(listHost);
+  const sentence = h('p', { class: 'confirm-sentence', 'aria-live': 'polite' });
+  const host = h('div', { class: 'confirm-outline' });
+  body.appendChild(sentence); body.appendChild(host);
+  let ctl = null, seq = 0;
   function rebuild(a) {
-    action = a;
-    clear(listHost);
-    const steps = d.procedure[a] || [];
-    listHost.appendChild(h('p', { style: 'color:var(--text-dim);margin-bottom:8px' }, steps.length + ' step' + (steps.length === 1 ? '' : 's') + ' will run in order on ', h('b', null, providerName(uc.provider)), '. The job stops at the first failure.'));
-    listHost.appendChild(h('ol', { class: 'steps' }, steps.map(s => h('li', { class: 'step' }, h('span', { class: 'step-n', 'aria-hidden': 'true' }), h('div', null, h('div', { class: 'step-name' }, s.name), h('div', { class: 'step-run' }, s.run))))));
+    action = a; const my = ++seq;
+    let o = (state.outlines[uc.id] || {})[a];
+    if (!o || (!o.loading && !o.data && !o.err)) { loadOutline(uc.id, a).then(() => { if (seq === my) rebuild(a); }); o = (state.outlines[uc.id] || {})[a]; }
+    else if (o.loading && o.promise) o.promise.then(() => { if (seq === my) rebuild(a); });
+    sentence.textContent = outlineSentence(uc, a, o);
+    sentence.className = 'confirm-sentence' + (a === 'off' ? ' is-danger' : '') + (!o || o.loading ? ' is-loading' : '') + (o && !o.loading && (o.err || !(o.data && o.data.plan && o.data.plan.ok)) ? ' is-failed' : '');
+    clear(host);
+    host.appendChild(renderOutlineColumn(uc, d, a, null, { noTitle: true, onRetry: () => { loadOutline(uc.id, a, true).then(() => { if (seq === my) rebuild(a); }); rebuild(a); } }));
+    if (ctl) {
+      const ready = !!(o && !o.loading);
+      ctl.enableConfirm(ready);
+      ctl.okBtn.title = ready ? '' : 'Waiting for the plan';
+    }
   }
   rebuild(action);
   const ok = await modal({
     title: (action === 'on' ? 'Turn on ' : 'Turn off ') + uc.name + '?',
-    sub: action === 'off' ? 'This destroys the infrastructure the use case created.' : 'This creates infrastructure and may take several minutes.',
-    body, confirmLabel: action === 'on' ? 'Turn on' : 'Turn off', danger: action === 'off',
+    sub: action === 'off' ? 'This destroys the infrastructure the use case created. The outline below is from a live plan.' : 'This creates infrastructure and may take several minutes. The outline below is from a live plan.',
+    body, confirmLabel: action === 'on' ? 'Turn on' : 'Turn off', danger: action === 'off', wide: true, confirmDisabled: true,
+    setup(c) { ctl = c; rebuild(action); },
   });
   if (!ok) return;
   state.flipping[uc.id] = true; render();
@@ -1163,6 +1930,7 @@ async function requestFlip(uc) {
     const live = ucById(uc.id); if (live) live.state = action === 'on' ? 'turning_on' : 'turning_off';
     state.expanded = uc.id;
     delete state.flipping[uc.id];
+    delete state.outlines[uc.id]; // a job invalidates the plan
     render();
     if (res && res.job_id) trackJob(uc.id, res.job_id);
     loadUsecases(true);
@@ -1469,72 +2237,128 @@ SB.mock = (function () {
   const iso = (msAgo) => new Date(Date.now() - msAgo).toISOString();
   const MIN = 60000, H = 3600000, D = 86400000;
   let authed = PARAMS.get('authed') === '1';
-  let connected = PARAMS.get('connected') === '1';
+  const connected = new Set((PARAMS.get('connected') === '1' ? 'aws' : PARAMS.get('connected') || '').split(',').filter(Boolean));
+  const connectedAtBoot = iso(2 * H);
   const jobs = {};
   let jobSeq = 100;
 
   const identity = { account: '257394018842', arn: 'arn:aws:sts::257394018842:assumed-role/AWSReservedSSO_AdministratorAccess_9f1c2d/nils', alias: null };
   const REGIONS = ['eu-central-1', 'eu-west-1', 'eu-west-2', 'eu-west-3', 'eu-north-1', 'us-east-1', 'us-east-2', 'us-west-1', 'us-west-2', 'ca-central-1', 'ap-southeast-1', 'ap-southeast-2', 'ap-northeast-1', 'ap-northeast-2', 'ap-south-1', 'sa-east-1', 'ap-northeast-3'];
 
+  /* ---- inventory fixture: every v1.1 field on eu-central-1; money derived from one rate table so
+          region totals equal the sum of their lines by construction ---- */
+  const RATE = { 'm5.large': 0.115, 't3.medium': 0.048, 't3.micro': 0.012, 't3.medium:win': 0.0744, nat: 0.052, gp3: 0.0952, gp2: 0.08, ipv4: 0.005 };
+  const r2 = n => Math.round(n * 100) / 100;
   function inventory(fresh) {
     const lab = { Project: 'zpa-pse-lab', ManagedBy: 'opentofu' };
-    const region = (r, extra) => Object.assign({ region: r, instances: [], vpcs: [], nat_gateways: [], eips: [], volumes: [] }, extra || {});
+    const T = (name, extra) => Object.assign({ Name: name }, lab, extra || {});
+    const up = 3 * D + 2 * H, up2 = 3 * D + H;
+    const VPC = { pse: 'vpc-0f1e2d3c4b5a69788', app: 'vpc-0a9b8c7d6e5f41323', def: 'vpc-3b2a1c0d' };
+    const SN = { psePub: 'subnet-0a11b22c33d44e55f', appPub: 'subnet-0b22c33d44e55f66a', appPriv: 'subnet-0c33d44e55f66a77b', appSrv: 'subnet-0d44e55f66a77b88c', appClient: 'subnet-0e55f66a77b88c99d', d1: 'subnet-1a2b3c4d', d2: 'subnet-2b3c4d5e', d3: 'subnet-3c4d5e6f' };
+    const SG = { pse: 'sg-0a1b2c3d4e5f6a7b8', conn: 'sg-0b2c3d4e5f6a7b8c9', nginx: 'sg-0c3d4e5f6a7b8c9d0', client: 'sg-0d4e5f6a7b8c9d0e1', dPse: 'sg-0e5f6a7b8c9d0e1f2', dApp: 'sg-0f6a7b8c9d0e1f2a3', dDef: 'sg-1a7b8c9d0e1f2a3b4' };
+    const IGW = { pse: 'igw-0a1b2c3d4e5f60718', app: 'igw-0b2c3d4e5f607182a', def: 'igw-3c4d5e6f' };
+    const RT = { psePub: 'rtb-0a1b2c3d4e5f60718', pseMain: 'rtb-0a9f8e7d6c5b4a392', appPub: 'rtb-0b2c3d4e5f607182a', appPriv: 'rtb-0c3d4e5f6071829b3', appMain: 'rtb-0c9f8e7d6c5b4a394', defMain: 'rtb-3d4e5f6a' };
+    const NAT = 'nat-0123456789abcdef0';
+    const AMI = { al: 'ami-0e2c8caa4b6378d8c', win: 'ami-0b6d8c7e5f4a3b2c1' };
+    const inst = (o) => Object.assign({ state: 'running', platform: 'Linux/UNIX', architecture: 'x86_64', vpc: VPC.app, ami: AMI.al, ami_name: 'al2023-ami-2023.5.20240722.0-kernel-6.1-x86_64', iam_instance_profile: 'zpa-lab-instance-profile', key_name: 'zpa-lab', root_device: '/dev/xvda', monitoring: false, ebs_optimized: true, user_data_present: true }, o);
+    const instances = [
+      inst({ id: 'i-0a1b2c3d4e5f60718', name: 'zpa-lab-pse', type: 'm5.large', az: 'eu-central-1a', vpc: VPC.pse, subnet: SN.psePub, private_ip: '10.91.10.5', public_ip: '63.188.16.52', launched: iso(up), uptime_h: up / H, security_groups: [{ id: SG.pse, name: 'zpa-lab-pse-sg' }], volumes: ['vol-0aa1f3c9d2e4b5a61'], monthly_usd: r2(RATE['m5.large'] * 730), tags: T('zpa-lab-pse', { Role: 'pse' }) }),
+      inst({ id: 'i-0b2c3d4e5f607182a', name: 'zpa-lab-connector-a', type: 't3.medium', az: 'eu-central-1a', subnet: SN.appPriv, private_ip: '10.90.1.21', public_ip: null, launched: iso(up), uptime_h: up / H, security_groups: [{ id: SG.conn, name: 'zpa-lab-connector-sg' }], volumes: ['vol-0aa2e4d0c3f5a6b72'], monthly_usd: r2(RATE['t3.medium'] * 730), tags: T('zpa-lab-connector-a', { Role: 'app-connector' }) }),
+      inst({ id: 'i-0c3d4e5f6071829b3', name: 'zpa-lab-connector-b', type: 't3.medium', az: 'eu-central-1b', subnet: SN.appPriv, private_ip: '10.90.1.22', public_ip: null, launched: iso(up), uptime_h: up / H, security_groups: [{ id: SG.conn, name: 'zpa-lab-connector-sg' }], volumes: ['vol-0aa3f5e1d4a6b7c83'], monthly_usd: r2(RATE['t3.medium'] * 730), tags: T('zpa-lab-connector-b', { Role: 'app-connector' }) }),
+      inst({ id: 'i-0d4e5f607182a9b4c', name: 'zpa-lab-nginx', type: 't3.micro', az: 'eu-central-1a', subnet: SN.appSrv, private_ip: '10.90.2.10', public_ip: null, launched: iso(up2), uptime_h: up2 / H, security_groups: [{ id: SG.nginx, name: 'zpa-lab-nginx-sg' }], volumes: ['vol-0aa4a6f2e5b7c8d94'], monthly_usd: r2(RATE['t3.micro'] * 730), ebs_optimized: false, tags: T('zpa-lab-nginx', { Role: 'app-server' }) }),
+      inst({ id: 'i-0e5f607182a9b4c5d', name: 'zpa-lab-win-client', type: 't3.medium', az: 'eu-central-1a', subnet: SN.appClient, private_ip: '10.90.3.15', public_ip: '3.72.118.204', launched: iso(up2), uptime_h: up2 / H, platform: 'Windows', ami: AMI.win, ami_name: 'Windows_Server-2022-English-Full-Base-2024.07.10', root_device: '/dev/sda1', security_groups: [{ id: SG.client, name: 'zpa-lab-client-sg' }], volumes: ['vol-0aa5b7a3f6c8d9ea5'], monthly_usd: r2(RATE['t3.medium:win'] * 730), tags: T('zpa-lab-win-client', { Role: 'client' }) }),
+    ];
+    const vol = (id, gb, i, dev, extra) => Object.assign({ id, size_gb: gb, type: 'gp3', az: i ? i.az : 'eu-central-1a', iops: 3000, throughput: 125, encrypted: true, state: 'in-use', attached: !!i, instance: i ? i.id : null, attached_to: i ? i.id : null, device: i ? dev : null, created: i ? i.launched : iso(11 * D), name: i ? i.name : null, monthly_usd: r2(gb * RATE.gp3), tags: i ? T(i.name) : {} }, extra || {});
+    const volumes = [
+      vol('vol-0aa1f3c9d2e4b5a61', 80, instances[0], '/dev/xvda'), vol('vol-0aa2e4d0c3f5a6b72', 30, instances[1], '/dev/xvda'),
+      vol('vol-0aa3f5e1d4a6b7c83', 30, instances[2], '/dev/xvda', { az: 'eu-central-1b' }), vol('vol-0aa4a6f2e5b7c8d94', 8, instances[3], '/dev/xvda'),
+      vol('vol-0aa5b7a3f6c8d9ea5', 50, instances[4], '/dev/sda1'),
+      vol('vol-0bb6c8d4a7e9f0ab6', 20, null, null, { state: 'available', name: 'win-client-restore-test', encrypted: false, tags: { Name: 'win-client-restore-test' } }),
+    ];
+    const sub = (id, name, cidr, az, rt, target) => ({ id, name, cidr, az, public: !!(target && target.startsWith('igw-')), route_table: rt, default_route: target, map_public_ip: !!(target && target.startsWith('igw-')), available_ips: 240 });
+    const rt = (id, name, main, routes, subnets) => ({ id, name, main, routes: [{ dest: '10.0.0.0/8', target: 'local', state: 'active' }].map(x => x).concat(routes), subnets, tags: name ? T(name) : {} });
+    const vpcs = [
+      { id: VPC.pse, name: 'zpa-lab-pse-vpc', cidr: '10.91.0.0/16', default: false, state: 'available', dns_hostnames: true, igw: IGW.pse, nat_gateways: [],
+        subnets: [sub(SN.psePub, 'zpa-lab-pse-public', '10.91.10.0/24', 'eu-central-1a', RT.psePub, IGW.pse)],
+        route_tables: [
+          { id: RT.pseMain, name: null, main: true, routes: [{ dest: '10.91.0.0/16', target: 'local', state: 'active' }], subnets: [], tags: {} },
+          { id: RT.psePub, name: 'zpa-lab-pse-public', main: false, routes: [{ dest: '10.91.0.0/16', target: 'local', state: 'active' }, { dest: '0.0.0.0/0', target: IGW.pse, state: 'active' }], subnets: [SN.psePub], tags: T('zpa-lab-pse-public') }],
+        tags: T('zpa-lab-pse-vpc') },
+      { id: VPC.app, name: 'zpa-lab-app-vpc', cidr: '10.90.0.0/16', default: false, state: 'available', dns_hostnames: true, igw: IGW.app, nat_gateways: [NAT],
+        subnets: [
+          sub(SN.appPub, 'zpa-lab-app-public', '10.90.0.0/24', 'eu-central-1a', RT.appPub, IGW.app),
+          sub(SN.appPriv, 'zpa-lab-app-private', '10.90.1.0/24', 'eu-central-1a', RT.appPriv, NAT),
+          sub(SN.appSrv, 'zpa-lab-app-server', '10.90.2.0/24', 'eu-central-1a', RT.appPriv, NAT),
+          sub(SN.appClient, 'zpa-lab-app-client', '10.90.3.0/24', 'eu-central-1a', RT.appPub, IGW.app)],
+        route_tables: [
+          { id: RT.appMain, name: null, main: true, routes: [{ dest: '10.90.0.0/16', target: 'local', state: 'active' }], subnets: [], tags: {} },
+          { id: RT.appPub, name: 'zpa-lab-app-public', main: false, routes: [{ dest: '10.90.0.0/16', target: 'local', state: 'active' }, { dest: '0.0.0.0/0', target: IGW.app, state: 'active' }], subnets: [SN.appPub, SN.appClient], tags: T('zpa-lab-app-public') },
+          { id: RT.appPriv, name: 'zpa-lab-app-private', main: false, routes: [{ dest: '10.90.0.0/16', target: 'local', state: 'active' }, { dest: '0.0.0.0/0', target: NAT, state: 'active' }, { dest: '10.91.0.0/16', target: 'pcx-0a1b2c3d4e5f60718', state: 'active' }], subnets: [SN.appPriv, SN.appSrv], tags: T('zpa-lab-app-private') }],
+        tags: T('zpa-lab-app-vpc') },
+      { id: VPC.def, name: null, cidr: '172.31.0.0/16', default: true, state: 'available', dns_hostnames: true, igw: IGW.def, nat_gateways: [],
+        subnets: [sub(SN.d1, null, '172.31.0.0/20', 'eu-central-1a', RT.defMain, IGW.def), sub(SN.d2, null, '172.31.16.0/20', 'eu-central-1b', RT.defMain, IGW.def), sub(SN.d3, null, '172.31.32.0/20', 'eu-central-1c', RT.defMain, IGW.def)],
+        route_tables: [{ id: RT.defMain, name: null, main: true, routes: [{ dest: '172.31.0.0/16', target: 'local', state: 'active' }, { dest: '0.0.0.0/0', target: IGW.def, state: 'active' }], subnets: [SN.d1, SN.d2, SN.d3], tags: {} }],
+        tags: {} },
+    ];
+    void rt;
+    const nat_gateways = [{ id: NAT, name: 'zpa-lab-app-nat', vpc: VPC.app, subnet: SN.appPub, state: 'available', public_ip: '18.196.44.9', private_ip: '10.90.0.12', connectivity_type: 'public', created: iso(up), monthly_usd: r2(RATE.nat * 730), tags: T('zpa-lab-app-nat') }];
+    const eip = (ip, alloc, assoc, extra) => Object.assign({ ip, allocation_id: alloc, attached: !!assoc, instance: assoc && assoc.kind === 'instance' ? assoc.id : null, association: assoc, private_ip: null, name: null, monthly_usd: r2(RATE.ipv4 * 730), tags: {} }, extra || {});
+    const eips = [
+      eip('63.188.16.52', 'eipalloc-0c2d3e4f5a6b7c8d9', { kind: 'instance', id: instances[0].id, eni: 'eni-0a1b2c3d4e5f60718' }, { private_ip: '10.91.10.5', name: 'zpa-lab-pse', tags: T('zpa-lab-pse') }),
+      eip('18.196.44.9', 'eipalloc-0d3e4f5a6b7c8d9e0', { kind: 'nat', id: NAT, eni: 'eni-0b2c3d4e5f607182a' }, { private_ip: '10.90.0.12', name: 'zpa-lab-nat', tags: T('zpa-lab-nat') }),
+      eip('3.72.118.204', 'eipalloc-0e4f5a6b7c8d9e0f1', { kind: 'instance', id: instances[4].id, eni: 'eni-0c3d4e5f6071829b3' }, { private_ip: '10.90.3.15', name: 'zpa-lab-win-client', tags: T('zpa-lab-win-client') }),
+      eip('3.120.55.17', 'eipalloc-0f5a6b7c8d9e0f1a2', null, { name: 'zpa-lab-pse-old', tags: T('zpa-lab-pse-old') }),
+      eip('18.185.9.201', 'eipalloc-1a6b7c8d9e0f1a2b3', null, {}),
+    ];
+    const sg = (id, name, vpc, description, ingress, egress, attached_to, tags) => ({ id, name, vpc, description, ingress, egress, attached_to, tags: tags || {} });
+    const rule = (proto, from, to, source) => ({ proto, from, to, source });
+    const allOut = [rule('all', null, null, '0.0.0.0/0')];
+    const security_groups = [
+      sg(SG.pse, 'zpa-lab-pse-sg', VPC.pse, 'Private Service Edge: client TLS in, SSH from the lab', [rule('tcp', 443, 443, '0.0.0.0/0'), rule('udp', 443, 443, '0.0.0.0/0'), rule('tcp', 22, 22, '10.0.0.0/8')], allOut, [instances[0].id], T('zpa-lab-pse-sg')),
+      sg(SG.conn, 'zpa-lab-connector-sg', VPC.app, 'App Connectors: outbound only, SSH from inside the VPC', [rule('tcp', 22, 22, '10.90.0.0/16')], allOut, [instances[1].id, instances[2].id], T('zpa-lab-connector-sg')),
+      sg(SG.nginx, 'zpa-lab-nginx-sg', VPC.app, 'Protected app: HTTP/S from the connectors only', [rule('tcp', 80, 80, SG.conn), rule('tcp', 443, 443, SG.conn)], allOut, [instances[3].id], T('zpa-lab-nginx-sg')),
+      sg(SG.client, 'zpa-lab-client-sg', VPC.app, 'Windows client: RDP for the demo operator', [rule('tcp', 3389, 3389, '0.0.0.0/0')], allOut, [instances[4].id], T('zpa-lab-client-sg')),
+      sg(SG.dPse, 'default', VPC.pse, 'default VPC security group', [rule('all', null, null, SG.dPse)], allOut, [], {}),
+      sg(SG.dApp, 'default', VPC.app, 'default VPC security group', [rule('all', null, null, SG.dApp)], allOut, [], {}),
+      sg(SG.dDef, 'default', VPC.def, 'default VPC security group', [rule('all', null, null, SG.dDef)], allOut, [], {}),
+    ];
+    const region = (r, extra) => Object.assign({ region: r, instances: [], vpcs: [], nat_gateways: [], eips: [], volumes: [], security_groups: [], monthly_usd: 0, resource_count: 0 }, extra || {});
+    const defVpc = (r, id) => ({ id, name: null, cidr: '172.31.0.0/16', default: true, state: 'available', dns_hostnames: true, igw: 'igw-' + id.slice(4), nat_gateways: [], subnets: [], route_tables: [], tags: {} });
+    const regions = [
+      region('eu-central-1', { instances, vpcs, nat_gateways, eips, volumes, security_groups }),
+      region('eu-west-1', { vpcs: [defVpc('eu-west-1', 'vpc-1a2b3c4d')], eips: [eip('54.170.12.88', 'eipalloc-2b7c8d9e0f1a2b3c4', null, {})], security_groups: [sg('sg-2b8c9d0e1f2a3b4c5', 'default', 'vpc-1a2b3c4d', 'default VPC security group', [], allOut, [], {})] }),
+      region('us-east-1', { vpcs: [defVpc('us-east-1', 'vpc-5e6f7a8b')], volumes: [{ id: 'vol-0ff9a1b2c3d4e5f60', size_gb: 100, type: 'gp2', az: 'us-east-1a', iops: 300, throughput: null, encrypted: false, state: 'available', attached: false, instance: null, attached_to: null, device: null, created: iso(210 * D), name: 'old-jumpbox-root', monthly_usd: r2(100 * RATE.gp2), tags: { Name: 'old-jumpbox-root' } }] }),
+      ...REGIONS.filter(r => !['eu-central-1', 'eu-west-1', 'us-east-1'].includes(r)).map(r => region(r, ['eu-west-2', 'us-west-2', 'ap-southeast-1'].includes(r) ? { vpcs: [defVpc(r, 'vpc-' + r.replace(/-/g, '').slice(0, 8))] } : {})),
+    ];
+    // cost lines from the resources themselves, so every region total is the sum of its lines
+    const lines = [];
+    const line = (item, reg, qty, unit, unit_usd, monthly) => { const l = lines.find(x => x.item === item && x.region === reg); if (l) { l.qty += qty; l.monthly_usd = r2(l.monthly_usd + monthly); l.n = (l.n || 1) + 1; } else lines.push({ item, region: reg, qty, unit, unit_usd, monthly_usd: r2(monthly), n: 1 }); };
+    const groups = {};
+    const attribute = (reg, x, project) => { const k = project ? 'Project=' + project : 'untagged'; groups[k] = groups[k] || { key: k, instances: 0, monthly_usd: 0 }; groups[k].monthly_usd = r2(groups[k].monthly_usd + x.monthly_usd); };
+    for (const rg of regions) {
+      const byId = new Map(rg.instances.map(i => [i.id, i]));
+      const pj = x => (x.tags && x.tags.Project) || null;
+      for (const i of rg.instances) { line(i.type + (i.platform === 'Windows' ? ' Windows' : ' Linux'), rg.region, 730, 'hr', RATE[i.type + (i.platform === 'Windows' ? ':win' : '')], i.monthly_usd); attribute(rg.region, i, pj(i)); if (pj(i)) groups['Project=' + pj(i)].instances++; }
+      for (const n of rg.nat_gateways) { line('NAT gateway', rg.region, 730, 'hr', RATE.nat, n.monthly_usd); attribute(rg.region, n, pj(n)); }
+      for (const v of rg.volumes) { line('EBS ' + v.type + (v.attached ? '' : ' (unattached)'), rg.region, v.size_gb, 'GB-mo', RATE[v.type], v.monthly_usd); attribute(rg.region, v, pj(v) || (v.attached_to && byId.get(v.attached_to) ? pj(byId.get(v.attached_to)) : null)); }
+      for (const e of rg.eips) { line(e.attached ? 'Public IPv4' : 'Elastic IP (idle)', rg.region, 730, 'hr', RATE.ipv4, e.monthly_usd); const via = e.association && e.association.kind === 'instance' ? byId.get(e.association.id) : e.association && e.association.kind === 'nat' ? rg.nat_gateways.find(n => n.id === e.association.id) : null; attribute(rg.region, e, pj(e) || (via ? pj(via) : null)); }
+      rg.monthly_usd = r2(lines.filter(l => l.region === rg.region).reduce((s, l) => s + l.monthly_usd, 0));
+      rg.resource_count = ['instances', 'vpcs', 'nat_gateways', 'eips', 'volumes', 'security_groups'].reduce((s, k) => s + rg[k].length, 0);
+    }
+    for (const l of lines) { if (l.n > 1) l.item += ' ×' + l.n; delete l.n; }
+    const total = r2(lines.reduce((s, l) => s + l.monthly_usd, 0));
+    const all = k => regions.reduce((s, rg) => s + rg[k].length, 0);
     return {
       generated_at: fresh ? iso(0) : iso(14 * MIN + 12000),
       stale: !fresh,
-      regions: [
-        region('eu-central-1', {
-          instances: [
-            { id: 'i-0a1b2c3d4e5f60718', name: 'zpa-lab-pse', type: 'm5.large', state: 'running', private_ip: '10.91.10.5', public_ip: '63.188.16.52', launched: iso(3 * D + 2 * H), tags: Object.assign({ Name: 'zpa-lab-pse', Role: 'pse' }, lab) },
-            { id: 'i-0b2c3d4e5f607182a', name: 'zpa-lab-connector-a', type: 't3.medium', state: 'running', private_ip: '10.90.1.21', public_ip: null, launched: iso(3 * D + 2 * H), tags: Object.assign({ Name: 'zpa-lab-connector-a', Role: 'app-connector' }, lab) },
-            { id: 'i-0c3d4e5f6071829b3', name: 'zpa-lab-connector-b', type: 't3.medium', state: 'running', private_ip: '10.90.1.22', public_ip: null, launched: iso(3 * D + 2 * H), tags: Object.assign({ Name: 'zpa-lab-connector-b', Role: 'app-connector' }, lab) },
-            { id: 'i-0d4e5f607182a9b4c', name: 'zpa-lab-nginx', type: 't3.micro', state: 'running', private_ip: '10.90.2.10', public_ip: null, launched: iso(3 * D + H), tags: Object.assign({ Name: 'zpa-lab-nginx', Role: 'app-server' }, lab) },
-            { id: 'i-0e5f607182a9b4c5d', name: 'zpa-lab-win-client', type: 't3.medium', state: 'running', private_ip: '10.90.3.15', public_ip: '3.72.118.204', launched: iso(3 * D + H), tags: Object.assign({ Name: 'zpa-lab-win-client', Role: 'client' }, lab) },
-          ],
-          vpcs: [
-            { id: 'vpc-0f1e2d3c4b5a69788', name: 'zpa-lab-pse-vpc', cidr: '10.91.0.0/16', default: false },
-            { id: 'vpc-0a9b8c7d6e5f41323', name: 'zpa-lab-app-vpc', cidr: '10.90.0.0/16', default: false },
-            { id: 'vpc-3b2a1c0d', name: null, cidr: '172.31.0.0/16', default: true },
-          ],
-          nat_gateways: [{ id: 'nat-0123456789abcdef0', vpc: 'vpc-0a9b8c7d6e5f41323', state: 'available', public_ip: '18.196.44.9' }],
-          eips: [
-            { ip: '63.188.16.52', attached: true, instance: 'i-0a1b2c3d4e5f60718' },
-            { ip: '18.196.44.9', attached: true, instance: null },
-            { ip: '3.72.118.204', attached: true, instance: 'i-0e5f607182a9b4c5d' },
-          ],
-          volumes: [
-            { id: 'vol-0aa1', size_gb: 80, type: 'gp3', attached: true }, { id: 'vol-0aa2', size_gb: 30, type: 'gp3', attached: true },
-            { id: 'vol-0aa3', size_gb: 30, type: 'gp3', attached: true }, { id: 'vol-0aa4', size_gb: 8, type: 'gp3', attached: true },
-            { id: 'vol-0aa5', size_gb: 50, type: 'gp3', attached: true },
-          ],
-        }),
-        region('eu-west-1', { vpcs: [{ id: 'vpc-1a2b3c4d', name: null, cidr: '172.31.0.0/16', default: true }], eips: [{ ip: '54.170.12.88', attached: false, instance: null }] }),
-        region('us-east-1', { vpcs: [{ id: 'vpc-5e6f7a8b', name: null, cidr: '172.31.0.0/16', default: true }], volumes: [{ id: 'vol-0ff9', size_gb: 100, type: 'gp2', attached: false }] }),
-        ...REGIONS.filter(r => !['eu-central-1', 'eu-west-1', 'us-east-1'].includes(r)).map(r => region(r, ['eu-west-2', 'us-west-2', 'ap-southeast-1'].includes(r) ? { vpcs: [{ id: 'vpc-' + r.replace(/-/g, '').slice(0, 8), name: null, cidr: '172.31.0.0/16', default: true }] } : {})),
-      ],
-      totals: { instances: 5, running: 5, vpcs: 6, nat_gateways: 1, eips: 4, volumes_gb: 298 },
-      groups: [
-        { key: 'Project=zpa-pse-lab', instances: 5, monthly_usd: 284.86 },
-        { key: 'untagged', instances: 0, monthly_usd: 11.65 },
-      ],
-      cost: {
-        monthly_usd: 296.51, currency: 'USD', method: 'on-demand list price × 730h',
-        lines: [
-          { item: 'm5.large Linux', region: 'eu-central-1', qty: 730, unit: 'hr', unit_usd: 0.115, monthly_usd: 83.95 },
-          { item: 't3.medium Linux ×2', region: 'eu-central-1', qty: 1460, unit: 'hr', unit_usd: 0.048, monthly_usd: 70.08 },
-          { item: 't3.medium Windows', region: 'eu-central-1', qty: 730, unit: 'hr', unit_usd: 0.0744, monthly_usd: 54.31 },
-          { item: 't3.micro Linux', region: 'eu-central-1', qty: 730, unit: 'hr', unit_usd: 0.012, monthly_usd: 8.76 },
-          { item: 'NAT gateway', region: 'eu-central-1', qty: 730, unit: 'hr', unit_usd: 0.052, monthly_usd: 37.96 },
-          { item: 'EBS gp3', region: 'eu-central-1', qty: 198, unit: 'GB-mo', unit_usd: 0.0952, monthly_usd: 18.85 },
-          { item: 'Public IPv4 ×3', region: 'eu-central-1', qty: 2190, unit: 'hr', unit_usd: 0.005, monthly_usd: 10.95 },
-          { item: 'EBS gp2 (unattached)', region: 'us-east-1', qty: 100, unit: 'GB-mo', unit_usd: 0.08, monthly_usd: 8.00 },
-          { item: 'Elastic IP (idle)', region: 'eu-west-1', qty: 730, unit: 'hr', unit_usd: 0.005, monthly_usd: 3.65 },
-        ],
-        notes: ['Unattached elastic IPs are billed', 'NAT data processing not included', 'Windows price includes the licence surcharge'],
-      },
+      regions,
+      totals: { instances: all('instances'), running: all('instances'), vpcs: all('vpcs'), nat_gateways: all('nat_gateways'), eips: all('eips'), volumes_gb: regions.reduce((s, rg) => s + rg.volumes.reduce((t, v) => t + v.size_gb, 0), 0), security_groups: all('security_groups'), subnets: regions.reduce((s, rg) => s + rg.vpcs.reduce((t, v) => t + (v.subnets || []).length, 0), 0) },
+      groups: Object.values(groups).sort((a, b) => b.monthly_usd - a.monthly_usd),
+      cost: { monthly_usd: total, currency: 'USD', method: 'on-demand list price × 730h', lines, notes: ['Unattached elastic IPs are billed', 'NAT data processing not included', 'Windows price includes the licence surcharge'] },
     };
   }
   let inv = inventory(false);
+
 
   const PSE_DESC = `## What it builds
 
@@ -2022,6 +2846,48 @@ tofu -chdir=terraform apply
     return { path, language: FILE_LANG[path.split('.').pop()] || 'text', content };
   }
 
+  /* ---- providers: identities, forms, connection reports ---- */
+  const IDENTITY = {
+    aws: identity,
+    gcp: { client_email: 'switchboard@zs-lab-demo.iam.gserviceaccount.com', project_id: 'zs-lab-demo', project_name: 'Zscaler Lab Demo', project_number: '638201947512' },
+    azure: { tenant: '3f1a9c2e-7b4d-4e8f-9a1b-2c3d4e5f6a7b', tenant_name: 'nilsujma.onmicrosoft.com', subscription_name: 'ZS Lab Sandbox', subscription_id: 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d', client_id: '9e8d7c6b-5a4f-4e3d-2c1b-0a9f8e7d6c5b' },
+  };
+  const PROVIDERS = [
+    { id: 'aws', name: 'Amazon Web Services', capabilities: { inventory: true, usecases: true } },
+    { id: 'gcp', name: 'Google Cloud', capabilities: { inventory: false, usecases: false } },
+    { id: 'azure', name: 'Microsoft Azure', capabilities: { inventory: false, usecases: false } },
+  ];
+  const UNSUPPORTED = {
+    gcp: 'Inventory and cost are not built for Google Cloud yet; the connection is real, the scan is not',
+    azure: 'Inventory and cost are not built for Azure yet; the connection is real, the scan is not',
+  };
+  const FORMS = {
+    aws: [
+      { name: 'access_key_id', label: 'Access key ID', type: 'text', required: true, help: 'AKIA… (long-lived) or ASIA… (SSO session)' },
+      { name: 'secret_access_key', label: 'Secret access key', type: 'password', required: true, help: 'Never stored in clear; Fernet-encrypted at rest' },
+      { name: 'session_token', label: 'Session token', type: 'textarea', required: false, help: 'Required with ASIA… keys from an SSO session' },
+    ],
+    gcp: [
+      { name: 'service_account_json', label: 'Service account key (JSON)', type: 'file', required: true, help: 'Paste or upload the key file downloaded from IAM → Service accounts → Keys. It must be of type service_account.' },
+      { name: 'project_id', label: 'Project ID', type: 'text', required: false, help: 'Defaults to the key’s own project_id; set it to validate the key against another project.' },
+    ],
+    azure: [
+      { name: 'tenant_id', label: 'Tenant ID', type: 'text', required: true, help: 'Directory (tenant) ID of the Entra ID tenant, a GUID' },
+      { name: 'client_id', label: 'Client ID', type: 'text', required: true, help: 'Application (client) ID of the service principal, a GUID' },
+      { name: 'client_secret', label: 'Client secret', type: 'password', required: true, help: 'The secret *value* (not its ID); Fernet-encrypted at rest' },
+      { name: 'subscription_id', label: 'Subscription ID', type: 'text', required: false, help: 'Required only if the principal can see more than one subscription' },
+    ],
+  };
+  const connectedAt = {}, updatedAt = {};
+  connected.forEach(id => { connectedAt[id] = connectedAtBoot; });
+  if (PARAMS.get('rotated') === '1') connected.forEach(id => { updatedAt[id] = iso(20 * MIN); }); // "credentials updated 20 min ago"
+  function providerView(p) {
+    const on = connected.has(p.id);
+    const idn = on ? IDENTITY[p.id] : null;
+    const label = !idn ? null : p.id === 'aws' ? idn.account : p.id === 'gcp' ? idn.client_email : idn.subscription_name;
+    return { id: p.id, name: p.name, status: on ? 'connected' : 'disconnected', identity: idn, identity_label: label, regions: on && p.id === 'aws' ? REGIONS : [], connected_at: on ? connectedAt[p.id] : null, credentials_updated_at: on ? (updatedAt[p.id] || connectedAt[p.id]) : null, capabilities: p.capabilities };
+  }
+
   function report(fail, temporary) {
     const checks = [
       { name: 'Credentials valid (STS)', ok: true, detail: 'assumed-role/AWSReservedSSO_AdministratorAccess_9f1c2d/nils' },
@@ -2033,25 +2899,124 @@ tofu -chdir=terraform apply
     ];
     return { ok: !fail, identity: { account: identity.account, arn: identity.arn }, checks };
   }
+  /** GCP: bad JSON fails at the first check; a key whose private_key mentions FAIL fails at the token check. */
+  function reportGcp(body) {
+    let info = null, jsonErr = null;
+    try { info = JSON.parse(body.service_account_json || ''); if (!info || info.type !== 'service_account') jsonErr = 'JSON parsed but "type" is ' + JSON.stringify(info && info.type) + ', not "service_account"'; }
+    catch (e) { jsonErr = 'not valid JSON: ' + e.message.split('\n')[0]; }
+    const idn = IDENTITY.gcp;
+    if (jsonErr) return { ok: false, identity: null, checks: [
+      { name: 'Service account JSON valid', ok: false, detail: jsonErr },
+      { name: 'Token obtainable', ok: false, detail: 'Skipped: the key could not be read' },
+      { name: 'Project resolvable', ok: false, detail: 'Skipped: the key could not be read' },
+      { name: 'Compute Engine API enabled', ok: false, detail: 'Skipped: the key could not be read' }] };
+    const email = info.client_email || idn.client_email, project = (body.project_id || info.project_id || idn.project_id);
+    const bad = /fail/i.test(String(info.private_key || '') + String(info.private_key_id || ''));
+    return { ok: !bad, identity: bad ? null : Object.assign({}, idn, { client_email: email, project_id: project }), checks: [
+      { name: 'Service account JSON valid', ok: true, detail: email },
+      { name: 'Token obtainable', ok: !bad, detail: bad ? 'invalid_grant: Invalid JWT Signature.' : 'OAuth2 token for ' + email },
+      { name: 'Project resolvable', ok: !bad, detail: bad ? 'Skipped: no token' : idn.project_name + ' (' + project + ') ACTIVE' },
+      { name: 'Compute Engine API enabled', ok: !bad, detail: bad ? 'Skipped: no token' : '41 regions' }] };
+  }
+  /** Azure: a secret containing "fail" is rejected at the token check. */
+  function reportAzure(body) {
+    const idn = IDENTITY.azure;
+    const guid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const badGuid = !guid.test(body.tenant_id || '') ? 'tenant id' : !guid.test(body.client_id || '') ? 'client id' : null;
+    const bad = badGuid ? badGuid + ' is not a GUID' : /fail/i.test(body.client_secret || '') ? 'AADSTS7000215: Invalid client secret provided. Ensure the secret being sent in the request is the client secret value, not the client secret ID.' : null;
+    const sub = body.subscription_id || idn.subscription_id;
+    return { ok: !bad, identity: bad ? null : Object.assign({}, idn, { tenant: body.tenant_id, client_id: body.client_id, subscription_id: sub }), checks: [
+      { name: 'Token from client secret', ok: !bad, detail: bad || 'token for ' + body.client_id + ' in ' + idn.tenant_name },
+      { name: 'Subscriptions listable', ok: !bad, detail: bad ? 'Skipped: no token' : '1 visible, 1 enabled' },
+      { name: 'Subscription readable', ok: !bad, detail: bad ? 'Skipped: no token' : idn.subscription_name + ' (' + sub + ') Enabled' },
+      { name: 'Resource Manager reachable', ok: !bad, detail: bad ? 'Skipped: no token' : '7 resource groups' }] };
+  }
 
-  /* ---- scenes: ?scene=checklist&shown=3&fail=1  ?page=usecases&expand=<id>&code=1  ?region=eu-central-1 ---- */
+  /* ---- outline fixtures: a real-looking plan per use case and action ---- */
+  const PSE_ADDRS = [
+    'aws_vpc.pse', 'aws_vpc.app',
+    'aws_subnet.pse_public', 'aws_subnet.app_public', 'aws_subnet.app_private', 'aws_subnet.app_server', 'aws_subnet.app_client',
+    'aws_internet_gateway.pse', 'aws_internet_gateway.app',
+    'aws_nat_gateway.app',
+    'aws_eip.pse', 'aws_eip.nat',
+    'aws_route_table.pse_public', 'aws_route_table.app_public', 'aws_route_table.app_private', 'aws_route_table.app_client',
+    'aws_route.pse_default', 'aws_route.app_public_default', 'aws_route.app_private_default', 'aws_route.app_client_default',
+    'aws_route_table_association.pse_public', 'aws_route_table_association.app_public', 'aws_route_table_association.app_private', 'aws_route_table_association.app_server', 'aws_route_table_association.app_client',
+    'aws_security_group.pse', 'aws_security_group.connector', 'aws_security_group.nginx', 'aws_security_group.client',
+    'aws_vpc_security_group_ingress_rule.pse_tls_tcp', 'aws_vpc_security_group_ingress_rule.pse_tls_udp', 'aws_vpc_security_group_ingress_rule.pse_ssh', 'aws_vpc_security_group_ingress_rule.connector_ssh', 'aws_vpc_security_group_ingress_rule.nginx_http', 'aws_vpc_security_group_ingress_rule.nginx_https',
+    'aws_vpc_security_group_egress_rule.pse', 'aws_vpc_security_group_egress_rule.connector', 'aws_vpc_security_group_egress_rule.nginx', 'aws_vpc_security_group_egress_rule.client',
+    'aws_instance.pse', 'aws_instance.connector[0]', 'aws_instance.connector[1]', 'aws_instance.nginx', 'aws_instance.win_client',
+    'aws_iam_role.zpa', 'aws_iam_instance_profile.zpa', 'aws_iam_role_policy.ssm_read',
+    'aws_key_pair.lab',
+    'aws_network_acl.app',
+  ];
+  const CC_ADDRS = ['aws_vpc.cc', 'aws_subnet.cc_public', 'aws_subnet.workload', 'aws_internet_gateway.cc', 'aws_route_table.cc_public', 'aws_route_table.workload', 'aws_route.cc_default', 'aws_route.workload_via_cc', 'aws_route_table_association.cc_public', 'aws_route_table_association.workload', 'aws_security_group.cc', 'aws_security_group.workload', 'aws_instance.cc', 'aws_instance.workload'];
+  const entry = a => { const m = /^([a-z0-9_]+)\.([^\[]+)(\[.*\])?$/.exec(a); return { address: a, type: m[1], name: m[2], module: null }; };
+  const EFFECTS = {
+    'zpa-private-service-edge': {
+      on: { creates: [
+        'ZPA Service Edge Group, App Connector Groups and provisioning keys — reused by name if they already exist, never duplicated',
+        'Three SSM SecureString parameters under /zpa-lab/ holding the provisioning keys (overwritten on every run)',
+        'An enrolled Service Edge and two App Connectors in ZPA once the instances boot and dial in (~3 minutes)'], retains: [] },
+      off: { destroys: ['Everything OpenTofu manages in this use case: both VPCs and all their subnets, routes, NACLs and security groups, the NAT gateway, both elastic IPs, all five instances and their volumes, the IAM role and instance profile — see the plan'],
+        retains: [
+          'ZPA Service Edge Group, App Connector Groups and provisioning keys — deleting these is deliberately manual',
+          'The enrolled Service Edge and App Connector entries in ZPA, which will show as disconnected and accumulate one per rebuild',
+          'The three SSM parameters under /zpa-lab/ (harmless; overwritten on the next ON)',
+          'The S3 state object (versioned, so this OFF is recoverable) and the remote lock'] },
+    },
+    'zia-cloud-connector-sandbox': {
+      on: { creates: ['A Cloud Connector registration in ZIA with a provisioning URL — reused if present'], retains: [] },
+      off: { destroys: ['The workload subnet and the connector instance — see the plan'], retains: ['The Cloud Connector entry in ZIA, shown as offline until the next ON'] },
+    },
+    'ot-edge-relay': {
+      on: { creates: ['A rendered relay.conf committed to the checkout (not the repository)'], retains: [] },
+      off: { destroys: ['The relay instance and its route — see the plan'], retains: ['The Modbus path in ZPA; the LOGO! PLC at 10.1.75.10 is never touched'] },
+    },
+  };
+  function plan(create, destroy, unchanged) {
+    const p = { ok: true, generated_at: iso(12000), duration_s: 6.4, create: create.map(entry), update: [], destroy: destroy.map(entry), read: [], unchanged: unchanged.map(entry), change_summary: { add: create.length, change: 0, remove: destroy.length, import: 0, operation: 'plan' } };
+    p.summary = { create: p.create.length, update: 0, destroy: p.destroy.length, unchanged: p.unchanged.length, read: 0 };
+    return p;
+  }
+  function outlineFor(ucId, action) {
+    const uc = usecases[ucId];
+    const eff = (EFFECTS[ucId] || { on: { creates: [], retains: [] }, off: { destroys: [], retains: [] } })[action];
+    const base = { action, plan: null, declared: eff, steps: uc.procedure[action], retained_state: { backend: 's3', bucket: 'zs-lab-tfstate-257394018842', key: 'usecases/' + ucId + '/terraform.tfstate', region: 'eu-central-1' } };
+    if (ucId === 'zpa-private-service-edge') base.plan = action === 'on' ? plan([], [], PSE_ADDRS) : plan([], PSE_ADDRS, []);
+    else if (ucId === 'zia-cloud-connector-sandbox') base.plan = action === 'on' ? plan(CC_ADDRS, [], []) : plan([], [], []);
+    else if (ucId === 'ot-edge-relay') base.plan = { ok: false, generated_at: iso(3000), error: 'tofu plan exited 1: Reference to undeclared input variable: An input variable with the name "relay_host" has not been declared. This variable can be declared with a variable "relay_host" {} block.\n\n  on terraform/main.tf line 41, in resource "aws_instance" "relay":\n  41:   user_data = templatefile("${path.module}/relay.sh.tftpl", { host = var.relay_host })' };
+    else if (uc.provider !== 'aws') base.plan = { ok: false, generated_at: iso(1000), error: 'Provider "' + uc.provider + '" is connected for credentials only: capabilities.usecases is false, so no plan can run' };
+    else base.plan = plan([], [], []);
+    return base;
+  }
+
+  /* ---- scenes: ?scene=checklist&provider=gcp&shown=3&fail=1  ?scene=form&provider=azure&mode=rotate
+          ?page=usecases&expand=<id>&code=1&confirm=1  ?region=eu-central-1&inst=<instance id> ---- */
   function scene(state) {
     const page = PARAMS.get('page');
     if (page === 'usecases' || page === 'clouds') location.hash = '#/' + page;
+    if (PARAMS.get('region')) location.hash = '#/clouds/aws/' + PARAMS.get('region');
+    if (PARAMS.get('inst')) state.drawer.inst[PARAMS.get('inst')] = true;
+    if (PARAMS.get('project')) state.drawer.project = PARAMS.get('project');
     if (PARAMS.get('scene') === 'checklist') {
-      const rep = report(PARAMS.get('fail') === '1', true);
+      const prov = PARAMS.get('provider') || 'aws';
+      const rep = prov === 'gcp' ? reportGcp({ service_account_json: PARAMS.get('fail') === '1' ? '{"type":"service_account","private_key":"FAIL"}' : '{"type":"service_account"}' })
+        : prov === 'azure' ? reportAzure({ tenant_id: IDENTITY.azure.tenant, client_id: IDENTITY.azure.client_id, client_secret: PARAMS.get('fail') === '1' ? 'fail' : 'ok' })
+        : report(PARAMS.get('fail') === '1', true);
       const shown = Math.min(rep.checks.length, parseInt(PARAMS.get('shown') || '3', 10));
-      state.connect = { stage: shown >= rep.checks.length ? 'done' : 'checking', report: rep, shown, error: null, busy: true };
+      state.connect = { provider: prov, mode: PARAMS.get('mode') || 'connect', stage: shown >= rep.checks.length ? 'done' : 'checking', fields: FORMS[prov], values: {}, fieldErrors: {}, report: rep, shown, error: null, busy: true };
     }
-    if (PARAMS.get('region')) state.openRegion = PARAMS.get('region');
     if (PARAMS.get('expand')) state.expanded = PARAMS.get('expand');
   }
   async function sceneAfter(state) {
+    if (PARAMS.get('scene') === 'form') await openConnect(PARAMS.get('provider') || 'aws', PARAMS.get('mode') || 'connect');
     const id = PARAMS.get('expand');
     if (id && usecases[id]) {
       await loadDetail(id);
+      loadOutline(id, 'on'); loadOutline(id, 'off');
       if (PARAMS.get('code') === '1') await toggleCode(usecases[id]);
-      if (PARAMS.get('confirm') === '1' && ucById(id)) requestFlip(ucById(id));
+      if (PARAMS.get('confirm') === '1') { if (!ucById(id)) await loadUsecases(true); if (ucById(id)) requestFlip(ucById(id)); }
     }
   }
 
@@ -2059,29 +3024,49 @@ tofu -chdir=terraform apply
   const need = async () => { await sleep(120 + Math.random() * 180); if (!authed) { onUnauthorised(); throw new ApiError('Not signed in.', 401, 'unauthorised'); } };
   const listItem = uc => {
     const lr = uc.runs[0] ? { job_id: uc.runs[0].job_id, action: uc.runs[0].action, state: uc.runs[0].state, ended: uc.runs[0].ended, started: uc.runs[0].started } : null;
-    const prov = uc.provider === 'aws' ? connected : false;
-    return { id: uc.id, name: uc.name, provider: uc.provider, summary: uc.summary, state: uc.state, resources: uc.resources, last_run: lr, provider_connected: prov };
+    return { id: uc.id, name: uc.name, provider: uc.provider, summary: uc.summary, state: uc.state, resources: uc.resources, last_run: lr, provider_connected: connected.has(uc.provider) };
   };
   const api = {
     me: async () => { await sleep(80); if (!authed) throw new ApiError('Not signed in.', 401, 'unauthorised'); return { authenticated: true }; },
     login: async (pw) => { await sleep(500); if (!pw || pw === 'wrong') throw new ApiError('Wrong password.', 401, 'bad_password'); authed = true; return null; },
     logout: async () => { authed = false; return null; },
-    providers: async () => { await need(); return [{ id: 'aws', name: 'Amazon Web Services', status: connected ? 'connected' : 'disconnected', identity: connected ? identity : null, regions: connected ? REGIONS : [], connected_at: connected ? (SB.mock._connectedAt || (SB.mock._connectedAt = iso(2 * H))) : null }]; },
-    connect: async (id, creds) => {
+    providers: async () => { await need(); return PROVIDERS.map(providerView); },
+    providerForm: async (id) => { await need(); await sleep(250); if (!FORMS[id]) throw new ApiError("Unknown provider '" + id + "'", 404, 'unknown_provider'); return { fields: FORMS[id] }; },
+    connect: async (id, body) => {
       await need(); await sleep(700);
-      const fail = /fail/i.test(creds.access_key_id || '');
-      const rep = report(fail, !!creds.session_token);
-      if (!fail) { connected = true; SB.mock._connectedAt = iso(0); inv = inventory(false); }
+      if (!FORMS[id]) throw new ApiError("Unknown provider '" + id + "'", 404, 'unknown_provider');
+      const missing = FORMS[id].filter(f => f.required && !(body[f.name] && String(body[f.name]).trim())).map(f => f.name);
+      if (missing.length) throw new ApiError('Invalid request: check ' + missing.join(', '), 422, 'validation_error');
+      const rep = id === 'aws' ? report(/fail/i.test(body.access_key_id || ''), !!body.session_token) : id === 'gcp' ? reportGcp(body) : reportAzure(body);
+      if (rep.ok) {
+        const was = connected.has(id);
+        connected.add(id);
+        if (!was) connectedAt[id] = iso(0); else updatedAt[id] = iso(0);
+        if (id === 'aws') inv = inventory(false);
+      }
       return rep;
     },
-    disconnect: async () => { await need(); connected = false; return null; },
-    inventory: async (id, refresh) => { await need(); if (!connected) throw new ApiError('AWS is not connected.', 409, 'not_connected'); if (refresh) { await sleep(1400); inv = inventory(true); } return inv; },
+    disconnect: async (id) => { await need(); connected.delete(id); delete connectedAt[id]; delete updatedAt[id]; return null; },
+    inventory: async (id, refresh) => {
+      await need();
+      if (!connected.has(id)) throw new ApiError("Provider '" + id + "' is not connected", 409, 'provider_not_connected');
+      if (id !== 'aws') return { supported: false, reason: UNSUPPORTED[id] || 'Inventory is not built for this provider yet', generated_at: null, stale: false };
+      if (refresh) { await sleep(1400); inv = inventory(true); }
+      return inv;
+    },
     usecases: async () => { await need(); return Object.values(usecases).map(listItem); },
     usecase: async (id) => { await need(); const uc = usecases[id]; if (!uc) throw new ApiError('No such use case.', 404, 'not_found'); return Object.assign(listItem(uc), { description: uc.description, procedure: uc.procedure, source: uc.source, status: uc.status, runs: uc.runs.slice(0, 20) }); },
+    outline: async (id, action) => {
+      await need(); const uc = usecases[id]; if (!uc) throw new ApiError('No such use case.', 404, 'not_found');
+      if (action !== 'on' && action !== 'off') throw new ApiError("Unknown action '" + action + "'", 400, 'bad_action');
+      if (uc.runs.some(r => r.state === 'running')) throw new ApiError("A job is already running for use case '" + id + "'", 409, 'job_running');
+      await sleep(action === 'on' ? 900 : 1500);
+      return outlineFor(id, action);
+    },
     flip: async (id, action) => {
       await need(); const uc = usecases[id]; if (!uc) throw new ApiError('No such use case.', 404, 'not_found');
       if (uc.runs.some(r => r.state === 'running')) throw new ApiError('A job is already running for this use case.', 409, 'busy');
-      if (uc.provider !== 'aws' || !connected) throw new ApiError('Provider is not connected.', 409, 'provider_disconnected');
+      if (uc.provider !== 'aws' || !connected.has('aws')) throw new ApiError('Provider is not connected.', 409, 'provider_disconnected');
       await sleep(300);
       const job = mkJob(id, action, {});
       return { job_id: job.id };
@@ -2092,7 +3077,7 @@ tofu -chdir=terraform apply
     job: async (jobId) => { await need(); const j = jobs[jobId]; if (!j) throw new ApiError('No such job.', 404, 'not_found'); return { id: j.id, usecase: j.usecase, action: j.action, state: j.state, steps: j.steps.map(s => Object.assign({}, s)), started: j.started, ended: j.ended }; },
     jobLog: async (jobId, since) => { await need(); const j = jobs[jobId]; if (!j) throw new ApiError('No such job.', 404, 'not_found'); since = since || 0; return { lines: j._lines.slice(since), next: j._lines.length }; },
   };
-  return { api, usecases, jobs, scene, sceneAfter, report };
+  return { api, usecases, jobs, scene, sceneAfter, report, reportGcp, reportAzure, outlineFor, inventory };
 })();
 
 /* ==========================================================================
