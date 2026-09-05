@@ -21,7 +21,7 @@ from starlette.exceptions import HTTPException  # base class: catches FastAPI's 
 from app.auth import Auth
 from app.jobs import JobRunner
 from app.providers import build_registry
-from app.providers.base import Provider
+from app.providers.base import FormError, Provider
 from app.store import Store, utcnow_iso
 from app.usecases.engine import Engine, EngineError, iso_age_seconds
 
@@ -65,13 +65,6 @@ def error_response(status: int, code: str, message: str) -> JSONResponse:
 # ---------------------------------------------------------------------- request models
 class LoginRequest(BaseModel):
     password: str = Field(min_length=1)
-
-
-class ConnectRequest(BaseModel):
-    access_key_id: str = Field(min_length=1)
-    secret_access_key: str = Field(min_length=1)
-    session_token: str | None = None
-    regions: list[str] | None = None
 
 
 # ---------------------------------------------------------------------- app state
@@ -175,13 +168,17 @@ def build_app(*, background: bool | None = None) -> FastAPI:
 
     def _provider_view(provider: Provider, record: dict[str, Any] | None) -> dict[str, Any]:
         connected = bool(record) and record.get("status") == "connected"
+        identity = (record or {}).get("identity") if connected else None
         return {
             "id": provider.id,
             "name": provider.name,
             "status": "connected" if connected else "disconnected",
-            "identity": (record or {}).get("identity") if connected else None,
+            "identity": identity,
+            "identity_label": provider.identity_label(identity) if connected else None,
             "regions": (record or {}).get("regions", []) if connected else [],
             "connected_at": (record or {}).get("connected_at") if connected else None,
+            "credentials_updated_at": (record or {}).get("credentials_updated_at") if connected else None,
+            "capabilities": dict(provider.capabilities),
         }
 
     def _provider(request: Request, provider_id: str) -> Provider:
@@ -196,17 +193,30 @@ def build_app(*, background: bool | None = None) -> FastAPI:
         records = s.store.get_providers()
         return [_provider_view(p, records.get(pid)) for pid, p in s.providers.items()]
 
+    @api.get("/providers/{provider_id}/form")
+    async def provider_form(provider_id: str, request: Request) -> dict[str, Any]:
+        provider = _provider(request, provider_id)
+        return {"fields": [f.to_api() for f in provider.form_fields()]}
+
     @api.post("/providers/{provider_id}/connect")
-    async def connect_provider(provider_id: str, body: ConnectRequest, request: Request) -> dict[str, Any]:
+    async def connect_provider(provider_id: str, body: dict[str, Any], request: Request) -> dict[str, Any]:
+        """Runs the provider checklist. Stores (or atomically replaces) credentials only when every
+        required check passes; a failed reconnect leaves the previous credentials untouched."""
         s = sb(request)
         provider = _provider(request, provider_id)
-        credentials = {
-            "access_key_id": body.access_key_id.strip(),
-            "secret_access_key": body.secret_access_key.strip(),
-            "session_token": (body.session_token or "").strip() or None,
-        }
-        result = await run_in_threadpool(provider.connect, credentials, body.regions)
+        try:
+            credentials = provider.parse_form(body)
+        except FormError as exc:
+            raise ApiError(422, "validation_error", str(exc)) from None
+        regions = body.get("regions")
+        if regions is not None and (not isinstance(regions, list) or not all(isinstance(r, str) and r.strip() for r in regions)):
+            raise ApiError(422, "validation_error", "Invalid request: check regions")
+        regions = sorted({r.strip() for r in regions}) if regions else None
+        result = await run_in_threadpool(provider.connect, credentials, regions)
         if result.credentials is not None and result.report.identity is not None:
+            now = utcnow_iso()
+            previous = s.store.get_provider(provider_id) or {}
+            was_connected = previous.get("status") == "connected"
             s.store.save_provider(
                 provider_id,
                 {
@@ -214,7 +224,8 @@ def build_app(*, background: bool | None = None) -> FastAPI:
                     "identity": result.report.identity.to_api(),
                     "regions": result.regions,
                     "credentials": s.store.encrypt(result.credentials),
-                    "connected_at": utcnow_iso(),
+                    "connected_at": previous.get("connected_at") if was_connected and previous.get("connected_at") else now,
+                    "credentials_updated_at": now,
                 },
             )
             for uc_id in s.engine.manifests()[0]:
@@ -236,6 +247,8 @@ def build_app(*, background: bool | None = None) -> FastAPI:
     async def provider_inventory(provider_id: str, request: Request, refresh: int = Query(0, ge=0, le=1)) -> dict[str, Any]:
         s = sb(request)
         provider = _provider(request, provider_id)
+        if not provider.capabilities.get("inventory"):
+            return {**provider.unsupported_inventory(), "generated_at": None, "stale": False}
         record = s.store.get_provider(provider_id)
         if not record or record.get("status") != "connected":
             raise ApiError(409, "provider_not_connected", f"Provider '{provider_id}' is not connected")
@@ -304,6 +317,14 @@ def build_app(*, background: bool | None = None) -> FastAPI:
             return engine.detail(manifest)
 
         return await run_in_threadpool(refresh)
+
+    @api.get("/usecases/{usecase_id}/outline")
+    async def usecase_outline(usecase_id: str, request: Request, action: str = Query(...)) -> dict[str, Any]:
+        engine = sb(request).engine
+        manifest = engine.manifest(usecase_id)
+        if action not in ("on", "off"):
+            raise ApiError(400, "bad_action", "action must be 'on' or 'off'")
+        return await run_in_threadpool(engine.outline, manifest, action)
 
     @api.get("/usecases/{usecase_id}/code")
     async def usecase_code(usecase_id: str, request: Request, path: str | None = None) -> dict[str, Any]:

@@ -28,6 +28,9 @@ PROBE_TIMEOUT_S = 180
 GIT_TIMEOUT_S = 600
 TOFU_INIT_TIMEOUT_S = 900
 TOFU_STATE_TIMEOUT_S = 120
+TOFU_PLAN_TIMEOUT_S = 900
+OUTLINE_CACHE_TTL_S = 60
+PLAN_ACTIONS = {"create": "create", "update": "update", "delete": "destroy", "read": "read", "noop": "unchanged", "no-op": "unchanged"}
 REFRESH_LOOP_S = 5
 CODE_FILE_LIMIT = 512 * 1024
 SKIP_DIRS = frozenset({".git", ".terraform", "__pycache__", "node_modules", ".venv"})
@@ -71,6 +74,8 @@ class Engine:
         self._tofu = tofu_bin
         self._git = git_bin
         self._state_cache: dict[str, dict[str, Any]] = {}
+        self._outline_cache: dict[tuple[str, str], dict[str, Any]] = {}
+        self._outline_locks: dict[tuple[str, str], threading.Lock] = {}
         self._initialised: set[str] = set()
         self._last_probe: dict[str, float] = {}
         self._locks: dict[str, threading.RLock] = {}
@@ -99,6 +104,30 @@ class Engine:
     def provider_record(self, manifest: Manifest) -> dict[str, Any] | None:
         rec = self._store.get_provider(manifest.provider)
         return rec if rec and rec.get("status") == "connected" else None
+
+    def provider_supports_usecases(self, manifest: Manifest) -> bool:
+        provider = self._providers.get(manifest.provider)
+        return bool(provider and provider.capabilities.get("usecases"))
+
+    def provider_problem(self, manifest: Manifest) -> tuple[str, str] | None:
+        """(code, message) explaining why this use case cannot run right now, or None."""
+        if not self.provider_supports_usecases(manifest):
+            return "provider_unsupported", f"Provider '{manifest.provider}' does not support use cases yet"
+        if self.provider_record(manifest) is None:
+            return "provider_not_connected", f"Provider '{manifest.provider}' is not connected"
+        return None
+
+    def secret_values(self) -> list[str]:
+        """Every stored secret, expanded per provider (e.g. a GCP key's PEM lines), for the scrubber."""
+        values = list(self._store.all_secret_values())
+        for provider_id, provider in self._providers.items():
+            try:
+                creds = self._store.provider_credentials(provider_id)
+            except RuntimeError:
+                continue
+            if creds:
+                values.extend(provider.secret_values(creds))
+        return values
 
     def step_env(self, manifest: Manifest, credentials: dict[str, Any] | None) -> dict[str, str]:
         """Minimal env per SPEC: PATH, HOME, provider creds, manifest env, mapped secrets. Nothing else."""
@@ -308,6 +337,8 @@ class Engine:
 
     def invalidate(self, usecase_id: str) -> None:
         self._state_cache.pop(usecase_id, None)
+        for key in [k for k in self._outline_cache if k[0] == usecase_id]:
+            self._outline_cache.pop(key, None)
 
     def state(self, manifest: Manifest, *, force: bool = False) -> dict[str, Any]:
         """{"state", "resources", "checked_at", "error"} with a 60s cache of the tofu probe."""
@@ -330,9 +361,9 @@ class Engine:
             resources: list[str] | None = None
             error: str | None = None
             tofu_error = False
-            provider_rec = self.provider_record(manifest)
-            if provider_rec is None:
-                error = f"Provider '{manifest.provider}' is not connected"
+            problem = self.provider_problem(manifest)
+            if problem is not None:
+                error = problem[1]
                 tofu_error = True
             else:
                 try:
@@ -340,7 +371,7 @@ class Engine:
                     resources = self.state_list(manifest, self.step_env(manifest, creds))
                 except (TofuError, EngineError, OSError, RuntimeError) as exc:
                     tofu_error = True
-                    error = Scrubber(self._store.all_secret_values()).scrub(str(exc))
+                    error = Scrubber(self.secret_values()).scrub(str(exc))
                     log.warning("state probe failed for %s: %s", manifest.id, error)
             cached = self._state_cache[manifest.id] = {
                 "resources": resources,
@@ -365,9 +396,9 @@ class Engine:
             return None
         self._last_probe[manifest.id] = time.monotonic()
         record: dict[str, Any] = {"generated_at": utcnow_iso(), "output": None, "error": None}
-        provider_rec = self.provider_record(manifest)
-        if provider_rec is None:
-            record["error"] = f"Provider '{manifest.provider}' is not connected"
+        problem = self.provider_problem(manifest)
+        if problem is not None:
+            record["error"] = problem[1]
             self._store.save_status(manifest.id, record)
             return record
         checkout = self._store.checkout_dir(manifest.id)
@@ -376,7 +407,7 @@ class Engine:
             self._store.save_status(manifest.id, record)
             return record
         env = self.step_env(manifest, self._store.provider_credentials(manifest.provider))
-        scrubber = Scrubber(self._store.all_secret_values())
+        scrubber = Scrubber(self.secret_values())
         try:
             proc = subprocess.run(
                 manifest.status.run,
@@ -413,12 +444,12 @@ class Engine:
     def start_job(self, manifest: Manifest, action: str) -> str:
         if action not in ("on", "off"):
             raise EngineError(f"Unknown action '{action}'", "bad_action", 400)
-        provider_rec = self.provider_record(manifest)
-        if provider_rec is None:
-            raise EngineError(f"Provider '{manifest.provider}' is not connected", "provider_not_connected", 409)
+        problem = self.provider_problem(manifest)
+        if problem is not None:
+            raise EngineError(problem[1], problem[0], 409)
         creds = self._store.provider_credentials(manifest.provider)
         env = self.step_env(manifest, creds)
-        scrubber = Scrubber(self._store.all_secret_values() + self._host_secret_values())
+        scrubber = Scrubber(self.secret_values() + self._host_secret_values())
         steps = [StepSpec(s.name, s.run) for s in (manifest.on if action == "on" else manifest.off)]
         self._store.ensure_usecase_dirs(manifest.id)
 
@@ -481,6 +512,7 @@ class Engine:
                 {"job_id": last["id"], "action": last["action"], "state": last["state"], "ended": last["ended"]} if last else None
             ),
             "provider_connected": self.provider_record(manifest) is not None,
+            "provider_supported": self.provider_supports_usecases(manifest),
         }
 
     def detail(self, manifest: Manifest) -> dict[str, Any]:
@@ -499,11 +531,189 @@ class Engine:
             "status_error": status["error"] if status else None,
             "status_interval_s": manifest.status.interval_s if manifest.status else None,
             "tags": manifest.tags,
+            "effects": {"on": manifest.effects_on.to_api(), "off": manifest.effects_off.to_api()},
             "runs": [
                 {"job_id": r["id"], "action": r["action"], "state": r["state"], "started": r["started"], "ended": r["ended"]}
                 for r in runs
             ],
         }
+
+    # ------------------------------------------------------------------ outline (plan, never apply)
+    @staticmethod
+    def parse_address(address: str) -> tuple[str, str, str | None]:
+        """'module.a.data.aws_ami.x[0]' -> (type, name, module) using resource-address grammar."""
+        module_parts: list[str] = []
+        parts = address.split(".")
+        i = 0
+        while i + 1 < len(parts) and parts[i] == "module":
+            module_parts.append(parts[i + 1].split("[", 1)[0])
+            i += 2
+        rest = parts[i:]
+        if rest and rest[0] == "data":
+            rest = rest[1:]
+        rtype = rest[0] if rest else ""
+        name = ".".join(rest[1:]).split("[", 1)[0] if len(rest) > 1 else ""
+        return rtype, name, ".".join(module_parts) or None
+
+    @classmethod
+    def parse_plan_json(cls, output: str) -> dict[str, Any]:
+        """Parse `tofu plan -json` (newline-delimited). Returns
+        {"changes": {create|update|destroy|read|unchanged: [entry…]}, "summary": {…}|None,
+         "diagnostics": [str…], "other": [non-JSON lines]}. `replace` counts as create + destroy."""
+        changes: dict[str, list[dict[str, Any]]] = {"create": [], "update": [], "destroy": [], "read": [], "unchanged": []}
+        diagnostics: list[str] = []
+        other: list[str] = []
+        summary: dict[str, Any] | None = None
+        for raw in output.splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                other.append(line)
+                continue
+            if not isinstance(msg, dict):
+                other.append(line)
+                continue
+            kind = msg.get("type")
+            if kind == "planned_change":
+                change = msg.get("change") or {}
+                res = change.get("resource") or {}
+                addr = res.get("addr") or ""
+                ptype, pname, pmodule = cls.parse_address(addr)
+                entry = {
+                    "address": addr,
+                    "type": res.get("resource_type") or ptype,
+                    "name": res.get("resource_name") or pname,
+                    "module": res.get("module") or pmodule,
+                }
+                action = str(change.get("action") or "")
+                if action == "replace":
+                    changes["destroy"].append(dict(entry, replace=True))
+                    changes["create"].append(dict(entry, replace=True))
+                elif action in PLAN_ACTIONS:
+                    changes[PLAN_ACTIONS[action]].append(entry)
+                else:
+                    changes["update"].append(dict(entry, action=action))
+            elif kind == "change_summary":
+                summary = msg.get("changes") or {}
+            elif kind == "diagnostic":
+                diag = msg.get("diagnostic") or {}
+                if diag.get("severity") == "error":
+                    text = " ".join(str(diag.get("summary") or msg.get("@message") or "").split())
+                    detail = " ".join(str(diag.get("detail") or "").split())
+                    diagnostics.append(f"{text}: {detail}" if detail else text)
+        return {"changes": changes, "summary": summary, "diagnostics": diagnostics, "other": other}
+
+    @staticmethod
+    def _group_by_type(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Stable order: by type in order of first appearance, then arrival order."""
+        first_seen: dict[str, int] = {}
+        for e in entries:
+            first_seen.setdefault(e["type"], len(first_seen))
+        return sorted(entries, key=lambda e: first_seen[e["type"]])
+
+    def _outline_lock(self, key: tuple[str, str]) -> threading.Lock:
+        with self._locks_guard:
+            lock = self._outline_locks.get(key)
+            if lock is None:
+                lock = self._outline_locks[key] = threading.Lock()
+            return lock
+
+    def outline(self, manifest: Manifest, action: str) -> dict[str, Any]:
+        """What ON/OFF will do: a real `tofu plan` (never apply) plus the manifest's declared effects."""
+        if action not in ("on", "off"):
+            raise EngineError(f"Unknown action '{action}'", "bad_action", 400)
+        if self._jobs.running_job(manifest.id) is not None:
+            raise EngineError(f"A job is already running for use case '{manifest.id}'", "job_running", 409)
+        key = (manifest.id, action)
+        with self._outline_lock(key):
+            cached = self._outline_cache.get(key)
+            if cached is not None and (time.monotonic() - cached["_at"]) < OUTLINE_CACHE_TTL_S:
+                return {k: v for k, v in cached.items() if k != "_at"}
+            result = self._outline(manifest, action)
+            self._outline_cache[key] = {**result, "_at": time.monotonic()}
+            return result
+
+    def _outline(self, manifest: Manifest, action: str) -> dict[str, Any]:
+        provider_rec = self.provider_record(manifest)
+        provider = self._providers.get(manifest.provider)
+        bucket = provider.state_bucket(provider_rec) if (provider and provider_rec) else None
+        steps = manifest.on if action == "on" else manifest.off
+        response: dict[str, Any] = {
+            "action": action,
+            "plan": None,
+            "declared": manifest.effects(action).to_api(),
+            "steps": [s.to_api() for s in steps],
+            "retained_state": {"backend": "s3", "bucket": bucket, "key": manifest.state_key, "region": STATE_BACKEND_REGION},
+        }
+
+        def failed(error: str) -> dict[str, Any]:
+            response["plan"] = {"ok": False, "generated_at": utcnow_iso(), "error": Scrubber(self.secret_values()).scrub(error)}
+            return response
+
+        problem = self.provider_problem(manifest)
+        if problem is not None:
+            return failed(problem[1])
+        try:
+            creds = self._store.provider_credentials(manifest.provider)
+        except RuntimeError as exc:
+            return failed(str(exc))
+        env = self.step_env(manifest, creds)
+        try:
+            if manifest.id not in self._initialised:
+                self.prepare(manifest, env)
+        except FileNotFoundError as exc:
+            return failed(f"'{exc.filename or self._tofu}' is not installed or not on PATH; a plan needs git and OpenTofu")
+        except (TofuError, EngineError, OSError) as exc:
+            return failed(f"Could not prepare the checkout: {exc}")
+
+        args = [self._tofu, f"-chdir={manifest.terraform_dir}", "plan", "-json", "-input=false", "-lock=false", "-refresh=true"]
+        if action == "off":
+            args.append("-destroy")
+        started = time.monotonic()
+        try:
+            code, out = self._run(args, cwd=self._store.checkout_dir(manifest.id), env=env, timeout=TOFU_PLAN_TIMEOUT_S)
+        except FileNotFoundError:
+            return failed(f"'{self._tofu}' is not installed or not on PATH; a plan needs OpenTofu")
+        except (TofuError, OSError) as exc:
+            return failed(f"tofu plan failed: {exc}")
+        parsed = self.parse_plan_json(out)
+        if code != 0:
+            tail = parsed["diagnostics"] or parsed["other"]
+            reason = tail[-1] if tail else f"exit code {code}"
+            return failed(f"tofu plan exited {code}: {reason}")
+
+        changes = parsed["changes"]
+        changed_addrs = {e["address"] for lst in changes.values() for e in lst}
+        # `planned_change` is only emitted for real changes; what is in state and untouched is unchanged.
+        try:
+            state_addrs = self.state_list(manifest, env)
+        except (TofuError, EngineError, OSError, RuntimeError) as exc:
+            log.warning("outline: state list failed for %s: %s", manifest.id, exc)
+            state_addrs = []
+        unchanged = list(changes["unchanged"])
+        seen = {e["address"] for e in unchanged}
+        for addr in state_addrs:
+            if addr in changed_addrs or addr in seen:
+                continue
+            rtype, rname, module = self.parse_address(addr)
+            unchanged.append({"address": addr, "type": rtype, "name": rname, "module": module})
+        plan: dict[str, Any] = {
+            "ok": True,
+            "generated_at": utcnow_iso(),
+            "duration_s": round(time.monotonic() - started, 1),
+            "create": self._group_by_type(changes["create"]),
+            "update": self._group_by_type(changes["update"]),
+            "destroy": self._group_by_type(changes["destroy"]),
+            "read": self._group_by_type(changes["read"]),
+            "unchanged": self._group_by_type(unchanged),
+            "change_summary": parsed["summary"],
+        }
+        plan["summary"] = {k: len(plan[k]) for k in ("create", "update", "destroy", "unchanged", "read")}
+        response["plan"] = plan
+        return response
 
     # ------------------------------------------------------------------ code browser
     def _checkout_root(self, manifest: Manifest) -> Path:

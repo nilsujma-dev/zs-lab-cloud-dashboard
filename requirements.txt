@@ -4,5 +4,9 @@ boto3==1.38.27
 pyyaml==6.0.2
 cryptography==45.0.3
 itsdangerous==2.2.0
+google-auth==2.57.1
+google-api-python-client==2.200.0
+azure-identity==1.25.3
+azure-mgmt-resource==24.0.0
 pytest==8.3.5
 httpx==0.28.1

@@ -14,8 +14,9 @@ ID_RE = re.compile(r"^[a-z0-9-]+$")
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 KNOWN_SECRETS = frozenset({"zscaler_oneapi"})
 TOP_LEVEL_KEYS = frozenset(
-    {"id", "name", "provider", "summary", "description", "source", "terraform", "env", "secrets", "on", "off", "status", "tags"}
+    {"id", "name", "provider", "summary", "description", "source", "terraform", "env", "secrets", "on", "off", "status", "tags", "effects"}
 )
+EFFECT_KEYS = ("creates", "destroys", "retains")
 DEFAULT_STATUS_INTERVAL_S = 60
 
 
@@ -39,6 +40,18 @@ class StatusProbe:
 
 
 @dataclass(frozen=True)
+class Effects:
+    """What one action does outside OpenTofu, in prose (the plan supplies the rest)."""
+
+    creates: tuple[str, ...] = ()
+    destroys: tuple[str, ...] = ()
+    retains: tuple[str, ...] = ()
+
+    def to_api(self) -> dict[str, list[str]]:
+        return {"creates": list(self.creates), "destroys": list(self.destroys), "retains": list(self.retains)}
+
+
+@dataclass(frozen=True)
 class Manifest:
     id: str
     name: str
@@ -55,7 +68,12 @@ class Manifest:
     secrets: tuple[str, ...] = ()
     status: StatusProbe | None = None
     tags: dict[str, str] = field(default_factory=dict)
+    effects_on: Effects = field(default_factory=Effects)
+    effects_off: Effects = field(default_factory=Effects)
     path: Path | None = None
+
+    def effects(self, action: str) -> Effects:
+        return self.effects_on if action == "on" else self.effects_off
 
 
 def _fail(where: str, msg: str) -> ManifestError:
@@ -103,6 +121,42 @@ def _steps(data: dict[str, Any], key: str, where: str) -> tuple[Step, ...]:
             raise _fail(w, f"unknown step field(s): {', '.join(sorted(extra))}")
         steps.append(Step(name=_req_str(item, "name", w), run=_req_str(item, "run", w)))
     return tuple(steps)
+
+
+def _str_list(data: dict[str, Any], key: str, where: str) -> tuple[str, ...]:
+    value = data.get(key)
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in value):
+        raise _fail(where, f"'{key}' must be a list of non-empty strings")
+    return tuple(v.strip() for v in value)
+
+
+def _effects(data: dict[str, Any], where: str) -> tuple[Effects, Effects]:
+    """Optional `effects: {on: {...}, off: {...}}`; keys may be quoted or YAML-1.1 booleans."""
+    raw = data.get("effects")
+    if raw is None:
+        return Effects(), Effects()
+    if not isinstance(raw, dict):
+        raise _fail(where, "'effects' must be a mapping with optional 'on' and 'off'")
+    raw = {("on" if k is True else "off" if k is False else k): v for k, v in raw.items()}
+    unknown = set(raw) - {"on", "off"}
+    if unknown:
+        raise _fail(f"{where} effects", f"unknown field(s): {', '.join(sorted(str(k) for k in unknown))}")
+    out: list[Effects] = []
+    for action in ("on", "off"):
+        block = raw.get(action)
+        if block is None:
+            out.append(Effects())
+            continue
+        w = f"{where} effects.{action}"
+        if not isinstance(block, dict):
+            raise _fail(w, "must be a mapping with 'creates', 'destroys' and/or 'retains'")
+        extra = set(block) - set(EFFECT_KEYS)
+        if extra:
+            raise _fail(w, f"unknown field(s): {', '.join(sorted(str(k) for k in extra))}")
+        out.append(Effects(creates=_str_list(block, "creates", w), destroys=_str_list(block, "destroys", w), retains=_str_list(block, "retains", w)))
+    return out[0], out[1]
 
 
 def _relative_path(value: str, where: str, key: str) -> str:
@@ -179,6 +233,7 @@ def parse_manifest(
             raise _fail(st_where, "'interval_s' must be an integer >= 5")
         status = StatusProbe(run=_req_str(st, "run", st_where), interval_s=interval)
 
+    effects_on, effects_off = _effects(data, where)
     return Manifest(
         id=uc_id,
         name=_req_str(data, "name", where),
@@ -195,6 +250,8 @@ def parse_manifest(
         secrets=tuple(secrets_raw),
         status=status,
         tags=_opt_str_map(data, "tags", where),
+        effects_on=effects_on,
+        effects_off=effects_off,
         path=path,
     )
 
