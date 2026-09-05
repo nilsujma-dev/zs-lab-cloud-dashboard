@@ -1,0 +1,24 @@
+# Switchboard — one service. Run on the lab host (10.1.200.10) via ./deploy.sh.
+#
+# Two host files are required and are never copied into the image or the volume:
+#   ~/.config/zscaler/oneapi.env   ZS_ISSUER, ZS_CLIENT_ID, ZPA_CUSTOMER_ID, ZS_GATEWAY
+#   ~/.zscaler_api_key             OneAPI client secret, mode 0600, mounted read-only
+services:
+  switchboard:
+    build: .
+    image: switchboard:latest
+    platform: linux/amd64
+    container_name: switchboard
+    init: true
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+      - ${HOME}/.config/zscaler/oneapi.env
+    volumes:
+      - data:/data
+      - ${HOME}/.zscaler_api_key:/run/secrets/zscaler_api_key:ro
+
+volumes:
+  data:

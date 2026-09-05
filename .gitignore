@@ -1,45 +1,36 @@
-# Local config & secrets — never commit
-*.local.conf
+# --- Host configuration and secrets ------------------------------------------
+# .env is generated on the host by deploy.sh and holds the operator password and
+# the Fernet key. It must never be committed. .env.example is the template.
 .env
 .env.*
-secrets/
+!.env.example
+*.local.conf
 config/local*
+credentials*
+*_key
 *.pem
 *.key
-credentials*
+secrets/
 
-# Runtime state
+# --- Runtime data (lives in the Docker volume, never in the repo) ------------
+data/
 state/
 *.log
-*.csv.tmp
 
-# Python
+# --- Terraform / OpenTofu (use-case checkouts run inside /data, but just in case)
+*.tfstate
+*.tfstate.*
+*.tfplan
+.terraform/
+.terraform.lock.hcl
+crash.log
+
+# --- Python ------------------------------------------------------------------
 __pycache__/
 *.py[cod]
 .venv/
 venv/
 .pytest_cache/
-.ruff_cache/
 
-# Terraform
-.terraform/
-*.tfstate
-*.tfstate.*
-*.tfvars
-!example.tfvars
-.terraform.lock.hcl
-
-# OS / editor
+# --- OS / editor -------------------------------------------------------------
 .DS_Store
-.vscode/
-.idea/
-
-# --- Switchboard --------------------------------------------------------------
-.env
-data/
-tmpdata/
-*.tfstate
-*.tfstate.*
-*.tfplan
-.terraform/
-ui-shots/

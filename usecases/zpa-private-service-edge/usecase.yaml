@@ -1,0 +1,112 @@
+id: zpa-private-service-edge            # [a-z0-9-]+, matches the directory name
+name: ZPA Private Service Edge lab
+provider: aws                           # must be a registered provider id
+summary: A Private Service Edge in an isolated VPC, plus a segmented client/server VPC.
+description: |                          # markdown; the card shows it
+  A reproducible **Zscaler Private Access — Private Service Edge** built end to end
+  in AWS `eu-central-1`: two isolated VPCs, three network zones, and unattended
+  provisioning-key enrolment. Source:
+  [zs-zpa-private-service-edge-lab](https://github.com/nilsujma-dev/zs-zpa-private-service-edge-lab).
+
+  ## Topology
+
+  **There is no link between the two VPCs.** No peering, no transit gateway, no
+  PrivateLink, no VPN. Each route table holds one `0.0.0.0/0` entry plus its own
+  implicit `local` route, so neither VPC has a route to the other.
+
+  | VPC | CIDR | Holds |
+  |---|---|---|
+  | **A** | `10.91.0.0/16` | The Private Service Edge (`10.91.10.5`, elastic IP) and a co-located App Connector (`10.91.10.64`), one public subnet |
+  | **B** | `10.90.0.0/16` | A NAT gateway (`10.90.0.0/24`), a **PRIV** zone (`10.90.20.0/24`: App Connector + nginx server) and an **MCU** zone (`10.90.30.0/24`: Windows client) |
+
+  Traffic from VPC B reaches the PSE by leaving through the NAT gateway, crossing
+  the public internet and arriving at the PSE's elastic IP. VPC A's own connector
+  stays on the local route. That is a design choice, not an AWS constraint: the
+  CIDRs do not overlap and any of the AWS links would work, but each one creates a
+  routing relationship between the VPCs, which is exactly what the isolated-VPC
+  requirement forbids. It also matches the real-world shape of a PSE hosted outside
+  the private perimeter. Traffic is mutually authenticated TLS either way.
+
+  Inside VPC B, **PRIV and MCU cannot reach each other**. The MCU client reaches the
+  PRIV server *only* through ZPA brokering; a direct connection fails. The block is
+  enforced twice, by security-group omission and by a subnet network ACL, so it
+  survives a loosened security group. Because there is no peering, the PSE accepts
+  `443` from exactly one address: VPC B's NAT elastic IP.
+
+  Footprint when on: 5 instances, 2 VPCs, 1 NAT gateway, 3 elastic IPs. All AWS
+  resources carry `Project=zpa-pse-lab`; all ZPA objects are prefixed `AWS-Lab`.
+
+  ## What turning it on does
+
+  1. **Create ZPA groups and keys** — a Service Edge Group, an App Connector Group
+     and their provisioning keys in the ZPA tenant, all prefixed `AWS-Lab`. A
+     SHA-hashed baseline of the tenant is taken first and verified afterwards so
+     the run can prove it touched nothing else.
+  2. **Create PRIV connector group** — the second App Connector Group and key for
+     the PRIV zone.
+  3. **Seed provisioning keys into SSM** — the keys go straight from ZPA into SSM
+     Parameter Store as `SecureString`. They are never written to disk, never put
+     in `user_data`, never stored in OpenTofu state.
+  4. **Apply infrastructure** — `tofu apply` builds both VPCs, subnets, routing,
+     security groups, the NAT gateway, elastic IPs and the five instances. Each
+     instance reads its own key from SSM at boot through its IAM role and
+     self-enrols; no OAuth code, no console login.
+  5. **Wait for enrolment** — polls ZPA until the Service Edge and both App
+     Connectors report `ZPN_STATUS_AUTHENTICATED` (up to 15 minutes).
+
+  Every rebuild consumes one use of each provisioning key (`maxUsage 5`) and leaves
+  a stale, disconnected entry in ZPA for the previous instance.
+
+  ## What turning it off does
+
+  `tofu destroy` removes **every AWS resource** in the lab: instances, volumes, NAT
+  gateway, elastic IPs, subnets and both VPCs. Nothing keeps billing.
+
+  **ZPA objects deliberately survive.** The groups and provisioning keys live
+  outside OpenTofu; the enrolled Service Edge and App Connectors simply show as
+  disconnected in the ZPA admin portal until the next turn-on.
+
+  ## Cost
+
+  About **$285/month** at on-demand list price while on (EC2 for the five
+  instances, the NAT gateway, elastic IPs and gp3 volumes; NAT data processing not
+  included). There is **no vendor licensing cost**: the ZPA AMIs carry no
+  marketplace product code and bill as plain `RunInstances`. When off, the AWS
+  spend is zero. The Clouds page shows the live figure under `Project=zpa-pse-lab`.
+
+  ## Sharing
+
+  The lab is self-contained. The one thing it shares with other work is the ZPA
+  tenant, because a tenant is an account-level object and that is where the
+  credentials point. No VPC, subnet, application segment, server group or access
+  policy is shared with anything else.
+source:
+  git: https://github.com/nilsujma-dev/zs-zpa-private-service-edge-lab.git
+  ref: main
+terraform:
+  dir: terraform                        # relative to checkout
+  state_key: usecases/zpa-private-service-edge/terraform.tfstate
+env:                                    # non-secret, applied to every step
+  AWS_DEFAULT_REGION: eu-central-1
+secrets:                                # host-provided; engine maps these in
+  - zscaler_oneapi                      # -> ZS_ISSUER, ZS_CLIENT_ID, ZPA_CUSTOMER_ID env
+                                        #    + ~/.zscaler_api_key symlink to the mounted secret
+"on":                                   # ordered; stop on first failure (quoted: YAML 1.1 reads bare on/off as booleans)
+  - name: Create ZPA groups and keys
+    run: python3 scripts/zpa_create.py
+  - name: Create PRIV connector group
+    run: python3 scripts/zpa_create_priv.py
+  - name: Seed provisioning keys into SSM
+    run: python3 scripts/put_keys_ssm.py
+  - name: Apply infrastructure
+    run: tofu -chdir=terraform apply -auto-approve -input=false
+  - name: Wait for enrolment
+    run: python3 scripts/wait_enrolled.py --timeout 900
+"off":
+  - name: Destroy infrastructure
+    run: tofu -chdir=terraform destroy -auto-approve -input=false
+status:                                 # optional; must print JSON on stdout
+  run: python3 scripts/status.py --json
+  interval_s: 60
+tags:                                   # inventory grouping + cost attribution
+  Project: zpa-pse-lab
