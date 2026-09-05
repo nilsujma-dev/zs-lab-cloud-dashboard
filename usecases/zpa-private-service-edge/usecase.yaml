@@ -8,33 +8,10 @@ description: |                          # markdown; the card shows it
   provisioning-key enrolment. Source:
   [zs-zpa-private-service-edge-lab](https://github.com/nilsujma-dev/zs-zpa-private-service-edge-lab).
 
-  ## Topology
-
-  **There is no link between the two VPCs.** No peering, no transit gateway, no
-  PrivateLink, no VPN. Each route table holds one `0.0.0.0/0` entry plus its own
-  implicit `local` route, so neither VPC has a route to the other.
-
-  - **VPC A — `10.91.0.0/16`.** The Private Service Edge (`10.91.10.5`, elastic IP) and a
-    co-located App Connector (`10.91.10.64`), one public subnet.
-  - **VPC B — `10.90.0.0/16`.** A NAT gateway (`10.90.0.0/24`), a PRIV zone (`10.90.20.0/24`:
-    App Connector + nginx server) and an MCU zone (`10.90.30.0/24`: Windows client).
-
-  Traffic from VPC B reaches the PSE by leaving through the NAT gateway, crossing
-  the public internet and arriving at the PSE's elastic IP. VPC A's own connector
-  stays on the local route. That is a design choice, not an AWS constraint: the
-  CIDRs do not overlap and any of the AWS links would work, but each one creates a
-  routing relationship between the VPCs, which is exactly what the isolated-VPC
-  requirement forbids. It also matches the real-world shape of a PSE hosted outside
-  the private perimeter. Traffic is mutually authenticated TLS either way.
-
-  Inside VPC B, **PRIV and MCU cannot reach each other**. The MCU client reaches the
-  PRIV server *only* through ZPA brokering; a direct connection fails. The block is
-  enforced twice, by security-group omission and by a subnet network ACL, so it
-  survives a loosened security group. Because there is no peering, the PSE accepts
-  `443` from exactly one address: VPC B's NAT elastic IP.
-
-  Footprint when on: 5 instances, 2 VPCs, 1 NAT gateway, 3 elastic IPs. All AWS
-  resources carry `Project=zpa-pse-lab`; all ZPA objects are prefixed `AWS-Lab`.
+  The drawing above is generated from the live AWS inventory; structure comes from AWS,
+  the dashed flows are declared in this manifest. Two isolated VPCs with no link between
+  them; VPC B's private zones reach the Private Service Edge only by leaving through the NAT
+  and coming back in over the internet, and the MCU client has no route to the PRIV server.
 
   ## What turning it on does
 
@@ -126,3 +103,19 @@ effects:                                # what happens OUTSIDE OpenTofu; the liv
       - "The enrolled Service Edge and App Connector entries in ZPA, which will show as disconnected and accumulate one per rebuild"
       - "The three SSM parameters under /zpa-lab/ (harmless; overwritten on the next ON)"
       - "The S3 state object (versioned, so this OFF is recoverable) and the remote lock"
+
+topology:                               # structure comes from AWS; these give it meaning
+  roles:
+    zpa-lab-pse: pse
+    zpa-lab-connector: connector
+    zpa-lab-priv-connector: connector
+    zpa-lab-server: app
+    zpa-lab-mcu-client: client
+  flows:
+    - {from: zpa-lab-mcu-client,     to: zpa-lab-pse,    label: "dials :443",         via: [nat, internet]}
+    - {from: zpa-lab-priv-connector, to: zpa-lab-pse,    label: "dials :443",         via: [nat, internet]}
+    - {from: zpa-lab-connector,      to: zpa-lab-pse,    label: "dials :443 (local)"}
+    - {from: zpa-lab-priv-connector, to: zpa-lab-server, label: ":8080 brokered"}
+    - {from: zpa-lab-pse,            to: internet,       label: "control plane :443"}
+  blocked:
+    - {from: zpa-lab-mcu-client, to: zpa-lab-server, label: "no route"}

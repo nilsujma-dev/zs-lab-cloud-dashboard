@@ -434,3 +434,112 @@ same env as a step. Never `apply`.
   with the field's help text; a fake credential fails the checklist with a clear detail.
 - Tests updated; `?mock=1` covers the drawer, the outline (both actions, plus a failed plan), and
   all three provider forms.
+
+---
+
+# v1.2 delta — a real topology drawing for each use case
+
+Feedback from the product owner, verbatim in substance: the use-case card explains the network
+in prose — CIDRs, "no peering, no transit gateway", bullet lists of addresses. Nobody can hold
+that in their head. It has to be a **network drawing**: graphical, clickable, driven by live
+data from the cloud, so an architect understands the lab in seconds. The v1.1 description text
+is the wrong medium and is being removed from the card.
+
+## Principle
+
+**Structure comes from the cloud; meaning comes from the manifest.** Every box and containment
+edge is derived from the live inventory (VPCs, subnets, route tables, gateways, instances,
+addresses, security-group rules). AWS cannot tell you *why* traffic flows, so the handful of
+application flows — "the client dials the PSE on 443 via the NAT and the internet" — are
+declared in the manifest and drawn as flow edges, visibly distinct from structure. Nothing in
+the drawing is hardcoded to this lab; a second use case gets a drawing for free.
+
+## Backend — `GET /api/usecases/{id}/topology`
+
+Built from the provider's cached inventory (refresh with `?refresh=1`), filtered to resources
+carrying the use case's `tags` (plus resources reachable only through them: the subnets of a
+tagged VPC, the IGW attached to it, EIPs associated to tagged instances/NATs). Provider-neutral
+node/edge model:
+
+```
+{"generated_at":…, "usecase":"zpa-private-service-edge", "provider":"aws", "region":"eu-central-1",
+ "nodes":[
+   {"id":"internet","kind":"internet","label":"Internet"},
+   {"id":"vpc-…","kind":"vpc","label":"VPC A","cidr":"10.91.0.0/16","parent":null,
+    "detail":{…the inventory record…}},
+   {"id":"subnet-…","kind":"subnet","label":"zpa-lab-public","cidr":"10.91.10.0/24",
+    "parent":"vpc-…","exposure":"public"|"private"|"isolated","az":"eu-central-1a"},
+   {"id":"i-…","kind":"instance","label":"zpa-lab-pse","parent":"subnet-…","role":"pse",
+    "type":"m5.large","state":"running","private_ip":…,"public_ip":…,"detail":{…}},
+   {"id":"nat-…","kind":"nat","label":"NAT","parent":"vpc-…","public_ip":…},
+   {"id":"igw-…","kind":"igw","label":"IGW","parent":"vpc-…"},
+   {"id":"eipalloc-…","kind":"eip","label":"3.70.113.155","attached_to":"i-…"|"nat-…"|null}
+ ],
+ "edges":[
+   {"kind":"route","from":"subnet-…","to":"igw-…","label":"0.0.0.0/0"},          # default routes
+   {"kind":"route","from":"subnet-…","to":"nat-…","label":"0.0.0.0/0"},
+   {"kind":"uplink","from":"igw-…","to":"internet"},
+   {"kind":"uplink","from":"nat-…","to":"igw-…"},
+   {"kind":"allow","from":"<cidr or sg-id>","to":"i-…","label":"tcp/443"},        # SG ingress
+   {"kind":"flow","from":"i-…","to":"i-…","via":["nat-…","internet"],"label":"dials :443",
+    "declared":true}                                                              # from manifest
+ ],
+ "enrolment":{"i-…":{"authenticated":true,"label":"Private Service Edge"}, …},  # from status probe
+ "unknown":[…resources tagged but not placeable…]}
+```
+- `role` on an instance comes from the manifest's `topology.roles` map (by Name tag); absent →
+  null. `exposure` for a subnet: `public` if its default route is an IGW, `private` if a NAT,
+  `isolated` if none.
+- Manifest additions (validated, all optional):
+  ```yaml
+  topology:
+    roles: {zpa-lab-pse: pse, zpa-lab-connector: connector, zpa-lab-priv-connector: connector,
+            zpa-lab-server: app, zpa-lab-mcu-client: client}
+    flows:
+      - {from: zpa-lab-mcu-client,    to: zpa-lab-pse, label: "dials :443", via: [nat, internet]}
+      - {from: zpa-lab-priv-connector,to: zpa-lab-pse, label: "dials :443", via: [nat, internet]}
+      - {from: zpa-lab-connector,     to: zpa-lab-pse, label: "dials :443 (local)"}
+      - {from: zpa-lab-priv-connector,to: zpa-lab-server, label: ":8080"}
+      - {from: zpa-lab-pse,           to: internet,    label: "control plane :443"}
+    blocked:
+      - {from: zpa-lab-mcu-client, to: zpa-lab-server, label: "no route"}
+  ```
+  Names resolve to instance ids at build time; a flow whose endpoint is missing goes to
+  `unknown` with a reason rather than failing. `nat`/`internet` in `via` resolve to the NAT of
+  the source's VPC and the internet node.
+- Cached 60 s; 200 with `nodes: []` and a `reason` when the provider is disconnected or the use
+  case is off (the drawing then shows the declared skeleton only — see frontend).
+
+## Frontend — the drawing
+
+Replaces the prose topology in the expanded card (the description keeps only *what it is*,
+*what ON/OFF do*, *cost*, *sharing* — cut everything that reads like a network spec).
+
+- **Inline SVG rendered from the graph**, deterministic auto-layout, no library:
+  internet node top-centre; each VPC a rounded container in a row beneath it, labelled with name
+  and CIDR; subnets as nested containers stacked inside their VPC, labelled with name, CIDR and
+  an exposure badge; instances as cards inside their subnet (role glyph, name, type, private IP,
+  enrolment lamp from `enrolment`); NAT and IGW as nodes on the VPC's top edge; EIPs as chips on
+  the node they're attached to, idle EIPs as chips outside any VPC. Orthogonal edges: routes as
+  thin solid lines, uplinks to the internet as solid, **declared flows as dashed amber**, blocked
+  pairs as a red struck line. Edge labels on hover and in a legend. The whole thing fits the card
+  width at 1280 and grows at 1920; pan/zoom not required, but wide graphs may scroll horizontally.
+- **Everything is clickable.** Instance / subnet / VPC / NAT / EIP click → the existing region
+  drawer opens deep-linked to that resource (`#/clouds/aws/<region>?inst=` etc.; extend the
+  drawer's deep-link params to `?subnet=`, `?vpc=`, `?nat=`, `?eip=` and scroll+flash the item).
+  Hover highlights the node, its edges and the nodes at their other ends; a small inspector
+  panel beside the SVG shows the hovered/selected node's key facts without leaving the card.
+- **Off state:** when the use case is off, draw the declared skeleton (VPCs/subnets/instances
+  from the manifest's last known topology are not available — so render the flows/roles as a
+  greyed schematic with "not running" and the last-run timestamp) rather than nothing.
+- Legend, keyboard: nodes are focusable in DOM order, Enter opens the drawer.
+- Mock: a fixture graph for the PSE lab that exercises every node kind, an idle EIP, all five
+  flows, the blocked pair, and the off-state schematic; screenshots at 1280 and 1920, dark and
+  light.
+
+## Definition of done
+The PSE card shows a drawing an architect can read in seconds: two VPC boxes, three subnets,
+five instances with lamps, NAT and IGWs, the internet on top, the three dashed flows converging
+on the PSE, the red blocked MCU→PRIV pair. Clicking the PSE opens the drawer on it. The drawing
+regenerates from AWS on refresh — after an OFF/ON cycle it shows the new ids and addresses with
+no manifest change.
