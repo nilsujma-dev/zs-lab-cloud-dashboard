@@ -1169,3 +1169,114 @@ tr.is-flash td { animation: flash-row 1.6s var(--ease); }
 .topo-unknown { margin-top: 8px; font-size: 12px; color: var(--text); }
 .topo-unknown .mono { font-size: 11.5px; }
 .topo-unknown .dim { color: var(--text-faint); }
+
+/* ==========================================================================
+   v1.3 — provider rail on the Use cases page: three selector keys, one lit
+   ========================================================================== */
+.prail {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 14px;
+  margin-bottom: 22px;
+}
+.ptile {
+  position: relative;
+  display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 16px; align-items: center;
+  padding: 16px 18px 20px;
+  text-align: left; cursor: pointer;
+  background: var(--bg-panel); color: var(--text);
+  border: 1px solid var(--line); border-radius: var(--radius-lg);
+  box-shadow: 0 1px 0 rgba(0,0,0,.25);
+  transition: transform .14s var(--ease), border-color .14s var(--ease), box-shadow .14s var(--ease), background .14s var(--ease), opacity .14s var(--ease);
+}
+.ptile:hover { transform: translateY(-2px); border-color: var(--line-strong); background: var(--bg-raised); box-shadow: 0 6px 18px rgba(0,0,0,.28); }
+.ptile:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; border-radius: var(--radius-lg); }
+.ptile:not(.is-selected) { opacity: .8; }
+.ptile:not(.is-selected):hover { opacity: 1; }
+.ptile.is-selected {
+  transform: translateY(-3px); opacity: 1;
+  background: var(--bg-raised);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent-dim), 0 10px 26px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.04);
+}
+.ptile.is-selected:hover { transform: translateY(-3px); }
+/* the notch that points at the list below: this line is patched through */
+.ptile.is-selected::after {
+  content: ""; position: absolute; left: 50%; bottom: -8px; width: 14px; height: 14px;
+  margin-left: -7px; transform: rotate(45deg);
+  background: var(--bg-raised); border-right: 1px solid var(--accent); border-bottom: 1px solid var(--accent);
+}
+/* the illuminated key strip along the bottom edge */
+.ptile-key {
+  position: absolute; left: 18px; right: 18px; bottom: 8px; height: 3px; border-radius: 2px;
+  background: var(--line);
+  transition: background .14s var(--ease), box-shadow .14s var(--ease);
+}
+.ptile.is-selected .ptile-key { background: var(--accent); box-shadow: 0 0 8px var(--accent-glow); }
+
+/* the bezel: a sunken socket holding the mark */
+.ptile-bezel, .uc-empty-bezel {
+  display: grid; place-items: center;
+  width: 72px; height: 72px; border-radius: 14px;
+  background: var(--bg-inset); border: 1px solid var(--line-strong);
+  box-shadow: inset 0 2px 8px rgba(0,0,0,.45), 0 1px 0 rgba(255,255,255,.04);
+  transition: border-color .14s var(--ease), box-shadow .14s var(--ease);
+}
+.ptile.is-dead .ptile-bezel, .uc-empty-bezel.is-dead { border-style: dashed; }
+.ptile.is-selected .ptile-bezel { border-color: var(--accent); box-shadow: inset 0 2px 8px rgba(0,0,0,.45), 0 0 0 3px var(--accent-dim); }
+.pmark { width: 44px; height: 44px; }
+.pmark .ink { fill: none; stroke: var(--text); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.pmark .ink.fill { fill: var(--text); stroke: none; }
+.pmark .acc { fill: none; stroke: var(--accent); stroke-width: 2.4; stroke-linejoin: round; stroke-linecap: round; }
+.pmark .acc.fill { fill: var(--accent); stroke: none; }
+.ptile:not(.is-selected) .pmark .ink { stroke: var(--text-dim); }
+.ptile:not(.is-selected) .pmark .ink.fill { fill: var(--text-dim); }
+.ptile.is-selected .pmark .acc { filter: drop-shadow(0 0 4px var(--accent-glow)); }
+.ptile.is-dead .pmark { opacity: .7; }
+.ptile.is-dead .pmark .acc { stroke: var(--text-faint); }
+.ptile.is-dead .pmark .acc.fill { fill: var(--text-faint); }
+.ptile.is-reading .pmark { opacity: .5; }
+
+.ptile-body { min-width: 0; display: block; }
+.ptile-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; min-width: 0; }
+.ptile-name { display: block; font-weight: 600; font-size: 15px; letter-spacing: -0.01em; white-space: nowrap; }
+.ptile-id { font-size: 11px; color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; max-width: 46%; }
+.ptile.is-selected .ptile-id { color: var(--text-dim); }
+.ptile-state { display: flex; align-items: center; gap: 8px; margin-top: 4px; font-size: 13px; color: var(--text-dim); min-height: 18px; }
+.ptile-since { color: var(--text-faint); font-size: 12px; letter-spacing: 0; text-transform: none; }
+.ptile-stats { display: flex; gap: 22px; margin-top: 12px; align-items: flex-end; flex-wrap: wrap; }
+.pstat { display: inline-flex; flex-direction: column; font-family: var(--font-mono); line-height: 1.1; }
+.pstat b { font-weight: 500; font-size: 22px; color: var(--text); }
+.pstat span { font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: var(--text-dim); margin-top: 3px; }
+.pstat.is-zero b { color: var(--text-faint); }
+.pstat.is-on b { color: var(--accent); }
+.pstat-cost b { font-size: 18px; padding-bottom: 2px; }
+.ptile.is-bare .ptile-name { color: var(--text-dim); }
+.ptile.is-selected .ptile-name { color: var(--text); }
+
+/* the list below re-renders with a short fade when the selection changes */
+@keyframes uc-fade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+.cards.is-fading, .uc-empty.is-fading { animation: uc-fade .18s var(--ease); }
+
+/* empty state per provider: never a blank area */
+.uc-empty {
+  display: flex; flex-direction: column; align-items: center; text-align: center;
+  padding: 44px 24px 40px;
+  border: 1px dashed var(--line-strong); border-radius: var(--radius-lg);
+  background: var(--bg-panel);
+}
+.uc-empty-bezel { width: 96px; height: 96px; border-radius: 18px; margin-bottom: 18px; }
+.uc-empty-bezel .pmark { width: 58px; height: 58px; }
+.uc-empty-bezel.is-dead .pmark .acc { stroke: var(--text-faint); }
+.uc-empty-bezel.is-dead .pmark .acc.fill { fill: var(--text-faint); }
+.uc-empty-bezel.is-dead .pmark .ink { stroke: var(--text-dim); }
+.uc-empty-bezel.is-dead .pmark .ink.fill { fill: var(--text-dim); }
+.uc-empty-title { font-weight: 600; font-size: 16px; }
+.uc-empty-state { display: inline-flex; align-items: center; gap: 8px; margin-top: 8px; }
+.uc-empty-sub { color: var(--text-dim); max-width: 56ch; margin-top: 10px; line-height: 1.5; }
+.uc-empty-sub code { font-size: 12.5px; background: var(--bg-inset); border: 1px solid var(--line-faint); padding: 1px 5px; border-radius: 3px; }
+.uc-empty .btn { margin-top: 18px; text-decoration: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  .ptile, .ptile:hover, .ptile.is-selected, .ptile-key, .ptile-bezel { transition: none; }
+  .ptile:hover, .ptile.is-selected, .ptile.is-selected:hover { transform: none; }
+  .cards.is-fading, .uc-empty.is-fading { animation: none; }
+}

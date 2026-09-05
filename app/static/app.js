@@ -259,6 +259,10 @@ const state = {
   drawerReturnFocus: null,      // topology node id that opened the drawer; refocused on close
   topo: {},                     // usecaseId -> {loading, data, err, width, sel}
   usecases: null, ucErr: null, ucLoading: false,
+  ucProvider: null,             // provider id selected on the Use cases page (#/usecases/<provider>)
+  ucProviderAuto: true,         // true while the selection is a computed default, not a choice from the URL, memory or the operator
+  ucFade: false,                // one-shot: the next card list render fades in (a selection just changed)
+  pendingFocus: null,           // CSS selector to focus after the next route render instead of the view
   expanded: null,               // use case id
   details: {},                  // id -> detail (+ _loading/_err)
   outlines: {},                 // id -> {on:{loading,data,err}, off:{…}}
@@ -299,6 +303,45 @@ function regionFromHash() {
   return out;
 }
 function navigate(route) { location.hash = '#/' + route; }
+
+/* ---- v1.3: provider selection on the Use cases page ----
+   Route: #/usecases/<provider>. #/usecases alone resolves to localStorage `sb.usecases.provider`,
+   else the first registered provider with at least one use case, else aws. */
+const UC_PROVIDER_KEY = 'sb.usecases.provider';
+function ucProviderFromHash() {
+  const m = /^#\/usecases\/([a-z0-9-]+)/.exec(location.hash);
+  return m ? m[1] : null;
+}
+function knownProviderIds() { return panelProviders().map(p => p.id); }
+function rememberedUcProvider() {
+  try { return localStorage.getItem(UC_PROVIDER_KEY); } catch (e) { return null; }
+}
+function rememberUcProvider(id) {
+  try { localStorage.setItem(UC_PROVIDER_KEY, id); } catch (e) { /* private mode or blocked storage — memory is a convenience */ }
+}
+/** {id, auto}: auto = true when nothing (URL, memory) named a provider and the default was computed. */
+function resolveUcProvider() {
+  const ids = knownProviderIds();
+  const fromHash = ucProviderFromHash();
+  if (fromHash && ids.includes(fromHash)) return { id: fromHash, auto: false };
+  const mem = rememberedUcProvider();
+  if (mem && ids.includes(mem)) return { id: mem, auto: false };
+  const withCases = ids.find(id => (state.usecases || []).some(u => u.provider === id));
+  return { id: withCases || (ids.includes('aws') ? 'aws' : ids[0] || 'aws'), auto: true };
+}
+/** Operator choice (click / keyboard): remember it, put it in the URL, fade the list, keep focus on the tile. */
+function selectUcProvider(id, opts) {
+  opts = opts || {};
+  if (id === state.ucProvider && !opts.force) return;
+  rememberUcProvider(id);
+  state.ucFade = true;
+  state.pendingFocus = opts.focus ? '[data-provider-tile="' + id + '"]' : null;
+  const hash = '#/usecases/' + id;
+  if (opts.replace) { history.replaceState(null, '', KEEP_QUERY + hash); onRoute(); }
+  else location.hash = hash;
+}
+function ucHash() { return '#/usecases' + (state.ucProvider ? '/' + state.ucProvider : ''); }
+
 function openRegionDrawer(providerId, region) { location.hash = '#/clouds/' + providerId + '/' + region; }
 /** Open the drawer on one resource, remembering where to return on close. */
 function openResourceDrawer(providerId, region, kind, id, opts) {
@@ -345,6 +388,7 @@ async function boot() {
 
 function onRoute() {
   const r = routeFromHash();
+  const wasRoute = state.route;
   if (!state.authed) {
     if (r !== 'login') { location.hash = '#/login'; return; }
     state.route = 'login';
@@ -352,12 +396,20 @@ function onRoute() {
     if (!r || r === 'login') { location.hash = '#/clouds'; return; }
     state.route = (r === 'usecases') ? 'usecases' : 'clouds';
   }
-  stopTimer('usecases');
   if (state.route === 'usecases') {
-    loadUsecases();
-    timers.usecases = setInterval(() => loadUsecases(true), 15000);
-  } else {
-    stopJobTimers();
+    const sel = resolveUcProvider();
+    state.ucProvider = sel.id; state.ucProviderAuto = sel.auto;
+    if (ucProviderFromHash() !== sel.id) history.replaceState(null, '', KEEP_QUERY + '#/usecases/' + sel.id); // normalise the deep link; no hashchange fires
+  }
+  const stayingOnUsecases = wasRoute === 'usecases' && state.route === 'usecases' && timers.usecases;
+  if (!stayingOnUsecases) {
+    stopTimer('usecases');
+    if (state.route === 'usecases') {
+      loadUsecases();
+      timers.usecases = setInterval(() => loadUsecases(true), 15000);
+    } else {
+      stopJobTimers();
+    }
   }
   if (!state.providers && !state.providersLoading) loadProviders();
   // region drawer follows the hash so it is deep-linkable and survives refresh
@@ -381,7 +433,11 @@ function onRoute() {
     const tile = node || $('[data-region-tile="' + CSS.escape(wasOpen.region) + '"]');
     if (tile) tile.focus({ preventScroll: true }); else $('#view').focus({ preventScroll: true });
   } else {
-    $('#view').focus({ preventScroll: true });
+    const want = state.pendingFocus ? $(state.pendingFocus) : null;
+    state.pendingFocus = null;
+    // a page change moves focus to the view; staying on a page (a rail selection, a normalised hash) must not steal it
+    if (want) want.focus({ preventScroll: true });
+    else if (wasRoute !== state.route) $('#view').focus({ preventScroll: true });
   }
 }
 
@@ -403,11 +459,14 @@ function render() {
     else a.removeAttribute('aria-current');
   });
   $('.wordmark').href = KEEP_QUERY + '#/clouds';
+  const act = document.activeElement;
+  const keepTile = act && act.dataset ? act.dataset.providerTile : null; // a focused rail tile must survive the rebuild (polls re-render the page)
   const view = clear($('#view'));
   if (state.route === 'login') view.appendChild(renderLogin());
   else if (state.route === 'clouds') view.appendChild(renderClouds());
   else view.appendChild(renderUsecases());
   renderDrawerRoot();
+  if (keepTile) { const el = $('[data-provider-tile="' + CSS.escape(keepTile) + '"]'); if (el) el.focus({ preventScroll: true }); }
 }
 
 function renderLogin() {
@@ -1416,6 +1475,11 @@ async function loadUsecases(quiet) {
     const list = await api.usecases();
     state.usecases = list;
     state.ucErr = null;
+    if (state.route === 'usecases' && state.ucProviderAuto) {
+      // the default is "the first provider with a use case" — only knowable now
+      const sel = resolveUcProvider();
+      if (sel.id !== state.ucProvider) { state.ucProvider = sel.id; history.replaceState(null, '', KEEP_QUERY + '#/usecases/' + sel.id); }
+    }
     // If a use case is mid-transition and we are not yet tailing its job, pick it up.
     for (const uc of list) {
       if (/^turning_/.test(uc.state) && !state.jobFor[uc.id] && uc.last_run && uc.last_run.state === 'running' && uc.last_run.job_id) {
@@ -1555,8 +1619,11 @@ function renderUsecases() {
   root.appendChild(h('div', { class: 'page-head' },
     h('div', null, h('h1', { class: 'page-title' }, 'Use cases'), h('p', { class: 'page-sub' }, 'Each switch runs a declared procedure against the connected cloud. Nothing happens without a confirmation.')),
     h('div', { style: 'display:flex;gap:10px;align-items:center' },
-      state.ucLoading ? h('span', { class: 'loading' }, 'Loading') : null,
-      h('button', { class: 'btn btn-sm', type: 'button', onclick: () => loadUsecases() }, icon('refresh'), 'Refresh'))));
+      state.ucLoading || state.providersLoading ? h('span', { class: 'loading' }, 'Loading') : null,
+      h('button', { class: 'btn btn-sm', type: 'button', onclick: () => { loadProviders(); loadUsecases(); } }, icon('refresh'), 'Refresh'))));
+
+  // the provider rail: one tile per registered provider, always all of them
+  root.appendChild(renderProviderRail());
 
   if (state.ucErr && !state.usecases) {
     root.appendChild(h('div', { class: 'state-box is-error' }, h('div', { class: 'title' }, 'Could not load use cases'), h('div', null, state.ucErr),
@@ -1567,16 +1634,151 @@ function renderUsecases() {
     root.appendChild(h('div', { class: 'cards' }, [1, 2].map(() => h('div', { class: 'skeleton', style: 'height:96px' }))));
     return root;
   }
-  if (!state.usecases.length) {
-    root.appendChild(h('div', { class: 'state-box' }, h('div', { class: 'title' }, 'No use cases registered'),
-      h('div', null, 'Add a manifest at ', h('code', null, 'usecases/<id>/usecase.yaml'), ' and restart Switchboard. Each one gets a switch here.')));
+  if (state.ucErr) root.appendChild(h('div', { class: 'form-error', style: 'margin-bottom:12px' }, 'Last refresh failed: ' + state.ucErr));
+  const fade = state.ucFade ? ' is-fading' : '';
+  state.ucFade = false;
+  const mine = state.usecases.filter(uc => uc.provider === state.ucProvider);
+  if (!mine.length) {
+    root.appendChild(renderUcEmpty(state.ucProvider, fade));
     return root;
   }
-  if (state.ucErr) root.appendChild(h('div', { class: 'form-error', style: 'margin-bottom:12px' }, 'Last refresh failed: ' + state.ucErr));
-  const cards = h('div', { class: 'cards' });
-  for (const uc of state.usecases) cards.appendChild(renderCard(uc));
+  const cards = h('div', { class: 'cards' + fade, 'aria-label': 'Use cases on ' + providerName(state.ucProvider) });
+  for (const uc of mine) cards.appendChild(renderCard(uc));
   root.appendChild(cards);
   return root;
+}
+
+/* ---- provider rail ---- */
+
+/** A summary's running cost, if the backend reports one (field name is not fixed yet). */
+function ucCost(uc) {
+  if (!uc) return null;
+  for (const k of ['cost_monthly', 'monthly_usd', 'cost_monthly_usd']) if (typeof uc[k] === 'number') return uc[k];
+  if (uc.cost && typeof uc.cost.monthly_usd === 'number') return uc.cost.monthly_usd;
+  return null;
+}
+function providerTally(id) {
+  const list = (state.usecases || []).filter(u => u.provider === id);
+  const on = list.filter(u => u.state === 'on');
+  let cost = null;
+  for (const u of on) { const c = ucCost(u); if (c !== null) cost = (cost || 0) + c; }
+  return { total: list.length, on: on.length, cost };
+}
+
+/** Provider marks: simple, recognisable, monochrome with one amber accent. Inline SVG, nothing fetched. */
+function providerMark(id, cls) {
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('viewBox', '0 0 48 48'); svg.setAttribute('class', 'pmark pmark-' + id + (cls ? ' ' + cls : '')); svg.setAttribute('aria-hidden', 'true');
+  const mk = (tag, attrs) => { const e = document.createElementNS(ns, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); svg.appendChild(e); return e; };
+  if (id === 'aws') {
+    // a cube (the service) over the smile arrow (the signature)
+    mk('path', { class: 'ink', d: 'M24 5 36 12v14L24 33 12 26V12z' });
+    mk('path', { class: 'ink', d: 'M12 12l12 7 12-7M24 19v14' });
+    mk('path', { class: 'ink fill', d: 'M24 5 36 12 24 19 12 12z', opacity: '.35' });
+    mk('path', { class: 'acc', d: 'M8 36q16 11 32 0' });
+    mk('path', { class: 'acc', d: 'M34 36.4 40 36l-2.6 5.4' });
+  } else if (id === 'gcp') {
+    // the hexagon, one edge lit, a cloud inside
+    mk('path', { class: 'ink', d: 'M14 6.5h20l10 17.5-10 17.5H14L4 24z' });
+    mk('path', { class: 'acc', d: 'M34 6.5 44 24' });
+    mk('path', { class: 'ink', d: 'M16 31h16a5 5 0 0 0 .8-9.9 7 7 0 0 0-13.4-1.5A5.5 5.5 0 0 0 16 31z' });
+    mk('circle', { class: 'acc fill', cx: 44, cy: 24, r: 2.2 });
+  } else if (id === 'azure') {
+    // the A: a slanted bar and a lit chevron
+    mk('path', { class: 'ink fill', d: 'M5 40 19 7h9L19 40z', opacity: '.55' });
+    mk('path', { class: 'ink', d: 'M5 40 19 7h9L19 40z' });
+    mk('path', { class: 'acc fill', d: 'M28 7l16 33H22l11.5-9.5L24.5 15z', opacity: '.22' });
+    mk('path', { class: 'acc', d: 'M28 7l16 33H22l11.5-9.5L24.5 15z' });
+  } else {
+    // unknown provider id: a generic socket ring
+    mk('circle', { class: 'ink', cx: 24, cy: 24, r: 17 });
+    mk('circle', { class: 'acc fill', cx: 24, cy: 24, r: 5 });
+  }
+  return svg;
+}
+
+function providerStateInfo(p) {
+  if (p.status === 'loading') return { lamp: 'unknown', cls: 'unknown', word: 'reading', tone: 'reading' };
+  if (p.status === 'connected') return { lamp: 'on', cls: 'on', word: 'connected', tone: 'live' };
+  return { lamp: '', cls: 'off', word: 'unplugged', tone: 'dead' };
+}
+
+function renderProviderRail() {
+  const providers = panelProviders();
+  const rail = h('div', { class: 'prail', role: 'radiogroup', 'aria-label': 'Cloud provider' });
+  const ids = providers.map(p => p.id);
+  rail.addEventListener('keydown', e => {
+    const i = ids.indexOf(state.ucProvider);
+    let next = null;
+    if (e.key === 'ArrowRight' || e.key === 'ArrowDown') next = ids[(i + 1) % ids.length];
+    else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') next = ids[(i - 1 + ids.length) % ids.length];
+    else if (e.key === 'Home') next = ids[0];
+    else if (e.key === 'End') next = ids[ids.length - 1];
+    else return;
+    e.preventDefault();
+    if (next) selectUcProvider(next, { replace: true, focus: true });
+  });
+  for (const p of providers) rail.appendChild(renderProviderTile(p));
+  return rail;
+}
+
+function renderProviderTile(p) {
+  const selected = p.id === state.ucProvider;
+  const st = providerStateInfo(p);
+  const t = providerTally(p.id);
+  const loaded = !!state.usecases;
+  const costText = t.cost !== null ? fmtUsd(t.cost) : null;
+  const name = [p.name, st.word,
+    loaded ? (t.total + ' use case' + (t.total === 1 ? '' : 's')) : 'use cases loading',
+    loaded && t.total ? t.on + ' on' : null,
+    costText ? costText + ' per month' : null].filter(Boolean).join(', ');
+  const tile = h('button', {
+    class: 'ptile is-' + st.tone + (selected ? ' is-selected' : '') + (loaded && !t.total ? ' is-bare' : ''),
+    type: 'button', role: 'radio', 'aria-checked': String(selected), tabindex: selected ? '0' : '-1',
+    'aria-label': name, dataset: { providerTile: p.id },
+    onclick: () => selectUcProvider(p.id, { focus: true }),
+  });
+  tile.appendChild(h('span', { class: 'ptile-bezel' }, providerMark(p.id)));
+  const body = h('span', { class: 'ptile-body' });
+  const idn = p.status === 'connected' ? identityLines(p)[0] : null;
+  body.appendChild(h('span', { class: 'ptile-head' }, h('span', { class: 'ptile-name' }, p.name),
+    idn ? h('span', { class: 'ptile-id mono', title: idn.text }, idn.text) : null));
+  body.appendChild(h('span', { class: 'ptile-state' },
+    h('span', { class: 'lamp ' + st.lamp }),
+    h('span', { class: 'state-word ' + st.cls }, st.word),
+    p.status === 'connected' && p.connected_at ? h('span', { class: 'ptile-since mono' }, '· since ', h('span', { dataset: { rel: p.connected_at }, title: fmtTime(p.connected_at) }, fmtRel(p.connected_at))) : null));
+  const stats = h('span', { class: 'ptile-stats' });
+  if (!loaded) {
+    stats.appendChild(h('span', { class: 'skeleton', style: 'height:26px;width:56px' }));
+    stats.appendChild(h('span', { class: 'skeleton', style: 'height:26px;width:40px' }));
+  } else {
+    stats.appendChild(h('span', { class: 'pstat' + (t.total ? '' : ' is-zero') }, h('b', null, t.total), h('span', null, t.total === 1 ? 'use case' : 'use cases')));
+    stats.appendChild(h('span', { class: 'pstat' + (t.on ? ' is-on' : ' is-zero') }, h('b', null, t.total ? t.on : '—'), h('span', null, 'on')));
+    if (costText) stats.appendChild(h('span', { class: 'pstat pstat-cost' }, h('b', null, costText), h('span', null, '/ month')));
+  }
+  body.appendChild(stats);
+  tile.appendChild(body);
+  tile.appendChild(h('span', { class: 'ptile-key', 'aria-hidden': 'true' }));
+  return tile;
+}
+
+/** Designed empty state for a provider with no use cases: mark, sentence, and the honest next step. */
+function renderUcEmpty(id, fade) {
+  const p = providerById(id) || { id, name: providerName(id), status: state.providers ? 'disconnected' : 'loading' };
+  const st = providerStateInfo(p);
+  const unplugged = p.status !== 'connected' && p.status !== 'loading';
+  const box = h('div', { class: 'uc-empty' + (fade || ''), role: 'status' });
+  box.appendChild(h('div', { class: 'uc-empty-bezel is-' + st.tone }, providerMark(id)));
+  box.appendChild(h('div', { class: 'uc-empty-title' }, 'No use cases for ', p.name, ' yet'));
+  box.appendChild(h('div', { class: 'uc-empty-state' }, h('span', { class: 'lamp ' + st.lamp }), h('span', { class: 'state-word ' + st.cls }, st.word)));
+  if (unplugged) {
+    box.appendChild(h('p', { class: 'uc-empty-sub' }, 'The ', p.name, ' line is unplugged. Plug it in on the Clouds page; use cases for this cloud then arrive as manifests under ', h('code', null, 'usecases/'), '.'));
+    box.appendChild(h('a', { class: 'btn btn-primary', href: KEEP_QUERY + '#/clouds' }, icon('plug'), 'Plug in ' + providerShort(id)));
+  } else {
+    box.appendChild(h('p', { class: 'uc-empty-sub' }, 'Use cases for this cloud arrive as manifests under ', h('code', null, 'usecases/'), ' — each one gets a switch here once its ', h('code', null, 'provider'), ' is ', h('code', null, id), '.'));
+  }
+  return box;
 }
 
 const STATE_INFO = {
@@ -2396,7 +2598,7 @@ function openTopoNode(uc, g, n) {
   if (!n || n.pseudo || n.kind === 'internet' || !g.region) return;
   const kind = { instance: 'inst', subnet: 'subnet', vpc: 'vpc', nat: 'nat', eip: 'eip' }[n.kind];
   if (!kind) return;
-  openResourceDrawer(uc.provider || g.provider || 'aws', g.region, kind, n.id, { returnTo: '#/usecases', returnFocus: n.id });
+  openResourceDrawer(uc.provider || g.provider || 'aws', g.region, kind, n.id, { returnTo: ucHash(), returnFocus: n.id });
 }
 
 /* ---- the block in the card ---- */
@@ -3082,7 +3284,9 @@ SB.highlight = (function () {
 /* ==========================================================================
    9. mock — ?mock=1 swaps the api for an in-memory backend that exercises
       every state. Extra switches: &authed=1 (skip login), &connected=1
-      (AWS already plugged in). An access key containing "FAIL" yields a
+      (AWS already plugged in) or &connected=aws,azure (the v1.3 rail scene:
+      AWS live, GCP unplugged and empty, Azure live with one use case that is
+      off), &page=usecases&provider=azure (preselect a rail tile). An access key containing "FAIL" yields a
       failing ConnectionReport; the password "wrong" yields 401.
    ========================================================================== */
 
@@ -3359,7 +3563,7 @@ shared with anything else. See the [lab repository](https://github.com/nilsujma-
     'zpa-private-service-edge': {
       id: 'zpa-private-service-edge', name: 'ZPA Private Service Edge lab', provider: 'aws',
       summary: 'A Private Service Edge in an isolated VPC, plus a segmented client/server VPC.',
-      state: 'on', resources: 5, description: PSE_DESC, procedure: PROC_PSE,
+      state: 'on', resources: 5, cost_monthly: 284.89, description: PSE_DESC, procedure: PROC_PSE,
       source: { git: 'https://github.com/nilsujma-dev/zs-zpa-private-service-edge-lab.git', ref: 'main', commit: '8c1f4e2a9b3d7c6e5f4a3b2c1d0e9f8a7b6c5d4e' },
       status: { pse: { enrolled: true, status: 'ZPN_STATUS_AUTHENTICATED', version: '25.62.1' }, connector: { status: 'ZPN_STATUS_AUTHENTICATED' }, priv_connector: { status: PARAMS.get('enrol') === 'partial' ? 'ZPN_STATUS_DISCONNECTED' : 'ZPN_STATUS_AUTHENTICATED' }, client: { app_segment: 'zpa-lab-server', reachable: true }, checked_at: iso(40000) },
       runs: [], tags: { Project: 'zpa-pse-lab' },
@@ -3383,17 +3587,17 @@ shared with anything else. See the [lab repository](https://github.com/nilsujma-
     'ot-edge-relay': {
       id: 'ot-edge-relay', name: 'OT edge relay', provider: 'aws',
       summary: 'A relay instance that bridges the OT cell (10.1.75.0/24) into a cloud-hosted historian.',
-      state: 'error', resources: 3, procedure: PROC_OT,
+      state: 'error', resources: 3, cost_monthly: 41.2, procedure: PROC_OT,
       description: 'Bridges the EBC OT cell into a cloud historian over a ZPA-published Modbus/TCP path.\n\nThe verification step talks to the **real LOGO! PLC** at `10.1.75.10`; if the cell is offline the turn-on fails on purpose rather than leaving a half-configured relay.',
       source: { git: 'https://github.com/nilsujma-dev/zs-ot-edge-relay.git', ref: 'main', commit: 'deadbeefcafe0123456789abcdef0123456789ab' },
       status: null, runs: [], tags: { Project: 'ot-relay' },
     },
-    'gke-workload-segmentation': {
-      id: 'gke-workload-segmentation', name: 'GKE workload segmentation', provider: 'gcp',
-      summary: 'Zscaler Workload Segmentation on a small GKE cluster.',
-      state: 'unknown', resources: null, procedure: { on: [{ name: 'Apply infrastructure', run: 'tofu -chdir=terraform apply -auto-approve -input=false' }], off: [{ name: 'Destroy infrastructure', run: 'tofu -chdir=terraform destroy -auto-approve -input=false' }] },
-      description: 'Placeholder until the GCP provider module exists.\n\nRenderer self-test — raw HTML must appear as text: <script>alert("never executed")</script> and [a javascript link](javascript:alert(1)) must be neutralised.',
-      source: { git: 'https://github.com/nilsujma-dev/zs-gke-segmentation.git', ref: 'main', commit: null },
+    'aks-workload-segmentation': {
+      id: 'aks-workload-segmentation', name: 'AKS workload segmentation', provider: 'azure',
+      summary: 'Zscaler Workload Segmentation on a small AKS cluster.',
+      state: 'off', resources: 0, cost_monthly: 0, procedure: { on: [{ name: 'Apply infrastructure', run: 'tofu -chdir=terraform apply -auto-approve -input=false' }], off: [{ name: 'Destroy infrastructure', run: 'tofu -chdir=terraform destroy -auto-approve -input=false' }] },
+      description: 'Placeholder until the Azure provider module can run use cases.\n\nRenderer self-test — raw HTML must appear as text: <script>alert("never executed")</script> and [a javascript link](javascript:alert(1)) must be neutralised.',
+      source: { git: 'https://github.com/nilsujma-dev/zs-aks-segmentation.git', ref: 'main', commit: null },
       status: null, runs: [], tags: {},
     },
   };
@@ -3932,6 +4136,7 @@ tofu -chdir=terraform apply
   function scene(state) {
     const page = PARAMS.get('page');
     if (page === 'usecases' || page === 'clouds') location.hash = '#/' + page;
+    if (PARAMS.get('provider') && (page === 'usecases' || /^#\/usecases/.test(location.hash))) location.hash = '#/usecases/' + PARAMS.get('provider'); // preselect a rail tile
     if (PARAMS.get('region')) location.hash = '#/clouds/aws/' + PARAMS.get('region');
     if (PARAMS.get('inst')) state.drawer.inst[PARAMS.get('inst')] = true;
     if (PARAMS.get('project')) state.drawer.project = PARAMS.get('project');
@@ -3943,6 +4148,7 @@ tofu -chdir=terraform apply
       const shown = Math.min(rep.checks.length, parseInt(PARAMS.get('shown') || '3', 10));
       state.connect = { provider: prov, mode: PARAMS.get('mode') || 'connect', stage: shown >= rep.checks.length ? 'done' : 'checking', fields: FORMS[prov], values: {}, fieldErrors: {}, report: rep, shown, error: null, busy: true };
     }
+    if (PARAMS.get('focus') === 'rail') state.pendingFocus = '[data-provider-tile="' + (PARAMS.get('provider') || 'aws') + '"]'; // keyboard focus ring on a rail tile
     if (PARAMS.get('expand')) state.expanded = PARAMS.get('expand');
     if (PARAMS.get('expand') && PARAMS.get('node')) state.topo[PARAMS.get('expand')] = { loading: false, data: null, err: null, width: 0, sel: { node: PARAMS.get('node') }, refocus: null };
   }
@@ -3961,7 +4167,9 @@ tofu -chdir=terraform apply
   const need = async () => { await sleep(120 + Math.random() * 180); if (!authed) { onUnauthorised(); throw new ApiError('Not signed in.', 401, 'unauthorised'); } };
   const listItem = uc => {
     const lr = uc.runs[0] ? { job_id: uc.runs[0].job_id, action: uc.runs[0].action, state: uc.runs[0].state, ended: uc.runs[0].ended, started: uc.runs[0].started } : null;
-    return { id: uc.id, name: uc.name, provider: uc.provider, summary: uc.summary, state: uc.state, resources: uc.resources, last_run: lr, provider_connected: connected.has(uc.provider) };
+    const item = { id: uc.id, name: uc.name, provider: uc.provider, summary: uc.summary, state: uc.state, resources: uc.resources, last_run: lr, provider_connected: connected.has(uc.provider) };
+    if (typeof uc.cost_monthly === 'number') item.cost_monthly = uc.cost_monthly;
+    return item;
   };
   const api = {
     me: async () => { await sleep(80); if (!authed) throw new ApiError('Not signed in.', 401, 'unauthorised'); return { authenticated: true }; },
