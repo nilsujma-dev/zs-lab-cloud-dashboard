@@ -543,3 +543,56 @@ five instances with lamps, NAT and IGWs, the internet on top, the three dashed f
 on the PSE, the red blocked MCU→PRIV pair. Clicking the PSE opens the drawer on it. The drawing
 regenerates from AWS on refresh — after an OFF/ON cycle it shows the new ids and addresses with
 no manifest change.
+
+---
+
+# v1.3 delta — provider selector on the Use cases page
+
+Use cases will be separated by cloud: AWS today, Google Cloud and Microsoft Azure next.
+The Use cases page therefore opens with a **provider selector** and shows only the
+selected provider's use cases beneath it. Backend is unchanged: `GET /api/usecases`
+already tags each summary with `provider`, and `GET /api/providers` already carries each
+provider's connection state. This is a frontend workstream.
+
+## The selector
+
+- A **provider rail** at the top of the Use cases page: one large selectable tile per
+  registered provider, in registry order (AWS, Google Cloud, Microsoft Azure), always all
+  three even when a provider has no use cases yet. Graphically deliberate, not a tab strip:
+  each tile carries the provider's mark (drawn inline as SVG in the v1 design language —
+  no logos fetched, no emoji), its name, the connection lamp and state
+  (`connected · since …` / `unplugged`), the use-case count, how many are **on**, and the
+  running monthly cost of that provider's *on* use cases (sum of the summaries'
+  `cost_monthly`-type field if present, else omitted). Selected tile: amber outline,
+  raised; others recede. Hover lifts. Transition on selection (fast, ≤150 ms; respect
+  `prefers-reduced-motion`).
+- Selecting a tile filters the cards below; the card list re-renders with a short fade.
+  A provider with zero use cases shows a designed **empty state**: the provider's mark,
+  "No use cases for Google Cloud yet", and — if it is unplugged — a link to the Clouds page
+  to plug it in; if connected — "Use cases for this cloud arrive as manifests under
+  `usecases/`". Never an empty white area.
+- **Deep link and memory:** the route becomes `#/usecases/<provider>`; `#/usecases` alone
+  resolves to the remembered choice (localStorage `sb.usecases.provider`), else the first
+  provider that has at least one use case, else `aws`. An unknown provider id in the URL
+  falls back the same way. Existing deep links used by the drawer's return path
+  (`#/usecases`) keep working. The drawer's `returnTo` should carry the selected provider.
+- **Keyboard:** the rail is a `radiogroup`; tiles are `radio` with roving tabindex,
+  Left/Right/Home/End move selection, the count and state are in the accessible name.
+- The page header's copy stays; the rail sits between the header and the cards. The
+  Refresh button refreshes both the rail's provider states and the cards.
+- 1280: three tiles in a row, each ≥ 360 px. Narrower: tiles wrap 2+1, never scroll.
+
+## Mock
+
+`?mock=1` already carries GCP and Azure use cases; keep them and make the rail honest
+against the mock provider states (AWS connected, GCP unplugged, Azure connected but with a
+use case that is off). Add `&provider=<id>` to preselect.
+
+## Definition of done (v1.3)
+
+- Rail renders all three providers with live connection state and counts; selection
+  filters; empty states designed; deep link + localStorage memory; keyboard radiogroup.
+- Screenshots at 1280 and 1920, dark and light: AWS selected, GCP empty/unplugged, Azure
+  selected, and the keyboard focus ring, into `scratchpad/ui-shots/v13/`.
+- No change outside `app/static/`. No external requests. All existing behaviour — card
+  expand, topology, outline, drawer return path — unchanged.
