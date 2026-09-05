@@ -54,7 +54,7 @@ description: |                          # markdown; the card shows it
   5. **Wait for enrolment** — polls ZPA until the Service Edge and both App
      Connectors report `ZPN_STATUS_AUTHENTICATED` (up to 15 minutes).
 
-  Every rebuild consumes one use of each provisioning key (`maxUsage 5`) and leaves
+  Every rebuild consumes one use of each provisioning key (`maxUsage 25`) and leaves
   a stale, disconnected entry in ZPA for the previous instance.
 
   ## What turning it off does

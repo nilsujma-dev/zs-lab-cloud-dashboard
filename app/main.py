@@ -14,6 +14,20 @@ from fastapi import APIRouter, Depends, FastAPI, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+
+
+class NoCacheStaticFiles(StaticFiles):
+    """Static files that browsers must revalidate on every load.
+
+    Without an explicit Cache-Control, browsers heuristically cache app.js and
+    app.css from Last-Modified, so a deploy is invisible until a hard refresh.
+    ETag stays, so an unchanged file is still a cheap 304.
+    """
+
+    async def get_response(self, path, scope):  # type: ignore[override]
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException  # base class: catches FastAPI's subclass and router 404s
@@ -354,7 +368,7 @@ def build_app(*, background: bool | None = None) -> FastAPI:
 
     # ------------------------------------------------------------------ static UI
     if (STATIC_DIR / "index.html").is_file():
-        app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
+        app.mount("/", NoCacheStaticFiles(directory=str(STATIC_DIR), html=True), name="static")
     else:
         log.warning("%s missing; serving a placeholder page", STATIC_DIR / "index.html")
 
