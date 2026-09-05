@@ -110,3 +110,19 @@ status:                                 # optional; must print JSON on stdout
   interval_s: 60
 tags:                                   # inventory grouping + cost attribution
   Project: zpa-pse-lab
+
+effects:                                # what happens OUTSIDE OpenTofu; the live plan supplies the rest
+  "on":
+    creates:
+      - "ZPA Service Edge Group, App Connector Groups and provisioning keys — reused by name if they already exist, never duplicated"
+      - "Three SSM SecureString parameters under /zpa-lab/ holding the provisioning keys (overwritten on every run)"
+      - "An enrolled Service Edge and two App Connectors in ZPA once the instances boot and dial in (~3 minutes)"
+    retains: []
+  "off":
+    destroys:
+      - "Everything OpenTofu manages in this use case: both VPCs and all their subnets, routes, NACLs and security groups, the NAT gateway, both elastic IPs, all five instances and their volumes, the IAM role and instance profile — see the plan"
+    retains:
+      - "ZPA Service Edge Group, App Connector Groups and provisioning keys — deleting these is deliberately manual"
+      - "The enrolled Service Edge and App Connector entries in ZPA, which will show as disconnected and accumulate one per rebuild"
+      - "The three SSM parameters under /zpa-lab/ (harmless; overwritten on the next ON)"
+      - "The S3 state object (versioned, so this OFF is recoverable) and the remote lock"
