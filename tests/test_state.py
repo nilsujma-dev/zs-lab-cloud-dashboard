@@ -26,9 +26,7 @@ def test_parse_state_list_counts_resources() -> None:
         "aws_instance.pse",
         "aws_vpc.pse",
         "module.client.aws_instance.client",
-        "module.client.aws_vpc.this",
-        "data.aws_ami.al2023",
-    ]
+        "module.client.aws_vpc.this"]
 
 
 def test_parse_state_list_drops_blank_and_diagnostic_lines() -> None:
@@ -101,7 +99,7 @@ def test_state_on_from_tofu_output(engine_env) -> None:
     engine = _FakeTofuEngine(store, providers, JobRunner(store), root, output=STATE_LIST_OUTPUT)
     result = engine.state(manifest)
     assert result["state"] == "on"
-    assert result["resources"] == 5
+    assert result["resources"] == 4  # the fixture's data source is not a resource
     assert engine.calls[-1][:3] == ["tofu", "-chdir=terraform", "state"]
 
 
@@ -188,6 +186,6 @@ def test_tofu_init_failure_raises(engine_env) -> None:
 
 
 def test_parse_state_list_drops_data_sources():
-    from app.usecases.engine import UseCaseEngine
+    from app.usecases.engine import Engine
     out = "aws_vpc.lab\ndata.aws_ami.al2023\nmodule.net.data.aws_caller_identity.me\naws_instance.pse\n"
-    assert UseCaseEngine.parse_state_list(out) == ["aws_vpc.lab", "aws_instance.pse"]
+    assert Engine.parse_state_list(out) == ["aws_vpc.lab", "aws_instance.pse"]
