@@ -93,7 +93,7 @@ class State:
         usecases_root = Path(os.environ.get("SWITCHBOARD_USECASES") or (REPO_DIR / "usecases"))
         self.engine = Engine(self.store, self.providers, self.jobs, usecases_root)
         self.version = _version()
-        self.inventory_lock = threading.Lock()
+        self.inventory_lock = self.engine.inventory_lock
 
 
 def build_app(*, background: bool | None = None) -> FastAPI:
@@ -339,6 +339,13 @@ def build_app(*, background: bool | None = None) -> FastAPI:
         if action not in ("on", "off"):
             raise ApiError(400, "bad_action", "action must be 'on' or 'off'")
         return await run_in_threadpool(engine.outline, manifest, action)
+
+    @api.get("/usecases/{usecase_id}/topology")
+    async def usecase_topology(usecase_id: str, request: Request, refresh: int = Query(0, ge=0, le=1)) -> dict[str, Any]:
+        """Live network drawing data (v1.2). Always 200: `nodes: []` + `reason` when nothing can be drawn."""
+        engine = sb(request).engine
+        manifest = engine.manifest(usecase_id)
+        return await run_in_threadpool(lambda: engine.topology(manifest, refresh=bool(refresh)))
 
     @api.get("/usecases/{usecase_id}/code")
     async def usecase_code(usecase_id: str, request: Request, path: str | None = None) -> dict[str, Any]:

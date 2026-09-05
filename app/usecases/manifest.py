@@ -14,9 +14,13 @@ ID_RE = re.compile(r"^[a-z0-9-]+$")
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 KNOWN_SECRETS = frozenset({"zscaler_oneapi"})
 TOP_LEVEL_KEYS = frozenset(
-    {"id", "name", "provider", "summary", "description", "source", "terraform", "env", "secrets", "on", "off", "status", "tags", "effects"}
+    {"id", "name", "provider", "summary", "description", "source", "terraform", "env", "secrets", "on", "off", "status", "tags", "effects", "topology"}
 )
 EFFECT_KEYS = ("creates", "destroys", "retains")
+TOPOLOGY_KEYS = frozenset({"roles", "flows", "blocked"})
+LINK_KEYS = frozenset({"from", "to", "label", "via"})
+VIA_HOPS = frozenset({"nat", "igw", "internet"})
+INTERNET = "internet"
 DEFAULT_STATUS_INTERVAL_S = 60
 
 
@@ -52,6 +56,31 @@ class Effects:
 
 
 @dataclass(frozen=True)
+class Link:
+    """One declared flow (or blocked pair): endpoints are instance Name tags or `internet`."""
+
+    from_: str
+    to: str
+    label: str | None = None
+    via: tuple[str, ...] = ()
+
+    def to_api(self) -> dict[str, Any]:
+        return {"from": self.from_, "to": self.to, "label": self.label, "via": list(self.via)}
+
+
+@dataclass(frozen=True)
+class Topology:
+    """Meaning layered on the cloud's structure: roles by Name tag, declared flows, blocked pairs."""
+
+    roles: dict[str, str] = field(default_factory=dict)
+    flows: tuple[Link, ...] = ()
+    blocked: tuple[Link, ...] = ()
+
+    def to_api(self) -> dict[str, Any]:
+        return {"roles": dict(self.roles), "flows": [l.to_api() for l in self.flows], "blocked": [l.to_api() for l in self.blocked]}
+
+
+@dataclass(frozen=True)
 class Manifest:
     id: str
     name: str
@@ -70,6 +99,7 @@ class Manifest:
     tags: dict[str, str] = field(default_factory=dict)
     effects_on: Effects = field(default_factory=Effects)
     effects_off: Effects = field(default_factory=Effects)
+    topology: Topology = field(default_factory=Topology)
     path: Path | None = None
 
     def effects(self, action: str) -> Effects:
@@ -157,6 +187,59 @@ def _effects(data: dict[str, Any], where: str) -> tuple[Effects, Effects]:
             raise _fail(w, f"unknown field(s): {', '.join(sorted(str(k) for k in extra))}")
         out.append(Effects(creates=_str_list(block, "creates", w), destroys=_str_list(block, "destroys", w), retains=_str_list(block, "retains", w)))
     return out[0], out[1]
+
+
+def _links(data: dict[str, Any], key: str, where: str) -> tuple[Link, ...]:
+    value = data.get(key)
+    if value is None:
+        return ()
+    if not isinstance(value, list):
+        raise _fail(where, f"'{key}' must be a list of {{from, to, label?, via?}} mappings")
+    links: list[Link] = []
+    for i, item in enumerate(value, start=1):
+        w = f"{where} {key}[{i}]"
+        if not isinstance(item, dict):
+            raise _fail(w, "each entry must be a mapping with 'from' and 'to'")
+        extra = set(item) - LINK_KEYS
+        if extra:
+            raise _fail(w, f"unknown field(s): {', '.join(sorted(str(k) for k in extra))}")
+        label = item.get("label")
+        if label is not None and (not isinstance(label, str) or not label.strip()):
+            raise _fail(w, "'label' must be a non-empty string")
+        via_raw = item.get("via")
+        via: tuple[str, ...] = ()
+        if via_raw is not None:
+            if not isinstance(via_raw, list) or not all(isinstance(v, str) for v in via_raw):
+                raise _fail(w, f"'via' must be a list drawn from {', '.join(sorted(VIA_HOPS))}")
+            bad = [v for v in via_raw if v not in VIA_HOPS]
+            if bad:
+                raise _fail(w, f"'via' has unknown hop(s): {', '.join(bad)} (allowed: {', '.join(sorted(VIA_HOPS))})")
+            via = tuple(via_raw)
+        links.append(Link(from_=_req_str(item, "from", w).strip(), to=_req_str(item, "to", w).strip(), label=label.strip() if label else None, via=via))
+    return tuple(links)
+
+
+def _topology(data: dict[str, Any], where: str) -> Topology:
+    """Optional `topology: {roles, flows, blocked}`; all keys optional."""
+    raw = data.get("topology")
+    if raw is None:
+        return Topology()
+    w = f"{where} topology"
+    if not isinstance(raw, dict):
+        raise _fail(where, "'topology' must be a mapping with optional 'roles', 'flows' and 'blocked'")
+    extra = set(raw) - TOPOLOGY_KEYS
+    if extra:
+        raise _fail(w, f"unknown field(s): {', '.join(sorted(str(k) for k in extra))}")
+    roles_raw = raw.get("roles")
+    roles: dict[str, str] = {}
+    if roles_raw is not None:
+        if not isinstance(roles_raw, dict):
+            raise _fail(w, "'roles' must be a mapping of instance Name to role")
+        for k, v in roles_raw.items():
+            if not isinstance(k, str) or not k.strip() or not isinstance(v, str) or not v.strip():
+                raise _fail(w, f"'roles' entries must be non-empty strings (offending key {k!r})")
+            roles[k.strip()] = v.strip()
+    return Topology(roles=roles, flows=_links(raw, "flows", w), blocked=_links(raw, "blocked", w))
 
 
 def _relative_path(value: str, where: str, key: str) -> str:
@@ -252,6 +335,7 @@ def parse_manifest(
         tags=_opt_str_map(data, "tags", where),
         effects_on=effects_on,
         effects_off=effects_off,
+        topology=_topology(data, where),
         path=path,
     )
 

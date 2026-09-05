@@ -19,6 +19,7 @@ from app.jobs import JobConflict, JobRunner, LogWriter, Scrubber, StepSpec
 from app.providers.base import Provider
 from app.store import Store, utcnow_iso
 from app.usecases.manifest import Manifest, load_all
+from app.usecases.topology import build_graph
 
 log = logging.getLogger("switchboard.engine")
 
@@ -30,6 +31,7 @@ TOFU_INIT_TIMEOUT_S = 900
 TOFU_STATE_TIMEOUT_S = 120
 TOFU_PLAN_TIMEOUT_S = 900
 OUTLINE_CACHE_TTL_S = 60
+TOPOLOGY_CACHE_TTL_S = 60
 PLAN_ACTIONS = {"create": "create", "update": "update", "delete": "destroy", "read": "read", "noop": "unchanged", "no-op": "unchanged"}
 REFRESH_LOOP_S = 5
 CODE_FILE_LIMIT = 512 * 1024
@@ -76,6 +78,9 @@ class Engine:
         self._state_cache: dict[str, dict[str, Any]] = {}
         self._outline_cache: dict[tuple[str, str], dict[str, Any]] = {}
         self._outline_locks: dict[tuple[str, str], threading.Lock] = {}
+        self._topology_cache: dict[str, dict[str, Any]] = {}
+        # One inventory scan at a time per process; main.py's inventory route shares this lock.
+        self.inventory_lock = threading.Lock()
         self._initialised: set[str] = set()
         self._last_probe: dict[str, float] = {}
         self._locks: dict[str, threading.RLock] = {}
@@ -347,6 +352,7 @@ class Engine:
 
     def invalidate(self, usecase_id: str) -> None:
         self._state_cache.pop(usecase_id, None)
+        self._topology_cache.pop(usecase_id, None)
         for key in [k for k in self._outline_cache if k[0] == usecase_id]:
             self._outline_cache.pop(key, None)
 
@@ -542,6 +548,7 @@ class Engine:
             "status_interval_s": manifest.status.interval_s if manifest.status else None,
             "tags": manifest.tags,
             "effects": {"on": manifest.effects_on.to_api(), "off": manifest.effects_off.to_api()},
+            "topology": manifest.topology.to_api(),
             "runs": [
                 {"job_id": r["id"], "action": r["action"], "state": r["state"], "started": r["started"], "ended": r["ended"]}
                 for r in runs
@@ -724,6 +731,83 @@ class Engine:
         plan["summary"] = {k: len(plan[k]) for k in ("create", "update", "destroy", "unchanged", "read")}
         response["plan"] = plan
         return response
+
+
+    # ------------------------------------------------------------------ topology (v1.2)
+    def inventory(self, provider_id: str, *, refresh: bool = False) -> dict[str, Any]:
+        """The provider's cached inventory; scans (and persists) when missing or `refresh`.
+        Raises EngineError when the provider is unsupported or not connected."""
+        provider = self._providers.get(provider_id)
+        if provider is None or not provider.capabilities.get("inventory"):
+            raise EngineError(f"Provider '{provider_id}' has no inventory", "provider_unsupported", 409)
+        record = self._store.get_provider(provider_id)
+        if not record or record.get("status") != "connected":
+            raise EngineError(f"Provider '{provider_id}' is not connected", "provider_not_connected", 409)
+        cached = self._store.get_inventory(provider_id)
+        if cached and not refresh:
+            return cached
+        with self.inventory_lock:
+            if not refresh:
+                latest = self._store.get_inventory(provider_id)  # another thread may have scanned meanwhile
+                if latest:
+                    return latest
+            creds = self._store.provider_credentials(provider_id)
+            if creds is None:
+                raise EngineError(f"Provider '{provider_id}' is not connected", "provider_not_connected", 409)
+            inventory = provider.inventory(creds, record.get("regions") or [])
+            self._store.save_inventory(provider_id, inventory)
+            return inventory
+
+    def topology(self, manifest: Manifest, *, refresh: bool = False) -> dict[str, Any]:
+        """Provider-neutral graph of the use case from the cached inventory (see topology.py).
+        Always 200-shaped: when nothing can be drawn, `nodes` is empty and `reason` says why."""
+        key = (manifest.id, "topology")
+        with self._outline_lock(key):
+            cached = self._topology_cache.get(manifest.id)
+            if cached is not None and not refresh and (time.monotonic() - cached["_at"]) < TOPOLOGY_CACHE_TTL_S:
+                return {k: v for k, v in cached.items() if k != "_at"}
+            result = self._topology(manifest, refresh)
+            self._topology_cache[manifest.id] = {**result, "_at": time.monotonic()}
+            return result
+
+    def _topology(self, manifest: Manifest, refresh: bool) -> dict[str, Any]:
+        st = self.state(manifest, force=refresh)
+        status = self.status_record(manifest)
+        base: dict[str, Any] = {
+            "generated_at": utcnow_iso(),
+            "state": st["state"],
+            "inventory_at": None,
+            "status_at": status["generated_at"] if status else None,
+        }
+
+        def empty(reason: str) -> dict[str, Any]:
+            return {**base, **build_graph(manifest, None, None), "reason": reason}
+
+        problem = self.provider_problem(manifest)
+        if problem is not None:
+            return empty(problem[1])
+        if st["state"] == "off":
+            return empty("Use case is off; nothing is running to draw")
+        try:
+            inventory = self.inventory(manifest.provider, refresh=refresh)
+        except EngineError as exc:
+            return empty(str(exc))
+        except Exception as exc:  # noqa: BLE001 - a failed scan must not 500 the card
+            log.exception("topology: inventory scan failed for %s", manifest.provider)
+            stale = self._store.get_inventory(manifest.provider)
+            if not stale:
+                return empty(f"Inventory scan failed: {type(exc).__name__}")
+            inventory = stale
+            base["stale"] = True
+        if not inventory.get("supported", True):
+            return empty(str(inventory.get("reason") or f"Inventory is not built for provider '{manifest.provider}' yet"))
+        base["inventory_at"] = inventory.get("generated_at")
+        graph = build_graph(manifest, inventory, status["output"] if status else None)
+        reason = None
+        if not graph["nodes"]:
+            tags = ", ".join(f"{k}={v}" for k, v in manifest.tags.items()) or "none declared"
+            reason = f"No resources carrying the use case's tags ({tags}) in the inventory"
+        return {**base, **graph, "reason": reason}
 
     # ------------------------------------------------------------------ code browser
     def _checkout_root(self, manifest: Manifest) -> Path:
