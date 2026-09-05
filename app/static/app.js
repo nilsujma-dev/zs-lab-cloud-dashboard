@@ -232,6 +232,7 @@ const liveApi = {
   usecases:   () => request('GET', '/api/usecases'),
   usecase:    (id) => request('GET', '/api/usecases/' + encodeURIComponent(id)),
   outline:    (id, action) => request('GET', '/api/usecases/' + encodeURIComponent(id) + '/outline?action=' + encodeURIComponent(action)),
+  topology:   (id, refresh) => request('GET', '/api/usecases/' + encodeURIComponent(id) + '/topology' + (refresh ? '?refresh=1' : '')),
   flip:       (id, action) => request('POST', '/api/usecases/' + encodeURIComponent(id) + '/' + action),
   refreshUsecase: (id) => request('POST', '/api/usecases/' + encodeURIComponent(id) + '/refresh'),
   codeTree:   (id) => request('GET', '/api/usecases/' + encodeURIComponent(id) + '/code'),
@@ -252,8 +253,11 @@ const state = {
   providers: null, providersErr: null, providersLoading: false,
   inventories: {},              // providerId -> {data, err, loading}
   connect: null,                // {provider, mode:'connect'|'rotate', stage:'loading'|'form'|'checking'|'done'|'error', fields, report, shown, error, busy}
-  openRegion: null,             // {provider, region} — mirrored in the URL hash
+  openRegion: null,             // {provider, region, focus?:{kind,id}} — mirrored in the URL hash
   drawer: { sections: {}, inst: {}, project: null, focusKey: null },
+  drawerReturn: null,           // hash to go back to when the drawer was opened from elsewhere (the topology)
+  drawerReturnFocus: null,      // topology node id that opened the drawer; refocused on close
+  topo: {},                     // usecaseId -> {loading, data, err, width, sel}
   usecases: null, ucErr: null, ucLoading: false,
   expanded: null,               // use case id
   details: {},                  // id -> detail (+ _loading/_err)
@@ -281,14 +285,37 @@ function routeFromHash() {
   const m = /^#\/([a-z]+)(?:\/([a-z0-9-]+)(?:\/([a-z0-9-]+))?)?/.exec(location.hash);
   return m ? m[1] : null;
 }
-/** #/clouds/<provider>/<region> -> {provider, region} | null */
+/** Deep-link params the drawer understands: ?inst= ?subnet= ?vpc= ?nat= ?eip= ?sg= ?vol= -> section to open. */
+const DRAWER_FOCUS = { inst: 'instances', subnet: 'vpcs', vpc: 'vpcs', nat: 'nat_gateways', eip: 'eips', sg: 'security_groups', vol: 'volumes' };
+/** #/clouds/<provider>/<region>[?inst=…] -> {provider, region, focus?} | null */
 function regionFromHash() {
-  const m = /^#\/clouds\/([a-z0-9-]+)\/([a-z0-9-]+)/.exec(location.hash);
-  return m ? { provider: m[1], region: m[2] } : null;
+  const m = /^#\/clouds\/([a-z0-9-]+)\/([a-z0-9-]+)(?:\?([^#]*))?/.exec(location.hash);
+  if (!m) return null;
+  const out = { provider: m[1], region: m[2] };
+  if (m[3]) {
+    const q = new URLSearchParams(m[3]);
+    for (const k of Object.keys(DRAWER_FOCUS)) { const v = q.get(k); if (v) { out.focus = { kind: k, id: v }; break; } }
+  }
+  return out;
 }
 function navigate(route) { location.hash = '#/' + route; }
 function openRegionDrawer(providerId, region) { location.hash = '#/clouds/' + providerId + '/' + region; }
-function closeRegionDrawer() { if (state.openRegion) location.hash = '#/clouds'; }
+/** Open the drawer on one resource, remembering where to return on close. */
+function openResourceDrawer(providerId, region, kind, id, opts) {
+  opts = opts || {};
+  state.drawerReturn = opts.returnTo || null;
+  state.drawerReturnFocus = opts.returnFocus || null;
+  location.hash = '#/clouds/' + providerId + '/' + region + (kind && id ? '?' + kind + '=' + encodeURIComponent(id) : '');
+}
+function closeRegionDrawer() { if (state.openRegion) location.hash = state.drawerReturn || '#/clouds'; }
+/** Scroll to, expand and flash one resource in the open drawer. */
+function applyDrawerFocus(focus) {
+  const sec = DRAWER_FOCUS[focus.kind]; if (!sec) return;
+  state.drawer.sections[sec] = true;
+  if (focus.kind === 'inst') state.drawer.inst[focus.id] = true;
+  state.drawer.project = null; // a filter must not hide the target
+  state.drawer.flash = focus.id;
+}
 
 async function boot() {
   const theme = PARAMS.get('theme');
@@ -336,15 +363,22 @@ function onRoute() {
   // region drawer follows the hash so it is deep-linkable and survives refresh
   const wasOpen = state.openRegion;
   const next = state.route === 'clouds' ? regionFromHash() : null;
+  const key = o => o ? o.provider + '/' + o.region : '';
+  const changedRegion = key(wasOpen) !== key(next);
   const changed = JSON.stringify(wasOpen) !== JSON.stringify(next);
   state.openRegion = next;
-  if (changed && wasOpen) { state.drawer = { sections: {}, inst: {}, project: null, focusKey: null }; } // switching regions starts fresh; a first open keeps deep-link state
+  if (changedRegion && wasOpen) { state.drawer = { sections: {}, inst: {}, project: null, focusKey: null }; } // switching regions starts fresh; a first open keeps deep-link state
+  if (next && next.focus && changed) applyDrawerFocus(next.focus);
+  const returnFocus = !next && wasOpen ? state.drawerReturnFocus : null;
+  if (!next) { state.drawerReturn = null; state.drawerReturnFocus = null; }
   render();
   if (next) {
-    if (changed) focusDrawer();
+    if (changedRegion) focusDrawer();
   } else if (wasOpen) {
-    // closing: the tile that opened the drawer regains focus
-    const tile = $('[data-region-tile="' + CSS.escape(wasOpen.region) + '"]');
+    // closing: whatever opened the drawer regains focus — a region tile, or a node in a topology drawing
+    const node = returnFocus ? $('[data-node="' + CSS.escape(returnFocus) + '"]') : null;
+    if (returnFocus && state.expanded && state.topo[state.expanded]) { const t = state.topo[state.expanded]; t.refocus = returnFocus; t.refocusUntil = Date.now() + 2500; } // survives the async re-renders that follow
+    const tile = node || $('[data-region-tile="' + CSS.escape(wasOpen.region) + '"]');
     if (tile) tile.focus({ preventScroll: true }); else $('#view').focus({ preventScroll: true });
   } else {
     $('#view').focus({ preventScroll: true });
@@ -1056,7 +1090,7 @@ function renderDrawerRoot() {
     if (el) el.focus({ preventScroll: true });
   }
   const flash = state.drawer.flash;
-  if (flash) {
+  if (flash && r) { // consumed only once the region's inventory is on screen
     state.drawer.flash = null;
     setTimeout(() => {
       const el = $('[data-res-id="' + CSS.escape(flash) + '"]', aside);
@@ -1460,7 +1494,7 @@ async function pollJob(ucId, jobId) {
       delete state.outlines[ucId]; // the plan is stale once a job has run
       await loadUsecases(true);
       await loadDetail(ucId, true);
-      if (state.expanded === ucId) { loadOutline(ucId, 'on'); loadOutline(ucId, 'off'); }
+      if (state.expanded === ucId) { loadOutline(ucId, 'on'); loadOutline(ucId, 'off'); loadTopology(ucId, true); } // the drawing regenerates from the cloud after a job
     }
   } catch (e) {
     if (e.status === 401) return;
@@ -1617,6 +1651,7 @@ function toggleExpand(id) {
   state.expanded = id;
   render();
   loadDetail(id);
+  loadTopology(id);
   loadOutline(id, 'on');
   loadOutline(id, 'off');
 }
@@ -1631,8 +1666,11 @@ function renderDetail(uc) {
     return wrap;
   }
 
+  // the drawing first: structure from the cloud, meaning from the manifest
+  wrap.appendChild(renderTopology(uc, d));
+
   const grid = h('div', { class: 'detail-grid' });
-  // left: description + status probe
+  // left: description (what it is, what ON/OFF do, cost, sharing — the network is the drawing above) + source
   const left = h('div');
   left.appendChild(h('div', { class: 'detail-block' }, h('div', { class: 'section-title', style: 'margin-bottom:8px' }, 'Description'),
     h('div', { class: 'md', html: SB.markdown.render(d.description || '_No description in the manifest._') })));
@@ -1723,6 +1761,811 @@ function renderProbe(d) {
     block.appendChild(h('div', { class: 'table-scroll' }, t));
   }
   return block;
+}
+
+/* ---- topology: the network drawing ----------------------------------------
+   Structure comes from the cloud (GET /api/usecases/{id}/topology: nodes and
+   edges built from the live inventory); meaning comes from the manifest
+   (roles, declared flows, blocked pairs). Deterministic auto-layout, inline
+   SVG, no library. Everything is clickable into the region drawer.
+
+   Layout in one paragraph: the internet node sits top-centre. VPCs form one
+   row beneath it, ordered by name; with exactly two VPCs their gateway gutters
+   face each other (right gutter on the first, left on the second) so both
+   IGWs sit under the internet. Inside a VPC, subnets stack top to bottom
+   (public, private, isolated), each a container whose instance cards flow
+   into a grid of N columns; N starts at the largest subnet's instance count
+   and is reduced one VPC at a time until the row fits the available width
+   (below that the canvas scrolls). Every gateway owns a vertical lane in its
+   VPC's gutter, and its box sits on the VPC's top edge over that lane; a
+   route line runs on the inner side of the lane, declared flows on the
+   outer side. Cards connect to the world only through their row's rail (the
+   gap above the row) and leave the subnet sideways into the gutter, so lines
+   never cross a card or a container they do not belong to. Above the VPCs,
+   horizontal trunks carry the traffic: NAT-to-IGW hops nearest the VPCs,
+   the IGW-to-internet trunk above that, then one dashed trunk per flow that
+   crosses the internet. Ports on cards and on the internet node are ordered
+   by the x of their far end, so parallel lines do not cross at the ends.
+   ---------------------------------------------------------------------- */
+
+const TOPO = {
+  MARGIN: 10, CARD_W: 172, CARD_H: 60, CARD_GAP: 12, ROW_GAP: 30,
+  SUB_PAD: 12, SUB_HEAD: 28, SUB_HEAD2: 44, SUB_GAP: 14, SUB_EMPTY_H: 44,
+  VPC_PAD: 14, VPC_HEAD: 36, VPC_GAP: 48,
+  GW_W: 60, GW_H: 26, LANE: 68, LOCAL_LANE: 30, CHIP_H: 18,
+  INET_W: 200, INET_H: 40, MAX_COLS: 6, MAX_SCALE: 1.3,
+};
+const SVG_NS = 'http://www.w3.org/2000/svg';
+function s(tag, attrs, ...children) {
+  const el = document.createElementNS(SVG_NS, tag);
+  if (attrs) for (const k of Object.keys(attrs)) {
+    const v = attrs[k];
+    if (v === null || v === undefined || v === false) continue;
+    if (k === 'dataset') Object.assign(el.dataset, v);
+    else if (k.startsWith('on') && typeof v === 'function') el.addEventListener(k.slice(2), v);
+    else el.setAttribute(k, String(v));
+  }
+  for (const c of children.flat(Infinity)) { if (c === null || c === undefined || c === false) continue; el.appendChild(c instanceof Node ? c : document.createTextNode(String(c))); }
+  return el;
+}
+const ROLE_RANK = { pse: 0, connector: 1, app: 2, client: 3 };
+const EXPOSURE_RANK = { public: 0, private: 1, isolated: 2 };
+const ROLE_WORD = { pse: 'Private Service Edge', connector: 'App Connector', app: 'Application', client: 'Client' };
+
+async function loadTopology(id, refresh) {
+  const t = state.topo[id] || (state.topo[id] = { loading: false, data: null, err: null, width: 0, sel: null, refocus: null });
+  if (t.loading) return;
+  t.loading = true; t.err = null;
+  if (state.route === 'usecases') render();
+  try { t.data = await api.topology(id, refresh); }
+  catch (e) { if (e.status === 401) return; t.err = e.message; }
+  t.loading = false;
+  if (state.route === 'usecases') render();
+}
+
+/** Longest common "word-" prefix of the given names, if it leaves every name non-empty. */
+function commonPrefix(names) {
+  names = names.filter(Boolean).map(String);
+  if (names.length < 2) return '';
+  let p = names[0];
+  for (const n of names) { let i = 0; while (i < p.length && i < n.length && p[i] === n[i]) i++; p = p.slice(0, i); }
+  const cut = Math.max(p.lastIndexOf('-'), p.lastIndexOf('_'), p.lastIndexOf('.'));
+  p = cut > 0 ? p.slice(0, cut + 1) : '';
+  return p.length >= 4 && names.every(n => n.length > p.length) ? p : '';
+}
+function trimTo(sv, n) { sv = String(sv || ''); return sv.length > n ? sv.slice(0, n - 1) + '…' : sv; }
+
+/* ---- layout ---- */
+function topoLayout(g, avail) {
+  const C = TOPO;
+  const byId = new Map(); g.nodes.forEach(n => byId.set(n.id, n));
+  const kids = new Map();
+  for (const n of g.nodes) if (n.parent) { if (!kids.has(n.parent)) kids.set(n.parent, []); kids.get(n.parent).push(n); }
+  const cmpLabel = (a, b) => String(a.label || a.id).localeCompare(String(b.label || b.id));
+  const children = (id, kind) => (kids.get(id) || []).filter(n => n.kind === kind);
+  const vpcs = g.nodes.filter(n => n.kind === 'vpc').sort(cmpLabel);
+  const L = { nodes: {}, edges: [], vpcs: [], w: 0, h: 0, scale: 1, unplaced: [], prefix: '' };
+  const N = L.nodes;
+  L.prefix = commonPrefix(g.nodes.filter(n => n.kind === 'instance' || (/^(subnet|vpc)$/.test(n.kind) && !n.pseudo)).map(n => n.label));
+  const strip = label => { const sv = String(label || ''); return L.prefix && sv.startsWith(L.prefix) ? sv.slice(L.prefix.length) : sv; };
+  L.strip = strip;
+
+  // VPC plans: subnets, gateways, columns, gutter side
+  const plans = vpcs.map((v, i) => {
+    const subnets = children(v.id, 'subnet').sort((a, b) => ((EXPOSURE_RANK[a.exposure] ?? 3) - (EXPOSURE_RANK[b.exposure] ?? 3)) || cmpLabel(a, b));
+    const gws = [...children(v.id, 'nat').sort(cmpLabel), ...children(v.id, 'igw').sort(cmpLabel)];
+    const maxInst = Math.max(1, ...subnets.map(sn => children(sn.id, 'instance').length));
+    return { v, subnets, gws, cols: Math.min(C.MAX_COLS, maxInst), side: vpcs.length === 2 && i === 1 ? 'left' : 'right' };
+  });
+  const subW = cols => cols * C.CARD_W + (cols - 1) * C.CARD_GAP + 2 * C.SUB_PAD;
+  const gutterW = p => C.LOCAL_LANE + p.gws.length * C.LANE + 8;
+  const vpcW = p => subW(p.cols) + 2 * C.VPC_PAD + gutterW(p);
+  const totalW = () => plans.reduce((sum, p) => sum + vpcW(p), 0) + Math.max(0, plans.length - 1) * C.VPC_GAP + 2 * C.MARGIN;
+  for (;;) {
+    if (totalW() <= avail) break;
+    const p = plans.filter(x => x.cols > 1).sort((a, b) => vpcW(b) - vpcW(a))[0];
+    if (!p) break;
+    p.cols--;
+  }
+
+  // helpers over the raw graph
+  const vpcOfNode = n => { if (!n) return null; if (n.kind === 'vpc') return n.id; if (n.kind === 'subnet') return n.parent; if (n.kind === 'instance') { const sn = byId.get(n.parent); return sn ? sn.parent : null; } if (n.kind === 'nat' || n.kind === 'igw') return n.parent; return null; };
+  const gwOf = (vpcId, kind) => (kids.get(vpcId) || []).find(n => n.kind === kind) || null;
+  const egressGw = inst => { const sn = byId.get(inst.parent); const vid = sn ? sn.parent : null; if (!vid) return null; return (sn && sn.exposure === 'private' ? gwOf(vid, 'nat') : null) || gwOf(vid, 'igw') || gwOf(vid, 'nat'); };
+  const ingressGw = inst => { const vid = vpcOfNode(inst); return vid ? gwOf(vid, 'igw') : null; };
+
+  // edge chains: [from, ...via, to] with the implicit gateways between an instance and the internet
+  const drawn = [];
+  g.edges.forEach((e, idx) => {
+    if (!/^(route|uplink|flow|blocked)$/.test(e.kind)) return;
+    const a = byId.get(e.from), b = byId.get(e.to);
+    if (!a || !b) { L.unplaced.push({ label: (e.kind === 'flow' ? 'flow' : e.kind) + ' ' + e.from + ' → ' + e.to + (e.label ? ' (' + e.label + ')' : ''), reason: 'endpoint not in the drawing' }); return; }
+    let chain = [a, ...(e.via || []).map(id => byId.get(id)).filter(Boolean), b];
+    // a NAT followed by its own IGW then the internet draws as NAT straight up: the hop is implied
+    chain = chain.filter((n, i) => !(n.kind === 'igw' && chain[i - 1] && chain[i - 1].kind === 'nat' && chain[i + 1] && chain[i + 1].kind === 'internet' && vpcOfNode(chain[i - 1]) === vpcOfNode(n)));
+    const out = [];
+    for (let i = 0; i < chain.length; i++) {
+      const cur = chain[i], next = chain[i + 1];
+      out.push(cur);
+      if (!next) break;
+      if (cur.kind === 'instance' && next.kind === 'internet') { const gw = egressGw(cur); if (gw) out.push(gw); }
+      else if (cur.kind === 'internet' && next.kind === 'instance') { const gw = ingressGw(next); if (gw) out.push(gw); }
+    }
+    const touchesInet = out.some(n => n.kind === 'internet');
+    const vpcSet = new Set(out.map(vpcOfNode).filter(Boolean));
+    drawn.push({ e, idx, chain: out, needsTrunk: e.kind !== 'uplink' && (touchesInet || vpcSet.size > 1), lane: {}, trunk: -1 });
+  });
+  // gateway lanes for flows/blocked, trunks
+  const laneCount = {}, localCount = {};
+  let trunkCount = 0;
+  for (const d of drawn) {
+    d.local = {};
+    if (d.e.kind === 'flow' || d.e.kind === 'blocked') {
+      // which VPCs' local lanes this chain will use: instance-to-instance hops that are not on one rail, and internet-to-instance hops without a gateway
+      for (let i = 0; i < d.chain.length - 1; i++) {
+        const a = d.chain[i], b = d.chain[i + 1];
+        const vids = [];
+        if (a.kind === 'instance' && b.kind === 'instance') { if (a.parent !== b.parent || true) { const va = vpcOfNode(a), vb = vpcOfNode(b); if (va) vids.push(va); if (vb && vb !== va) vids.push(vb); } }
+        else if (a.kind === 'internet' && b.kind === 'instance') vids.push(vpcOfNode(b));
+        else if (a.kind === 'instance' && b.kind === 'internet') vids.push(vpcOfNode(a));
+        else if ((a.kind === 'nat' || a.kind === 'igw') && b.kind === 'instance' && vpcOfNode(a) !== vpcOfNode(b)) vids.push(vpcOfNode(b));
+        else if (a.kind === 'instance' && (b.kind === 'nat' || b.kind === 'igw') && vpcOfNode(a) !== vpcOfNode(b)) vids.push(vpcOfNode(a));
+        for (const vid of vids) if (vid && d.local[vid] === undefined) { const c = localCount[vid] || 0; d.local[vid] = Math.min(2, c); localCount[vid] = c + 1; }
+      }
+    }
+    if (d.e.kind === 'flow' || d.e.kind === 'blocked') for (const n of d.chain) if ((n.kind === 'nat' || n.kind === 'igw') && d.lane[n.id] === undefined) { const c = laneCount[n.id] || 0; d.lane[n.id] = Math.min(2, c); laneCount[n.id] = c + 1; }
+    if (d.needsTrunk) d.trunk = trunkCount++;
+  }
+
+  // vertical bands above the VPC row
+  const inetTop = C.MARGIN;
+  const yVpc = inetTop + C.INET_H + 18 + 12 * Math.max(0, trunkCount - 1) + 58;
+  L.yVpc = yVpc; L.yHop = yVpc - 22; L.yUplink = yVpc - 40;
+  L.trunkY = i => yVpc - 58 - 12 * (Math.max(1, trunkCount) - 1 - i);
+
+  // VPC row geometry
+  const W = totalW();
+  let x = C.MARGIN;
+  const headH = (sn, w) => { if (sn.pseudo) return C.SUB_HEAD; const need = 20 + (strip(sn.label) || sn.id).length * 7.2 + 8 + (sn.cidr ? sn.cidr.length * 6.6 + 10 : 0) + (sn.exposure || 'unknown').length * 6.6 + 18; return need > w ? C.SUB_HEAD2 : C.SUB_HEAD; };
+  const subH = sn => { const p = plans.find(x => x.v.id === sn.parent); const hh = headH(sn, subW(p.cols)); const n = children(sn.id, 'instance').length; if (!n) return hh + C.SUB_EMPTY_H - C.SUB_HEAD; const rows = Math.ceil(n / Math.max(1, p.cols)); return hh + C.ROW_GAP + rows * C.CARD_H + (rows - 1) * C.ROW_GAP + C.SUB_PAD; };
+  const vpcH = p => C.VPC_HEAD + (p.subnets.length ? p.subnets.reduce((sum, sn) => sum + subH(sn), 0) + (p.subnets.length - 1) * C.SUB_GAP : 40) + C.VPC_PAD;
+  const rowH = Math.max(120, ...plans.map(vpcH));
+  for (const p of plans) {
+    const w = vpcW(p), dir = p.side === 'right' ? 1 : -1;
+    const V = { kind: 'vpc', node: p.v, x, y: yVpc, w, h: Math.max(120, vpcH(p)), side: p.side, dir, lanes: {}, subnets: [], gws: [] };
+    const sw = subW(p.cols);
+    V.subLeft = p.side === 'right' ? x + C.VPC_PAD : x + w - C.VPC_PAD - sw;
+    V.subRight = V.subLeft + sw;
+    V.localLane = p.side === 'right' ? V.subRight + 12 : V.subLeft - 12;
+    p.gws.forEach((gw, k) => {
+      const laneX = p.side === 'right' ? V.subRight + C.LOCAL_LANE + k * C.LANE + C.LANE / 2 : V.subLeft - C.LOCAL_LANE - k * C.LANE - C.LANE / 2;
+      V.lanes[gw.id] = laneX;
+      const hasChip = !!(gw.public_ip || g.nodes.some(n => n.kind === 'eip' && n.attached_to === gw.id));
+      N[gw.id] = { kind: gw.kind, node: gw, cx: laneX, cy: yVpc, x: laneX - C.GW_W / 2, y: yVpc - C.GW_H / 2, w: C.GW_W, h: C.GW_H, top: yVpc - C.GW_H / 2, bottom: yVpc + C.GW_H / 2 + (hasChip ? C.CHIP_H + 4 : 0), vpc: p.v.id, laneX, dir, chip: hasChip };
+      V.gws.push(gw.id);
+    });
+    let sy = yVpc + C.VPC_HEAD;
+    for (const sn of p.subnets) {
+      const insts = children(sn.id, 'instance').sort((a, b) => ((ROLE_RANK[a.role] ?? 4) - (ROLE_RANK[b.role] ?? 4)) || cmpLabel(a, b));
+      const S = { kind: 'subnet', node: sn, x: V.subLeft, y: sy, w: sw, h: subH(sn), headH: headH(sn, sw), vpc: p.v.id, side: p.side, dir, insts: [], cols: p.cols, rows: [] };
+      insts.forEach((inst, i) => {
+        const row = Math.floor(i / p.cols), col = i % p.cols;
+        const cx = S.x + C.SUB_PAD + col * (C.CARD_W + C.CARD_GAP);
+        const cy = S.y + S.headH + C.ROW_GAP + row * (C.CARD_H + C.ROW_GAP);
+        N[inst.id] = { kind: 'instance', node: inst, x: cx, y: cy, w: C.CARD_W, h: C.CARD_H, cx: cx + C.CARD_W / 2, rail: cy - C.ROW_GAP / 2, row, col, subnet: sn.id, vpc: p.v.id, dir };
+        S.insts.push(inst.id);
+      });
+      N[sn.id] = S; V.subnets.push(sn.id);
+      sy += S.h + C.SUB_GAP;
+    }
+    N[p.v.id] = V; L.vpcs.push(p.v.id);
+    x += w + C.VPC_GAP;
+  }
+  const inet = g.nodes.find(n => n.kind === 'internet');
+  if (inet) N[inet.id] = { kind: 'internet', node: inet, x: W / 2 - C.INET_W / 2, y: inetTop, w: C.INET_W, h: C.INET_H, cx: W / 2, bottom: inetTop + C.INET_H };
+  // idle addresses: a tray top-right, outside any VPC
+  const idle = g.nodes.filter(n => n.kind === 'eip' && !n.attached_to).sort(cmpLabel);
+  if (idle.length) {
+    const tw = 168, th = 26 + idle.length * (C.CHIP_H + 6);
+    L.tray = { x: W - C.MARGIN - tw, y: inetTop, w: tw, h: th, ids: idle.map(n => n.id) };
+    idle.forEach((n, i) => { N[n.id] = { kind: 'eip', node: n, x: L.tray.x + 10, y: L.tray.y + 24 + i * (C.CHIP_H + 6), w: tw - 20, h: C.CHIP_H, idle: true }; });
+  }
+  // attached addresses: chips hanging off their node
+  for (const n of g.nodes) {
+    if (n.kind !== 'eip' || !n.attached_to || N[n.id]) continue;
+    const host = N[n.attached_to];
+    if (!host) { L.unplaced.push({ label: n.label + ' (address)', reason: 'attached to ' + n.attached_to + ', which is not drawn' }); continue; }
+    const cw = Math.max(64, String(n.label || '').length * 6.4 + 14);
+    if (host.kind === 'instance') N[n.id] = { kind: 'eip', node: n, x: host.x + host.w - cw - 8, y: host.y + host.h - C.CHIP_H / 2 - 1, w: cw, h: C.CHIP_H, host: n.attached_to };
+    else N[n.id] = { kind: 'eip', node: n, x: host.cx - cw / 2, y: host.cy + C.GW_H / 2 + 3, w: cw, h: C.CHIP_H, host: n.attached_to };
+  }
+  for (const n of g.nodes) if (!N[n.id] && n.kind !== 'internet') L.unplaced.push({ label: (n.label || n.id) + ' (' + n.kind + ')', reason: n.parent ? 'parent ' + n.parent + ' is not in the drawing' : 'no parent' });
+  L.w = W; L.h = yVpc + rowH + C.MARGIN + 4;
+  if (L.tray && !vpcs.length) L.h = Math.max(L.h, L.tray.y + L.tray.h + C.MARGIN);
+
+  /* ---- routing: two passes; the first collects port requests, the second draws with sorted ports ---- */
+  const laneXFor = (gid, d) => { const G = N[gid]; return G.laneX + (d.e.kind === 'route' || d.e.kind === 'uplink' ? -10 : 4 + 8 * (d.lane[gid] || 0)) * G.dir; };
+  const localXFor = (vid, d) => { const V = N[vid]; return V.localLane + 8 * (d.local[vid] || 0) * V.dir; };
+  const entryReq = {}, inetReq = [], railReq = {};
+  let ports = null; // second pass: {entries: {instId: {edgeKey: x}}, inet: {edgeKey: x}, rails: {subnet:row: {edgeKey: y}}}
+  function routeAll(final) {
+    L.edges = [];
+    for (const d of drawn) {
+      const pts = [];
+      const push = (px, py) => { const l = pts[pts.length - 1]; if (!l || l[0] !== px || l[1] !== py) pts.push([px, py]); };
+      const ekey = 'e' + d.idx;
+      const entry = (inst, approachX, end) => {
+        const key = ekey + end;
+        if (!final) { (entryReq[inst.id] = entryReq[inst.id] || []).push({ key, approachX }); return N[inst.id].cx; }
+        return ports.entries[inst.id][key];
+      };
+      // a card touches the world at (entry x, rail y); `end` names the endpoint, a shared end (e.g. 'ab') keeps two cards on one sub-lane
+      const port = (inst, approachX, end, railEnd) => {
+        const I = N[inst.id], x = entry(inst, approachX, end);
+        const rk = I.subnet + ':' + I.row, key = ekey + (railEnd || end);
+        if (!final) { (railReq[rk] = railReq[rk] || []).push({ key, span: Math.abs(approachX - I.cx) }); return { x, y: I.rail }; }
+        return { x, y: ports.rails[rk][key] };
+      };
+      const inetPort = (approachX, end, ty) => {
+        const key = ekey + end;
+        if (!final) { inetReq.push({ key, approachX, ty }); return N[inet.id].cx; }
+        return ports.inet[key];
+      };
+      const ch = d.chain;
+      let ok = true;
+      for (let i = 0; i < ch.length - 1 && ok; i++) {
+        const a = ch[i], b = ch[i + 1], A = N[a.id], B = N[b.id];
+        if (!A || !B) { ok = false; break; }
+        const first = i === 0, last = i === ch.length - 2;
+        const ka = A.kind, kb = B.kind;
+        if (ka === 'subnet' && (kb === 'nat' || kb === 'igw')) {
+          const sx = A.side === 'right' ? A.x + A.w : A.x, y = A.y + 14, rx = laneXFor(b.id, d);
+          push(sx, y); push(rx, y); push(rx, B.bottom);
+        } else if (ka === 'instance' && kb === 'instance') {
+          if (A.subnet === B.subnet && A.row === B.row) {
+            const pa = port(a, B.cx, 'a', 'ab'), pb = port(b, A.cx, 'b', 'ab');
+            push(pa.x, A.y); push(pa.x, pa.y); push(pb.x, pb.y); push(pb.x, B.y);
+          } else if (A.vpc === B.vpc) {
+            const lx = localXFor(A.vpc, d), pa = port(a, lx, 'a'), pb = port(b, lx, 'b');
+            push(pa.x, A.y); push(pa.x, pa.y); push(lx, pa.y); push(lx, pb.y); push(pb.x, pb.y); push(pb.x, B.y);
+          } else {
+            const lxa = localXFor(A.vpc, d), lxb = localXFor(B.vpc, d), ty = L.trunkY(d.trunk), pa = port(a, lxa, 'a'), pb = port(b, lxb, 'b');
+            push(pa.x, A.y); push(pa.x, pa.y); push(lxa, pa.y); push(lxa, ty); push(lxb, ty); push(lxb, pb.y); push(pb.x, pb.y); push(pb.x, B.y);
+          }
+        } else if (ka === 'instance' && (kb === 'nat' || kb === 'igw')) {
+          const fx = laneXFor(b.id, d);
+          if (A.vpc === B.vpc) { const pa = port(a, fx, 'a'); push(pa.x, A.y); push(pa.x, pa.y); push(fx, pa.y); push(fx, B.bottom); }
+          else { const lx = localXFor(A.vpc, d), ty = L.trunkY(d.trunk), pa = port(a, lx, 'a'); push(pa.x, A.y); push(pa.x, pa.y); push(lx, pa.y); push(lx, ty); push(fx, ty); push(fx, B.top); }
+        } else if ((ka === 'nat' || ka === 'igw') && kb === 'instance') {
+          const fx = laneXFor(a.id, d);
+          if (A.vpc === B.vpc) { const pb = port(b, fx, 'b'); push(fx, A.bottom); push(fx, pb.y); push(pb.x, pb.y); push(pb.x, B.y); }
+          else { const lx = localXFor(B.vpc, d), ty = L.trunkY(d.trunk), pb = port(b, lx, 'b'); push(fx, A.top); push(fx, ty); push(lx, ty); push(lx, pb.y); push(pb.x, pb.y); push(pb.x, B.y); }
+        } else if ((ka === 'nat' || ka === 'igw') && kb === 'internet') {
+          const fx = laneXFor(a.id, d), ty = d.e.kind === 'uplink' ? L.yUplink : L.trunkY(d.trunk), px = inetPort(fx, 'a', ty);
+          push(fx, A.top); push(fx, ty); push(px, ty); push(px, B.bottom);
+        } else if (ka === 'internet' && (kb === 'nat' || kb === 'igw')) {
+          const fx = laneXFor(b.id, d), ty = L.trunkY(d.trunk), px = inetPort(fx, 'b', ty);
+          push(px, A.bottom); push(px, ty); push(fx, ty); push(fx, B.top);
+        } else if (ka === 'internet' && kb === 'instance') {
+          const lx = localXFor(B.vpc, d), ty = L.trunkY(d.trunk), px = inetPort(lx, 'b', ty), pb = port(b, lx, 'b');
+          push(px, A.bottom); push(px, ty); push(lx, ty); push(lx, pb.y); push(pb.x, pb.y); push(pb.x, B.y);
+        } else if (ka === 'instance' && kb === 'internet') {
+          const lx = localXFor(A.vpc, d), ty = L.trunkY(d.trunk), px = inetPort(lx, 'a', ty), pa = port(a, lx, 'a');
+          push(pa.x, A.y); push(pa.x, pa.y); push(lx, pa.y); push(lx, ty); push(px, ty); push(px, B.bottom);
+        } else if ((ka === 'nat' || ka === 'igw') && (kb === 'nat' || kb === 'igw')) {
+          const xa = laneXFor(a.id, d), xb = laneXFor(b.id, d);
+          if (A.vpc === B.vpc && d.e.kind === 'uplink' && Math.abs(A.cx - B.cx) <= C.LANE + 1) { const sgn = B.cx > A.cx ? 1 : -1; push(A.cx + sgn * C.GW_W / 2, A.cy); push(B.cx - sgn * C.GW_W / 2, B.cy); }
+          else if (A.vpc === B.vpc) { const hy = d.e.kind === 'uplink' ? L.yHop : L.yHop - 6; push(xa, A.top); push(xa, hy); push(xb, hy); if (!last || d.e.kind !== 'uplink') push(xb, B.top); }
+          else { const ty = L.trunkY(d.trunk); push(xa, A.top); push(xa, ty); push(xb, ty); push(xb, B.top); }
+        } else {
+          // anything else: a plain L between centres
+          const acx = A.cx !== undefined ? A.cx : A.x + A.w / 2, acy = A.y + A.h / 2, bcx = B.cx !== undefined ? B.cx : B.x + B.w / 2, bcy = B.y + B.h / 2;
+          push(acx, acy); push(acx, bcy); push(bcx, bcy);
+        }
+        void first;
+      }
+      if (!ok || pts.length < 2) continue;
+      L.edges.push({ e: d.e, idx: d.idx, pts: simplifyPts(pts), chain: ch.map(n => n.id) });
+    }
+  }
+  routeAll(false);
+  const spread = (k, K, pitch, max) => Math.max(-max, Math.min(max, (k - (K - 1) / 2) * pitch));
+  ports = { entries: {}, inet: {} };
+  for (const [id, reqs] of Object.entries(entryReq)) {
+    const I = N[id];
+    // the farther a line's far end lies to the right, the further left it enters the card, so drops never cross another line's run
+    const order = reqs.map((r, i) => Object.assign({ i }, r)).sort((p, q) => (q.approachX - p.approachX) || (p.i - q.i));
+    const K = order.length;
+    ports.entries[id] = {};
+    order.forEach((r, k) => { ports.entries[id][r.key] = I.cx + spread(k, K, 12, I.w / 2 - 16); });
+  }
+  ports.rails = {};
+  for (const [rk, reqs] of Object.entries(railReq)) {
+    const seen = new Map(); reqs.forEach(r => { if (!seen.has(r.key) || seen.get(r.key).span < r.span) seen.set(r.key, r); });
+    const order = Array.from(seen.values()).sort((p, q) => q.span - p.span);
+    const cut = rk.lastIndexOf(':'), sid = rk.slice(0, cut), row = rk.slice(cut + 1);
+    const base = N[sid].y + N[sid].headH + C.ROW_GAP + Number(row) * (C.CARD_H + C.ROW_GAP) - C.ROW_GAP / 2;
+    ports.rails[rk] = {};
+    order.forEach((r, k) => { ports.rails[rk][r.key] = base + spread(k, order.length, 8, C.ROW_GAP / 2 - 3); });
+  }
+  if (inet) {
+    const cx = N[inet.id].cx;
+    const left = inetReq.filter(r => r.approachX < cx).sort((p, q) => (p.ty - q.ty) || (p.approachX - q.approachX));
+    const right = inetReq.filter(r => r.approachX >= cx).sort((p, q) => (q.ty - p.ty) || (p.approachX - q.approachX));
+    const order = left.concat(right);
+    order.forEach((r, k) => { const px = cx + spread(k, order.length, 12, C.INET_W / 2 - 14); ports.inet[r.key] = Math.abs(px - r.approachX) < 10 ? r.approachX : px; });
+  }
+  routeAll(true);
+  return L;
+}
+function simplifyPts(pts) {
+  const out = [];
+  for (const p of pts) {
+    const a = out[out.length - 2], b = out[out.length - 1];
+    if (b && b[0] === p[0] && b[1] === p[1]) continue;
+    if (a && b && ((a[0] === b[0] && b[0] === p[0]) || (a[1] === b[1] && b[1] === p[1]))) { out[out.length - 1] = p; continue; }
+    out.push(p);
+  }
+  return out;
+}
+/** Midpoint of the longest segment, preferring a horizontal one for a readable label. */
+function labelSpot(pts, preferVertical) {
+  let best = null;
+  // a blocked pair marks its strike on a gutter (vertical) run when it has one of any length, never on a shared rail
+  const longestVertical = preferVertical ? Math.max(0, ...pts.slice(1).map((p, i) => p[0] === pts[i][0] ? Math.abs(p[1] - pts[i][1]) : 0)) : 0;
+  for (let i = 0; i < pts.length - 1; i++) {
+    const [x1, y1] = pts[i], [x2, y2] = pts[i + 1];
+    const len = Math.abs(x2 - x1) + Math.abs(y2 - y1), horiz = y1 === y2;
+    const score = len * (preferVertical ? (horiz ? (longestVertical >= 40 ? 0.01 : 1) : 2) : (horiz ? 1.6 : 1));
+    if (!best || score > best.score) best = { score, x: (x1 + x2) / 2, y: (y1 + y2) / 2, horiz, len };
+  }
+  return best;
+}
+
+/* ---- glyphs: one simple shape per role ---- */
+function roleGlyph(role) {
+  const g = s('g', { class: 'glyph glyph-' + (role || 'none') });
+  if (role === 'pse') { g.appendChild(s('path', { d: 'M9 1.5l7 4v7l-7 4-7-4v-7z' })); g.appendChild(s('circle', { cx: 9, cy: 9, r: 2.4, class: 'fill' })); }
+  else if (role === 'connector') { g.appendChild(s('circle', { cx: 4.5, cy: 9, r: 3 })); g.appendChild(s('circle', { cx: 13.5, cy: 9, r: 3 })); g.appendChild(s('path', { d: 'M7.5 9h3' })); }
+  else if (role === 'app') { g.appendChild(s('rect', { x: 2, y: 3, width: 14, height: 12, rx: 1.5 })); g.appendChild(s('path', { d: 'M2 7h14M5 11h5' })); }
+  else if (role === 'client') { g.appendChild(s('rect', { x: 2, y: 2.5, width: 14, height: 10, rx: 1.5 })); g.appendChild(s('path', { d: 'M9 12.5v3M5.5 15.5h7' })); }
+  else { g.appendChild(s('circle', { cx: 9, cy: 9, r: 6 })); }
+  return g;
+}
+
+/* ---- the drawing ---- */
+function topoSvg(g, L, ctx) {
+  const C = TOPO, N = L.nodes;
+  const uid = 'tp' + (topoSvg.seq = (topoSvg.seq || 0) + 1);
+  const svg = s('svg', { class: 'topo-svg', viewBox: '0 0 ' + L.w + ' ' + L.h, width: Math.round(L.w * L.scale), height: Math.round(L.h * L.scale), role: 'group', 'aria-label': 'Network drawing' });
+  const defs = s('defs');
+  const arrow = (id, cls) => s('marker', { id: uid + '-' + id, class: 'mk ' + cls, viewBox: '0 0 10 10', refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: 'auto-start-reverse' }, s('path', { d: 'M0 0.5L10 5 0 9.5z' }));
+  defs.appendChild(arrow('flow', 'mk-flow')); defs.appendChild(arrow('flowhi', 'mk-flow-hi'));
+  svg.appendChild(defs);
+  const strip = L.strip;
+  const idOf = n => n.id;
+  const gEdges = s('g', { class: 'topo-edges' });
+  const gBoxes = s('g', { class: 'topo-nodes topo-containers' });
+  const gNodes = s('g', { class: 'topo-nodes topo-leaves' });
+
+  // VPCs, subnets, instances (DOM order = focus order: vpc, its subnets, their instances, then the gateways)
+  for (const vid of L.vpcs) {
+    const V = N[vid], v = V.node;
+    const gv = s('g', { class: 'tn tn-vpc', dataset: { node: vid, kind: 'vpc' }, tabindex: 0, role: 'button', 'aria-label': 'VPC ' + (v.label || vid) + (v.cidr ? ' ' + v.cidr : '') });
+    gv.appendChild(s('rect', { class: 'tn-box', x: V.x, y: V.y, width: V.w, height: V.h, rx: 8 }));
+    const tx = V.side === 'right' ? V.x + 14 : V.subLeft;
+    gv.appendChild(s('text', { class: 'tn-vpc-name', x: tx, y: V.y + 22 }, strip(v.label) || v.id));
+    if (v.cidr) gv.appendChild(s('text', { class: 'tn-vpc-cidr mono', x: tx + 8 + Math.min(220, String(strip(v.label) || v.id).length * 7.6), y: V.y + 22 }, v.cidr));
+    if (!V.subnets.length) gv.appendChild(s('text', { class: 'tn-note', x: V.x + 14, y: V.y + C.VPC_HEAD + 20 }, 'no subnets'));
+    gBoxes.appendChild(gv);
+    for (const sid of V.subnets) {
+      const S = N[sid], sn = S.node;
+      const gs = s('g', { class: 'tn tn-subnet tn-exp-' + (sn.exposure || 'unknown'), dataset: { node: sid, kind: 'subnet' }, tabindex: 0, role: 'button', 'aria-label': 'Subnet ' + (sn.label || sid) + ' ' + (sn.cidr || '') + ' ' + (sn.exposure || '') });
+      gs.appendChild(s('rect', { class: 'tn-box', x: S.x, y: S.y, width: S.w, height: S.h, rx: 6 }));
+      gs.appendChild(s('text', { class: 'tn-sub-name', x: S.x + 10, y: S.y + 18 }, strip(sn.label) || sn.id));
+      const nameW = Math.min(S.w - 30, String(strip(sn.label) || sn.id).length * 7.2) + 8;
+      if (sn.cidr) gs.appendChild(S.headH > C.SUB_HEAD ? s('text', { class: 'tn-sub-cidr mono', x: S.x + 10, y: S.y + 35 }, sn.cidr) : s('text', { class: 'tn-sub-cidr mono', x: S.x + 10 + nameW, y: S.y + 18 }, sn.cidr));
+      if (!sn.pseudo) {
+        const badgeW = 8 + (sn.exposure || 'unknown').length * 6.6;
+        const bx = S.x + S.w - 10 - badgeW;
+        gs.appendChild(s('g', { class: 'badge' }, s('rect', { x: bx, y: S.y + 7, width: badgeW, height: 15, rx: 3 }), s('text', { x: bx + badgeW / 2, y: S.y + 18, 'text-anchor': 'middle' }, sn.exposure || 'unknown')));
+      }
+      if (!S.insts.length) {
+        const natHere = g.nodes.find(n => n.kind === 'nat' && n.detail && n.detail.subnet === sid) || g.nodes.find(n => n.kind === 'nat' && n.subnet === sid);
+        gs.appendChild(s('text', { class: 'tn-note', x: S.x + 10, y: S.y + S.h - 6 }, natHere ? 'no instances — hosts the NAT gateway' : 'no instances'));
+      }
+      gBoxes.appendChild(gs);
+      for (const iid of S.insts) {
+        const I = N[iid], inst = I.node;
+        const en = (g.enrolment || {})[iid];
+        const lamp = en ? (en.authenticated ? 'on' : 'bad') : (inst.state === 'running' ? 'running' : 'off');
+        const gi = s('g', { class: 'tn tn-instance tn-role-' + (inst.role || 'none') + ' lamp-' + lamp, dataset: { node: iid, kind: 'instance' }, tabindex: 0, role: 'button',
+          'aria-label': (ROLE_WORD[inst.role] ? ROLE_WORD[inst.role] + ' ' : '') + (inst.label || iid) + (en ? (en.authenticated ? ', enrolled' : ', not enrolled') : '') });
+        gi.appendChild(s('rect', { class: 'tn-box', x: I.x, y: I.y, width: I.w, height: I.h, rx: 5 }));
+        const gl = roleGlyph(inst.role); gl.setAttribute('transform', 'translate(' + (I.x + 10) + ',' + (I.y + 9) + ')'); gi.appendChild(gl);
+        gi.appendChild(s('text', { class: 'tn-name', x: I.x + 34, y: I.y + 22 }, trimTo(strip(inst.label) || iid, 17)));
+        gi.appendChild(s('circle', { class: 'tn-lamp', cx: I.x + I.w - 13, cy: I.y + 14, r: 4 }));
+        gi.appendChild(s('text', { class: 'tn-sub mono', x: I.x + 10, y: I.y + 44 }, inst.pseudo ? (ROLE_WORD[inst.role] || 'declared role').toLowerCase() : ([inst.type, inst.private_ip].filter(Boolean).join(' · ') || inst.id)));
+        gNodes.appendChild(gi);
+      }
+    }
+    for (const gid of V.gws) {
+      const G = N[gid], gw = G.node;
+      const gg = s('g', { class: 'tn tn-gw tn-' + gw.kind, dataset: { node: gid, kind: gw.kind }, tabindex: 0, role: 'button', 'aria-label': (gw.kind === 'nat' ? 'NAT gateway ' : 'Internet gateway ') + (gw.label || gid) });
+      gg.appendChild(s('rect', { class: 'tn-box', x: G.x, y: G.y, width: G.w, height: G.h, rx: 4 }));
+      gg.appendChild(s('text', { class: 'tn-gw-name', x: G.cx, y: G.cy + 4, 'text-anchor': 'middle' }, gw.kind === 'nat' ? 'NAT' : 'IGW'));
+      gNodes.appendChild(gg);
+    }
+  }
+  // internet
+  const inet = g.nodes.find(n => n.kind === 'internet');
+  if (inet && N[inet.id]) {
+    const I = N[inet.id];
+    const gi = s('g', { class: 'tn tn-internet', dataset: { node: inet.id, kind: 'internet' }, tabindex: 0, role: 'button', 'aria-label': 'Internet' });
+    gi.appendChild(s('rect', { class: 'tn-box', x: I.x, y: I.y, width: I.w, height: I.h, rx: 20 }));
+    gi.appendChild(s('text', { class: 'tn-inet-name', x: I.cx, y: I.y + 25, 'text-anchor': 'middle' }, inet.label || 'Internet'));
+    gNodes.insertBefore(gi, gNodes.firstChild);
+  }
+  // addresses
+  if (L.tray) {
+    const T = L.tray;
+    const gt = s('g', { class: 'topo-tray' });
+    gt.appendChild(s('rect', { class: 'tray-box', x: T.x, y: T.y, width: T.w, height: T.h, rx: 6 }));
+    gt.appendChild(s('text', { class: 'tray-title', x: T.x + 10, y: T.y + 16 }, 'unattached addresses'));
+    gBoxes.appendChild(gt);
+  }
+  for (const n of g.nodes) {
+    if (n.kind !== 'eip' || !N[n.id]) continue;
+    const E = N[n.id];
+    const ge = s('g', { class: 'tn tn-eip' + (E.idle ? ' is-idle' : ''), dataset: { node: n.id, kind: 'eip' }, tabindex: 0, role: 'button', 'aria-label': 'Elastic IP ' + n.label + (E.idle ? ', unattached' : '') });
+    ge.appendChild(s('rect', { class: 'tn-box', x: E.x, y: E.y, width: E.w, height: E.h, rx: 9 }));
+    ge.appendChild(s('text', { class: 'tn-eip-ip mono', x: E.x + E.w / 2, y: E.y + 13, 'text-anchor': 'middle' }, n.label));
+    gNodes.appendChild(ge);
+  }
+
+  // edges: structure first (under), then flows, then blocked (top)
+  const order = { route: 0, uplink: 1, flow: 2, blocked: 3 };
+  const edges = L.edges.slice().sort((a, b) => (order[a.e.kind] - order[b.e.kind]) || (a.idx - b.idx));
+  const spots = edges.map(ed => { const sp = labelSpot(ed.pts, ed.e.kind === 'blocked'); const label = ed.e.label || (ed.e.kind === 'route' ? 'default route' : ed.e.kind === 'uplink' ? 'uplink' : ''); return sp ? Object.assign(sp, { label, w: label.length * 6.3 + 8, x0: sp.x }) : null; });
+  // de-conflict: labels that share a horizontal band are packed left to right, then the band is re-centred on its own midpoint
+  const bands = [];
+  spots.filter(sp => sp && sp.label).forEach(sp => {
+    let band = bands.find(b => Math.abs(b.y - sp.y) < 26 && b.items.some(o => Math.abs(o.x0 - sp.x0) < (o.w + sp.w) / 2 + 40)); // a rail's sub-lanes span ±12
+    if (!band) { band = { y: sp.y, items: [] }; bands.push(band); }
+    band.items.push(sp);
+  });
+  for (const band of bands) {
+    if (band.items.length < 2) continue;
+    const items = band.items.sort((a, b) => a.x0 - b.x0);
+    const total = items.reduce((sum, o) => sum + o.w, 0) + 10 * (items.length - 1);
+    const mid = items.reduce((sum, o) => sum + o.x0, 0) / items.length;
+    let x = mid - total / 2;
+    for (const o of items) { o.x = x + o.w / 2; x += o.w + 10; if (!o.horiz) o.y += 0; }
+  }
+  edges.forEach((ed, i) => {
+    const e = ed.e, spot = spots[i];
+    const dstr = ed.pts.map((p, k) => (k ? 'L' : 'M') + p[0] + ' ' + p[1]).join(' ');
+    const ge = s('g', { class: 'te te-' + e.kind, dataset: { edge: String(ed.idx), from: e.from, to: e.to, via: ed.chain.join(' ') } });
+    ge.appendChild(s('path', { class: 'te-hit', d: dstr }));
+    ge.appendChild(s('path', { class: 'te-line', d: dstr, 'marker-end': e.kind === 'flow' ? 'url(#' + uid + '-flow)' : null }));
+    if (e.kind === 'uplink' && ed.pts.length > 2) { const last = ed.pts[ed.pts.length - 1]; const target = g.nodes.find(n => n.id === e.to); if (target && (target.kind === 'igw' || target.kind === 'nat')) ge.appendChild(s('circle', { class: 'te-dot', cx: last[0], cy: last[1], r: 2.5 })); }
+    if (e.kind === 'blocked' && spot) ge.appendChild(s('path', { class: 'te-strike', d: 'M' + (spot.x0 - 6) + ' ' + (spot.y - 6) + 'L' + (spot.x0 + 6) + ' ' + (spot.y + 6) + 'M' + (spot.x0 + 6) + ' ' + (spot.y - 6) + 'L' + (spot.x0 - 6) + ' ' + (spot.y + 6) }));
+    if (spot && spot.label) {
+      const lx = spot.horiz ? spot.x : spot.x + 8, ly = spot.horiz ? spot.y - 6 : spot.y + 4;
+      ge.appendChild(s('text', { class: 'te-label', x: lx, y: ly, 'text-anchor': spot.horiz ? 'middle' : 'start' }, spot.label));
+    }
+    gEdges.appendChild(ge);
+  });
+  svg.appendChild(gBoxes);
+  svg.appendChild(gEdges);
+  svg.appendChild(gNodes);
+  void idOf;
+  return svg;
+}
+
+/* ---- the off-state schematic: the manifest's declared roles and flows, greyed ---- */
+function schematicGraph(decl) {
+  const roles = (decl && decl.roles) || {};
+  const flows = (decl && decl.flows) || [], blocked = (decl && decl.blocked) || [];
+  const names = new Set(Object.keys(roles));
+  for (const f of [...flows, ...blocked]) { if (f.from && f.from !== 'internet') names.add(f.from); if (f.to && f.to !== 'internet') names.add(f.to); }
+  if (!names.size) return null;
+  const rid = n => 'role:' + n;
+  const needNat = flows.some(f => (f.via || []).includes('nat')), needIgw = true;
+  const nodes = [{ id: 'internet', kind: 'internet', label: 'Internet' },
+    { id: 'decl:vpc', kind: 'vpc', label: 'declared topology', cidr: null, parent: null, pseudo: true },
+    { id: 'decl:subnet', kind: 'subnet', label: 'roles', cidr: null, parent: 'decl:vpc', exposure: null, pseudo: true }];
+  if (needNat) nodes.push({ id: 'decl:nat', kind: 'nat', label: 'NAT', parent: 'decl:vpc', pseudo: true });
+  if (needIgw) nodes.push({ id: 'decl:igw', kind: 'igw', label: 'IGW', parent: 'decl:vpc', pseudo: true });
+  for (const n of names) nodes.push({ id: rid(n), kind: 'instance', label: n, parent: 'decl:subnet', role: roles[n] || null, type: null, state: null, private_ip: null, pseudo: true });
+  const edges = [];
+  if (needNat) edges.push({ kind: 'uplink', from: 'decl:nat', to: 'decl:igw' });
+  edges.push({ kind: 'uplink', from: 'decl:igw', to: 'internet' });
+  const ref = n => n === 'internet' ? 'internet' : rid(n);
+  for (const f of flows) edges.push({ kind: 'flow', from: ref(f.from), to: ref(f.to), label: f.label || '', declared: true, via: (f.via || []).map(v => v === 'nat' ? 'decl:nat' : v === 'internet' ? 'internet' : v === 'igw' ? 'decl:igw' : rid(v)) });
+  for (const b of blocked) edges.push({ kind: 'blocked', from: ref(b.from), to: ref(b.to), label: b.label || 'blocked', declared: true });
+  return { nodes, edges, enrolment: {}, unknown: [], schematic: true };
+}
+
+/* ---- inspector ---- */
+function topoInspector(g, L, sel, uc) {
+  const box = h('div', { class: 'topo-insp-body' });
+  const byId = new Map(g.nodes.map(n => [n.id, n]));
+  const row = (k, v) => v === null || v === undefined || v === '' ? null : h('div', { class: 'ti-row' }, h('span', { class: 'ti-k' }, k), h('span', { class: 'ti-v' }, v));
+  const mono = v => h('span', { class: 'mono' }, v);
+  const nameOf = id => { const n = byId.get(id); return n ? (n.label || id) : id; };
+  const kindWord = { instance: 'Instance', subnet: 'Subnet', vpc: 'VPC', nat: 'NAT gateway', igw: 'Internet gateway', eip: 'Elastic IP', internet: 'Internet' };
+  if (!sel) {
+    const count = k => g.nodes.filter(n => n.kind === k).length;
+    box.appendChild(h('div', { class: 'ti-title' }, g.schematic ? 'Declared topology' : 'Drawing'));
+    box.appendChild(h('div', { class: 'ti-hint' }, g.schematic ? 'Roles and flows from the manifest. Structure appears when the use case is on.' : 'Hover or focus anything for its facts. Click to open it in the region drawer.'));
+    if (!g.schematic) {
+      box.appendChild(row('Region', mono(g.region || '—')));
+      box.appendChild(row('Generated', g.generated_at ? h('span', { title: g.generated_at, dataset: { rel: g.generated_at } }, fmtRel(g.generated_at)) : '—'));
+      box.appendChild(row('VPCs', mono(String(count('vpc')))));
+      box.appendChild(row('Subnets', mono(String(count('subnet')))));
+      box.appendChild(row('Instances', mono(String(count('instance')))));
+      box.appendChild(row('Gateways', mono(count('igw') + ' IGW · ' + count('nat') + ' NAT')));
+      box.appendChild(row('Addresses', mono(count('eip') + (g.nodes.some(n => n.kind === 'eip' && !n.attached_to) ? ' (' + g.nodes.filter(n => n.kind === 'eip' && !n.attached_to).length + ' idle)' : ''))));
+    }
+    box.appendChild(row('Flows', mono(g.edges.filter(e => e.kind === 'flow').length + ' declared')));
+    box.appendChild(row('Blocked', mono(String(g.edges.filter(e => e.kind === 'blocked').length))));
+    if (L && L.prefix) box.appendChild(row('Names', ['shown without the ', mono(L.prefix), ' prefix']));
+    return packInspector(box);
+  }
+  if (sel.edge !== undefined) {
+    const e = g.edges[sel.edge]; if (!e) return packInspector(box);
+    const words = { route: 'Default route', uplink: 'Uplink', flow: 'Declared flow', blocked: 'Blocked pair' };
+    box.appendChild(h('div', { class: 'ti-title ti-edge-' + e.kind }, words[e.kind] || e.kind));
+    box.appendChild(row('From', nameOf(e.from)));
+    box.appendChild(row('To', nameOf(e.to)));
+    box.appendChild(row('Label', e.label ? mono(e.label) : null));
+    if (e.via && e.via.length) box.appendChild(row('Via', e.via.map(nameOf).join(' → ')));
+    box.appendChild(row('Source', e.kind === 'flow' || e.kind === 'blocked' ? 'manifest' : 'cloud inventory'));
+    return packInspector(box);
+  }
+  const n = byId.get(sel.node); if (!n) return packInspector(box);
+  const G = L.nodes[n.id] || {};
+  box.appendChild(h('div', { class: 'ti-kicker' }, kindWord[n.kind] || n.kind, n.role && ROLE_WORD[n.role] ? ' · ' + ROLE_WORD[n.role] : ''));
+  box.appendChild(h('div', { class: 'ti-title' }, n.label || n.id));
+  const en = (g.enrolment || {})[n.id];
+  if (n.kind === 'instance') {
+    const sn = byId.get(n.parent), v = sn ? byId.get(sn.parent) : null;
+    const eip = g.nodes.find(x => x.kind === 'eip' && x.attached_to === n.id);
+    box.appendChild(row('Enrolment', en ? h('span', { class: en.authenticated ? 'ok' : 'bad' }, (en.authenticated ? 'authenticated' : 'not authenticated') + (en.label ? ' · ' + en.label : '')) : (n.pseudo ? null : h('span', { class: 'dim' }, 'not an enrolling component'))));
+    box.appendChild(row('State', n.state ? h('span', { class: n.state === 'running' ? 'ok' : '' }, n.state) : null));
+    box.appendChild(row('Type', n.type ? mono(n.type) : null));
+    box.appendChild(row('Private IP', n.private_ip ? mono(n.private_ip) : null));
+    box.appendChild(row('Public IP', n.public_ip ? [mono(n.public_ip), eip ? h('span', { class: 'dim' }, ' elastic') : h('span', { class: 'dim' }, ' auto-assigned')] : (n.pseudo ? null : h('span', { class: 'dim' }, 'none'))));
+    box.appendChild(row('Subnet', sn ? [sn.label || sn.id, sn.cidr ? [' ', mono(sn.cidr)] : null, sn.exposure ? [' · ', sn.exposure] : null] : null));
+    box.appendChild(row('VPC', v ? [v.label || v.id, v.cidr ? [' ', mono(v.cidr)] : null] : null));
+    const allows = g.edges.filter(e => e.kind === 'allow' && e.to === n.id);
+    if (allows.length) box.appendChild(row('Allowed in', h('div', { class: 'ti-list' }, allows.map(a => h('div', null, mono(a.label || 'all'), h('span', { class: 'dim' }, ' from '), mono(nameOf(a.from)), /^(0\.0\.0\.0\/0|::\/0)$/.test(a.from) ? h('span', { class: 'ti-world' }, ' anywhere') : null)))));
+    box.appendChild(row('Id', n.pseudo ? null : mono(n.id)));
+  } else if (n.kind === 'subnet') {
+    const v = byId.get(n.parent);
+    const route = g.edges.find(e => e.kind === 'route' && e.from === n.id);
+    box.appendChild(row('CIDR', n.cidr ? mono(n.cidr) : null));
+    box.appendChild(row('Exposure', n.exposure ? [n.exposure, h('span', { class: 'dim' }, n.exposure === 'public' ? ' — default route to an internet gateway' : n.exposure === 'private' ? ' — default route through a NAT' : ' — no default route')] : null));
+    box.appendChild(row('Default route', route ? [mono(route.label || '0.0.0.0/0'), ' → ', nameOf(route.to)] : (n.pseudo ? null : h('span', { class: 'dim' }, 'none'))));
+    box.appendChild(row('AZ', n.az ? mono(n.az) : null));
+    box.appendChild(row('Instances', mono(String(g.nodes.filter(x => x.kind === 'instance' && x.parent === n.id).length))));
+    box.appendChild(row('VPC', v ? [v.label || v.id, v.cidr ? [' ', mono(v.cidr)] : null] : null));
+    box.appendChild(row('Id', n.pseudo ? null : mono(n.id)));
+  } else if (n.kind === 'vpc') {
+    const subs = g.nodes.filter(x => x.kind === 'subnet' && x.parent === n.id);
+    const insts = g.nodes.filter(x => x.kind === 'instance' && subs.some(sn => sn.id === x.parent));
+    box.appendChild(row('CIDR', n.cidr ? mono(n.cidr) : null));
+    box.appendChild(row('Subnets', mono(subs.length + (subs.length ? ' (' + subs.map(x => x.exposure || '?').join(', ') + ')' : ''))));
+    box.appendChild(row('Instances', mono(String(insts.length))));
+    box.appendChild(row('Gateways', g.nodes.filter(x => (x.kind === 'igw' || x.kind === 'nat') && x.parent === n.id).map(x => x.kind === 'nat' ? 'NAT' : 'IGW').join(' · ') || h('span', { class: 'dim' }, 'none — isolated')));
+    box.appendChild(row('Id', n.pseudo ? null : mono(n.id)));
+  } else if (n.kind === 'nat' || n.kind === 'igw') {
+    const v = byId.get(n.parent);
+    const eip = g.nodes.find(x => x.kind === 'eip' && x.attached_to === n.id);
+    box.appendChild(row('Public IP', n.public_ip || (eip && eip.label) ? mono(n.public_ip || eip.label) : null));
+    box.appendChild(row('Serves', g.edges.filter(e => e.kind === 'route' && e.to === n.id).map(e => nameOf(e.from)).join(', ') || (n.pseudo ? null : h('span', { class: 'dim' }, 'no subnet routes here'))));
+    box.appendChild(row('VPC', v ? [v.label || v.id, v.cidr ? [' ', mono(v.cidr)] : null] : null));
+    box.appendChild(row('Id', n.pseudo ? null : mono(n.id)));
+  } else if (n.kind === 'eip') {
+    box.appendChild(row('Address', mono(n.label)));
+    box.appendChild(row('Attached to', n.attached_to ? nameOf(n.attached_to) : h('span', { class: 'flag' }, icon('flag'), 'nothing — idle, billed hourly')));
+    box.appendChild(row('Id', mono(n.id)));
+  } else if (n.kind === 'internet') {
+    box.appendChild(row('Meaning', 'Everything outside the VPCs. A line through here crosses the public internet.'));
+    box.appendChild(row('Flows', mono(String(g.edges.filter(e => e.kind === 'flow' && (e.to === n.id || (e.via || []).includes(n.id))).length))));
+  }
+  const flows = g.edges.filter(e => (e.kind === 'flow' || e.kind === 'blocked') && (e.from === n.id || e.to === n.id));
+  if (flows.length) box.appendChild(row('Traffic', h('div', { class: 'ti-list' }, flows.map(e => h('div', { class: e.kind === 'blocked' ? 'bad' : '' }, e.from === n.id ? ['→ ', nameOf(e.to)] : ['← ', nameOf(e.from)], e.label ? [' ', mono(e.label)] : null, e.kind === 'blocked' ? ' (blocked)' : null)))));
+  if (!n.pseudo && n.kind !== 'internet' && n.kind !== 'igw' && uc) {
+    box.appendChild(h('button', { class: 'btn btn-sm ti-open', type: 'button', onclick: () => openTopoNode(uc, g, n) }, icon('link'), 'Open in region drawer'));
+  }
+  void G;
+  return packInspector(box);
+}
+
+function packInspector(box) {
+  const head = h('div', { class: 'ti-head' }), rows = h('div', { class: 'ti-rows' });
+  let btn = null;
+  for (const c of Array.from(box.childNodes)) { if (c.classList && c.classList.contains('ti-row')) rows.appendChild(c); else if (c.classList && c.classList.contains('ti-open')) btn = c; else head.appendChild(c); }
+  clear(box); box.appendChild(head); box.appendChild(rows); if (btn) head.appendChild(btn);
+  return box;
+}
+/** Click / Enter on a node: the region drawer, deep-linked to that resource. */
+function openTopoNode(uc, g, n) {
+  if (!n || n.pseudo || n.kind === 'internet' || !g.region) return;
+  const kind = { instance: 'inst', subnet: 'subnet', vpc: 'vpc', nat: 'nat', eip: 'eip' }[n.kind];
+  if (!kind) return;
+  openResourceDrawer(uc.provider || g.provider || 'aws', g.region, kind, n.id, { returnTo: '#/usecases', returnFocus: n.id });
+}
+
+/* ---- the block in the card ---- */
+function renderTopology(uc, d) {
+  const t = state.topo[uc.id] || (state.topo[uc.id] = { loading: false, data: null, err: null, width: 0, sel: null, refocus: null });
+  const block = h('div', { class: 'detail-block topo-block' });
+  const data = t.data;
+  const live = data && data.nodes && data.nodes.length > 0;
+  const head = h('div', { class: 'section-head topo-head' },
+    h('div', { class: 'topo-headings' },
+      h('span', { class: 'section-title' }, 'Topology'),
+      h('span', { class: 'topo-hint' }, live ? 'Boxes and lines come from the cloud; dashed flows and blocked pairs are declared in the manifest.' : 'Structure from the cloud, meaning from the manifest.')),
+    h('div', { class: 'topo-tools' },
+      data && data.generated_at && live ? h('span', { class: 'topo-when mono', title: data.generated_at }, data.region ? data.region + ' · ' : '', 'generated ', h('span', { dataset: { rel: data.generated_at } }, fmtRel(data.generated_at))) : null,
+      h('button', { class: 'btn btn-sm', type: 'button', disabled: !!t.loading, title: 'Rebuild the drawing from the cloud now', onclick: () => loadTopology(uc.id, true) }, icon('refresh'), t.loading ? 'Drawing' : 'Redraw')));
+  block.appendChild(head);
+
+  if (!data && t.loading) {
+    block.appendChild(h('div', { class: 'topo-stage is-loading' }, h('div', { class: 'skeleton', style: 'height:300px' }), h('span', { class: 'loading topo-loading' }, 'Reading the inventory')));
+    return block;
+  }
+  if (!data && t.err) {
+    block.appendChild(h('div', { class: 'state-box is-error' }, h('div', { class: 'title' }, 'Could not draw the topology'), h('div', null, t.err),
+      h('button', { class: 'btn', type: 'button', onclick: () => loadTopology(uc.id, true) }, 'Retry')));
+    return block;
+  }
+  if (!data) {
+    block.appendChild(h('div', { class: 'state-box' }, h('div', { class: 'title' }, 'Not drawn yet'), h('button', { class: 'btn', type: 'button', onclick: () => loadTopology(uc.id) }, 'Draw')));
+    return block;
+  }
+  let g = data, off = false;
+  if (!live) {
+    const decl = data.declared || data.topology || (d && d.topology) || null;
+    const sk = schematicGraph(decl);
+    off = true;
+    if (!sk) {
+      block.appendChild(h('div', { class: 'topo-stage is-off' },
+        h('div', { class: 'topo-offstate' },
+          h('div', { class: 'topo-off-title' }, 'Nothing to draw'),
+          h('div', { class: 'topo-off-reason' }, data.reason || 'The inventory carries nothing for this use case.'),
+          h('div', { class: 'topo-off-hint' }, uc.state === 'off' ? 'Turn it on to draw the network from the cloud. The manifest declares no roles or flows to sketch meanwhile.' : 'The drawing appears once tagged resources exist in the inventory.'))));
+      return block;
+    }
+    g = Object.assign(sk, { region: data.region || null, provider: data.provider || uc.provider, generated_at: data.generated_at, reason: data.reason });
+  }
+  if (t.err) block.appendChild(h('div', { class: 'form-error', style: 'margin-bottom:10px' }, 'Redraw failed: ' + t.err + ' — showing the previous drawing.'));
+
+  const stage = h('div', { class: 'topo-stage' + (off ? ' is-off' : '') });
+  const canvas = h('div', { class: 'topo-canvas', tabindex: '-1', 'aria-label': 'Topology drawing, scrolls horizontally when wider than the card' });
+  const aside = h('aside', { class: 'topo-inspector', 'aria-live': 'polite' });
+  if (off) {
+    const lr = uc.last_run;
+    stage.appendChild(h('div', { class: 'topo-offbar' },
+      h('span', { class: 'lamp' }), h('span', { class: 'state-word off' }, 'not running'),
+      h('span', { class: 'dim' }, data.reason || 'The use case is off.'),
+      h('span', { class: 'topo-offbar-run mono' }, lr ? ['last run: ' + lr.action + ' ' + lr.state + ' · ', h('span', { dataset: { rel: lr.ended || lr.started }, title: lr.ended || lr.started }, fmtRel(lr.ended || lr.started))] : 'never run')));
+  }
+  stage.appendChild(canvas);
+  stage.appendChild(aside);
+  block.appendChild(stage);
+  block.appendChild(topoLegend(g, uc));
+  if (g.unknown && g.unknown.length) {
+    block.appendChild(h('div', { class: 'topo-unknown' }, h('span', { class: 'dim' }, 'Not drawn: '), g.unknown.map((u, i) => [i ? ', ' : null, h('span', { class: 'mono', title: u.reason || '' }, u.label || u.id || String(u)), u.reason ? h('span', { class: 'dim' }, ' — ' + u.reason) : null])));
+  }
+
+  // draw (synchronously with the last known width, then measure and redraw if the width changed)
+  const draw = () => {
+    const avail = Math.max(320, t.width || canvas.clientWidth || 1100);
+    canvas._drawnFor = avail;
+    const L = topoLayout(g, avail);
+    L.scale = L.w < avail ? Math.min(TOPO.MAX_SCALE, avail / L.w) : 1;
+    const svg = topoSvg(g, L, {});
+    clear(canvas); canvas.appendChild(svg);
+    clear(aside); aside.appendChild(topoInspector(g, L, t.sel, uc));
+    if (L.unplaced.length && !$('.topo-unplaced', block)) block.appendChild(h('div', { class: 'topo-unknown topo-unplaced' }, h('span', { class: 'dim' }, 'Not placed: '), L.unplaced.map((u, i) => [i ? ', ' : null, h('span', { class: 'mono' }, u.label), h('span', { class: 'dim' }, ' — ' + u.reason)])));
+    wireTopology(svg, canvas, aside, g, L, t, uc);
+    return L;
+  };
+  draw();
+  setTimeout(() => {
+    if (!canvas.isConnected) return;
+    const w = canvas.clientWidth;
+    if (w && Math.abs(w - canvas._drawnFor) > 8) { t.width = w; draw(); }
+    if (t.refocus) { if (Date.now() > (t.refocusUntil || 0)) t.refocus = null; else { const el = $('[data-node="' + CSS.escape(t.refocus) + '"]', canvas); if (el) el.focus({ preventScroll: true }); } }
+  });
+  canvas._topoRedraw = () => { const w = canvas.clientWidth; if (w && Math.abs(w - canvas._drawnFor) > 8) { t.width = w; draw(); } };
+  return block;
+}
+window.addEventListener('resize', () => { clearTimeout(renderTopology._rt); renderTopology._rt = setTimeout(() => { $$('.topo-canvas').forEach(c => c._topoRedraw && c._topoRedraw()); }, 120); });
+
+function topoLegend(g, uc) {
+  const sw = (cls, d) => s('svg', { class: 'lg-sw', viewBox: '0 0 44 14', 'aria-hidden': 'true' }, s('path', { class: cls, d: d || 'M2 7H42' }));
+  const item = (svgEl, text) => h('span', { class: 'lg-item' }, svgEl, text);
+  const lamp = cls => h('span', { class: 'lg-lamp ' + cls });
+  const badge = exp => h('span', { class: 'lg-badge lg-exp-' + exp }, exp);
+  const legend = h('div', { class: 'topo-legend' },
+    item(sw('lg-route'), 'default route'),
+    item(sw('lg-uplink'), 'uplink to the internet'),
+    item(sw('lg-flow', 'M2 7H36'), 'declared flow'),
+    item(s('svg', { class: 'lg-sw', viewBox: '0 0 44 14', 'aria-hidden': 'true' }, s('path', { class: 'lg-blocked', d: 'M2 7H42' }), s('path', { class: 'lg-strike', d: 'M18 3l8 8M26 3l-8 8' })), 'blocked'),
+    h('span', { class: 'lg-sep' }),
+    item(lamp('on'), 'enrolled'), item(lamp('bad'), 'not enrolled'), item(lamp('running'), 'running'),
+    h('span', { class: 'lg-sep' }),
+    badge('public'), badge('private'), badge('isolated'),
+    h('span', { class: 'lg-sep' }),
+    item(s('svg', { class: 'lg-glyph', viewBox: '0 0 18 18', 'aria-hidden': 'true' }, roleGlyph('pse')), 'service edge'),
+    item(s('svg', { class: 'lg-glyph', viewBox: '0 0 18 18', 'aria-hidden': 'true' }, roleGlyph('connector')), 'connector'),
+    item(s('svg', { class: 'lg-glyph', viewBox: '0 0 18 18', 'aria-hidden': 'true' }, roleGlyph('app')), 'app'),
+    item(s('svg', { class: 'lg-glyph', viewBox: '0 0 18 18', 'aria-hidden': 'true' }, roleGlyph('client')), 'client'));
+  void g; void uc;
+  return legend;
+}
+
+/** Hover, focus, keyboard and click behaviour on one drawing. */
+function wireTopology(svg, canvas, aside, g, L, t, uc) {
+  const byId = new Map(g.nodes.map(n => [n.id, n]));
+  const nodeEls = new Map(); $$('[data-node]', svg).forEach(el => nodeEls.set(el.dataset.node, el));
+  const edgeEls = $$('[data-edge]', svg);
+  let sticky = t.sel; // keyboard-focused / last chosen
+  const showInsp = sel => { clear(aside); aside.appendChild(topoInspector(g, L, sel, uc)); };
+  function related(sel) {
+    const nodes = new Set(), edges = new Set();
+    if (sel.node !== undefined) {
+      nodes.add(sel.node);
+      const n = byId.get(sel.node);
+      // an address highlights its host; a host highlights its address
+      if (n && n.kind === 'eip' && n.attached_to) nodes.add(n.attached_to);
+      g.nodes.forEach(x => { if (x.kind === 'eip' && x.attached_to === sel.node) nodes.add(x.id); });
+      edgeEls.forEach(el => {
+        const chain = (el.dataset.via || '').split(' ');
+        if (el.dataset.from === sel.node || el.dataset.to === sel.node || chain.includes(sel.node)) { edges.add(el.dataset.edge); chain.forEach(id => { if (id) nodes.add(id); }); }
+      });
+    } else if (sel.edge !== undefined) {
+      edges.add(String(sel.edge));
+      const el = edgeEls.find(x => x.dataset.edge === String(sel.edge));
+      if (el) (el.dataset.via || '').split(' ').forEach(id => { if (id) nodes.add(id); });
+    }
+    return { nodes, edges };
+  }
+  function highlight(sel) {
+    svg.classList.toggle('is-focus', !!sel);
+    $$('.is-hi', svg).forEach(el => el.classList.remove('is-hi'));
+    if (!sel) return;
+    const r = related(sel);
+    r.nodes.forEach(id => { const el = nodeEls.get(id); if (el) el.classList.add('is-hi'); });
+    edgeEls.forEach(el => { if (r.edges.has(el.dataset.edge)) el.classList.add('is-hi'); });
+  }
+  const selOf = el => {
+    const ne = el.closest('[data-node]'); if (ne) return { node: ne.dataset.node };
+    const ee = el.closest('[data-edge]'); if (ee) return { edge: Number(ee.dataset.edge) };
+    return null;
+  };
+  svg.addEventListener('mouseover', e => { const sel = selOf(e.target); if (!sel) return; highlight(sel); showInsp(sel); });
+  svg.addEventListener('mouseleave', () => { highlight(sticky); showInsp(sticky); });
+  svg.addEventListener('focusin', e => { const sel = selOf(e.target); if (!sel) return; sticky = sel; t.sel = sel; highlight(sel); showInsp(sel); });
+  svg.addEventListener('focusout', e => { if (!svg.contains(e.relatedTarget)) { highlight(sticky); showInsp(sticky); } });
+  svg.addEventListener('click', e => {
+    const sel = selOf(e.target); if (!sel) return;
+    if (sel.node !== undefined) { const n = byId.get(sel.node); sticky = sel; t.sel = sel; if (n && !n.pseudo && n.kind !== 'internet' && n.kind !== 'igw') openTopoNode(uc, g, n); else { highlight(sel); showInsp(sel); } }
+    else { sticky = sel; t.sel = sel; highlight(sel); showInsp(sel); }
+  });
+  svg.addEventListener('keydown', e => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const sel = selOf(e.target); if (!sel || sel.node === undefined) return;
+    e.preventDefault();
+    const n = byId.get(sel.node);
+    if (n && !n.pseudo && n.kind !== 'internet' && n.kind !== 'igw') openTopoNode(uc, g, n);
+  });
+  if (sticky) { highlight(sticky); showInsp(sticky); }
 }
 
 /* ---- outline: steps + a real plan + declared effects, per action ---- */
@@ -2263,73 +3106,72 @@ SB.mock = (function () {
     const lab = { Project: 'zpa-pse-lab', ManagedBy: 'opentofu' };
     const T = (name, extra) => Object.assign({ Name: name }, lab, extra || {});
     const up = 3 * D + 2 * H, up2 = 3 * D + H;
-    const VPC = { pse: 'vpc-0f1e2d3c4b5a69788', app: 'vpc-0a9b8c7d6e5f41323', def: 'vpc-3b2a1c0d' };
-    const SN = { psePub: 'subnet-0a11b22c33d44e55f', appPub: 'subnet-0b22c33d44e55f66a', appPriv: 'subnet-0c33d44e55f66a77b', appSrv: 'subnet-0d44e55f66a77b88c', appClient: 'subnet-0e55f66a77b88c99d', d1: 'subnet-1a2b3c4d', d2: 'subnet-2b3c4d5e', d3: 'subnet-3c4d5e6f' };
-    const SG = { pse: 'sg-0a1b2c3d4e5f6a7b8', conn: 'sg-0b2c3d4e5f6a7b8c9', nginx: 'sg-0c3d4e5f6a7b8c9d0', client: 'sg-0d4e5f6a7b8c9d0e1', dPse: 'sg-0e5f6a7b8c9d0e1f2', dApp: 'sg-0f6a7b8c9d0e1f2a3', dDef: 'sg-1a7b8c9d0e1f2a3b4' };
-    const IGW = { pse: 'igw-0a1b2c3d4e5f60718', app: 'igw-0b2c3d4e5f607182a', def: 'igw-3c4d5e6f' };
-    const RT = { psePub: 'rtb-0a1b2c3d4e5f60718', pseMain: 'rtb-0a9f8e7d6c5b4a392', appPub: 'rtb-0b2c3d4e5f607182a', appPriv: 'rtb-0c3d4e5f6071829b3', appMain: 'rtb-0c9f8e7d6c5b4a394', defMain: 'rtb-3d4e5f6a' };
+    const VPC = { a: 'vpc-0f1e2d3c4b5a69788', b: 'vpc-0a9b8c7d6e5f41323', def: 'vpc-3b2a1c0d' };
+    const SN = { aPub: 'subnet-0a11b22c33d44e55f', bPub: 'subnet-0b22c33d44e55f66a', priv: 'subnet-0c33d44e55f66a77b', mcu: 'subnet-0d44e55f66a77b88c', d1: 'subnet-1a2b3c4d', d2: 'subnet-2b3c4d5e', d3: 'subnet-3c4d5e6f' };
+    const SG = { pse: 'sg-0a1b2c3d4e5f6a7b8', conn: 'sg-0b2c3d4e5f6a7b8c9', privConn: 'sg-0c3d4e5f6a7b8c9d0', server: 'sg-0d4e5f6a7b8c9d0e1', mcu: 'sg-0e5f6a7b8c9d0e1f2', dA: 'sg-0f6a7b8c9d0e1f2a3', dB: 'sg-1a7b8c9d0e1f2a3b4', dDef: 'sg-2b8c9d0e1f2a3b4c5' };
+    const IGW = { a: 'igw-0a1b2c3d4e5f60718', b: 'igw-0b2c3d4e5f607182a', def: 'igw-3c4d5e6f' };
+    const RT = { aPub: 'rtb-0a1b2c3d4e5f60718', aMain: 'rtb-0a9f8e7d6c5b4a392', bPub: 'rtb-0b2c3d4e5f607182a', bPriv: 'rtb-0c3d4e5f6071829b3', bMain: 'rtb-0c9f8e7d6c5b4a394', defMain: 'rtb-3d4e5f6a' };
     const NAT = 'nat-0123456789abcdef0';
-    const AMI = { al: 'ami-0e2c8caa4b6378d8c', win: 'ami-0b6d8c7e5f4a3b2c1' };
-    const inst = (o) => Object.assign({ state: 'running', platform: 'Linux/UNIX', architecture: 'x86_64', vpc: VPC.app, ami: AMI.al, ami_name: 'al2023-ami-2023.5.20240722.0-kernel-6.1-x86_64', iam_instance_profile: 'zpa-lab-instance-profile', key_name: 'zpa-lab', root_device: '/dev/xvda', monitoring: false, ebs_optimized: true, user_data_present: true }, o);
+    const AMI = { al: 'ami-0e2c8caa4b6378d8c', zpa: 'ami-0c7e1f2a3b4c5d6e7', win: 'ami-0b6d8c7e5f4a3b2c1' };
+    const inst = (o) => Object.assign({ state: 'running', platform: 'Linux/UNIX', architecture: 'x86_64', vpc: VPC.b, ami: AMI.zpa, ami_name: 'zpa-connector-el9-25.62.1-x86_64', iam_instance_profile: 'zpa-lab-node', key_name: 'zpa-lab', root_device: '/dev/xvda', monitoring: false, ebs_optimized: true, user_data_present: true }, o);
+    // the real lab: VPC A holds the Private Service Edge and its local App Connector in one public subnet;
+    // VPC B holds a public subnet for the NAT, the PRIV zone (connector + server) and the MCU zone (Windows client)
     const instances = [
-      inst({ id: 'i-0a1b2c3d4e5f60718', name: 'zpa-lab-pse', type: 'm5.large', az: 'eu-central-1a', vpc: VPC.pse, subnet: SN.psePub, private_ip: '10.91.10.5', public_ip: '63.188.16.52', launched: iso(up), uptime_h: up / H, security_groups: [{ id: SG.pse, name: 'zpa-lab-pse-sg' }], volumes: ['vol-0aa1f3c9d2e4b5a61'], monthly_usd: r2(RATE['m5.large'] * 730), tags: T('zpa-lab-pse', { Role: 'pse' }) }),
-      inst({ id: 'i-0b2c3d4e5f607182a', name: 'zpa-lab-connector-a', type: 't3.medium', az: 'eu-central-1a', subnet: SN.appPriv, private_ip: '10.90.1.21', public_ip: null, launched: iso(up), uptime_h: up / H, security_groups: [{ id: SG.conn, name: 'zpa-lab-connector-sg' }], volumes: ['vol-0aa2e4d0c3f5a6b72'], monthly_usd: r2(RATE['t3.medium'] * 730), tags: T('zpa-lab-connector-a', { Role: 'app-connector' }) }),
-      inst({ id: 'i-0c3d4e5f6071829b3', name: 'zpa-lab-connector-b', type: 't3.medium', az: 'eu-central-1b', subnet: SN.appPriv, private_ip: '10.90.1.22', public_ip: null, launched: iso(up), uptime_h: up / H, security_groups: [{ id: SG.conn, name: 'zpa-lab-connector-sg' }], volumes: ['vol-0aa3f5e1d4a6b7c83'], monthly_usd: r2(RATE['t3.medium'] * 730), tags: T('zpa-lab-connector-b', { Role: 'app-connector' }) }),
-      inst({ id: 'i-0d4e5f607182a9b4c', name: 'zpa-lab-nginx', type: 't3.micro', az: 'eu-central-1a', subnet: SN.appSrv, private_ip: '10.90.2.10', public_ip: null, launched: iso(up2), uptime_h: up2 / H, security_groups: [{ id: SG.nginx, name: 'zpa-lab-nginx-sg' }], volumes: ['vol-0aa4a6f2e5b7c8d94'], monthly_usd: r2(RATE['t3.micro'] * 730), ebs_optimized: false, tags: T('zpa-lab-nginx', { Role: 'app-server' }) }),
-      inst({ id: 'i-0e5f607182a9b4c5d', name: 'zpa-lab-win-client', type: 't3.medium', az: 'eu-central-1a', subnet: SN.appClient, private_ip: '10.90.3.15', public_ip: '3.72.118.204', launched: iso(up2), uptime_h: up2 / H, platform: 'Windows', ami: AMI.win, ami_name: 'Windows_Server-2022-English-Full-Base-2024.07.10', root_device: '/dev/sda1', security_groups: [{ id: SG.client, name: 'zpa-lab-client-sg' }], volumes: ['vol-0aa5b7a3f6c8d9ea5'], monthly_usd: r2(RATE['t3.medium:win'] * 730), tags: T('zpa-lab-win-client', { Role: 'client' }) }),
+      inst({ id: 'i-0a1b2c3d4e5f60718', name: 'zpa-lab-pse', type: 'm5.large', az: 'eu-central-1a', vpc: VPC.a, subnet: SN.aPub, private_ip: '10.91.10.5', public_ip: '63.188.16.52', launched: iso(up), uptime_h: up / H, ami_name: 'zpa-private-service-edge-el9-25.62.1-x86_64', security_groups: [{ id: SG.pse, name: 'zpa-lab-pse' }], volumes: ['vol-0aa1f3c9d2e4b5a61'], monthly_usd: r2(RATE['m5.large'] * 730), tags: T('zpa-lab-pse') }),
+      inst({ id: 'i-0b2c3d4e5f607182a', name: 'zpa-lab-connector', type: 't3.medium', az: 'eu-central-1a', vpc: VPC.a, subnet: SN.aPub, private_ip: '10.91.10.64', public_ip: '3.72.118.204', launched: iso(up), uptime_h: up / H, security_groups: [{ id: SG.conn, name: 'zpa-lab-connector' }], volumes: ['vol-0aa2e4d0c3f5a6b72'], monthly_usd: r2(RATE['t3.medium'] * 730), tags: T('zpa-lab-connector') }),
+      inst({ id: 'i-0c3d4e5f6071829b3', name: 'zpa-lab-priv-connector', type: 't3.medium', az: 'eu-central-1a', subnet: SN.priv, private_ip: '10.90.20.21', public_ip: null, launched: iso(up), uptime_h: up / H, security_groups: [{ id: SG.privConn, name: 'zpa-lab-priv-connector' }], volumes: ['vol-0aa3f5e1d4a6b7c83'], monthly_usd: r2(RATE['t3.medium'] * 730), tags: T('zpa-lab-priv-connector') }),
+      inst({ id: 'i-0d4e5f607182a9b4c', name: 'zpa-lab-server', type: 't3.micro', az: 'eu-central-1a', subnet: SN.priv, private_ip: '10.90.20.10', public_ip: null, launched: iso(up2), uptime_h: up2 / H, ami: AMI.al, ami_name: 'al2023-ami-2023.5.20240722.0-kernel-6.1-x86_64', security_groups: [{ id: SG.server, name: 'zpa-lab-server' }], volumes: ['vol-0aa4a6f2e5b7c8d94'], monthly_usd: r2(RATE['t3.micro'] * 730), ebs_optimized: false, tags: T('zpa-lab-server') }),
+      inst({ id: 'i-0e5f607182a9b4c5d', name: 'zpa-lab-mcu-client', type: 't3.medium', az: 'eu-central-1a', subnet: SN.mcu, private_ip: '10.90.30.15', public_ip: null, launched: iso(up2), uptime_h: up2 / H, platform: 'Windows', ami: AMI.win, ami_name: 'Windows_Server-2022-English-Full-Base-2024.07.10', root_device: '/dev/sda1', security_groups: [{ id: SG.mcu, name: 'zpa-lab-mcu-client' }], volumes: ['vol-0aa5b7a3f6c8d9ea5'], monthly_usd: r2(RATE['t3.medium:win'] * 730), tags: T('zpa-lab-mcu-client') }),
     ];
     const vol = (id, gb, i, dev, extra) => Object.assign({ id, size_gb: gb, type: 'gp3', az: i ? i.az : 'eu-central-1a', iops: 3000, throughput: 125, encrypted: true, state: 'in-use', attached: !!i, instance: i ? i.id : null, attached_to: i ? i.id : null, device: i ? dev : null, created: i ? i.launched : iso(11 * D), name: i ? i.name : null, monthly_usd: r2(gb * RATE.gp3), tags: i ? T(i.name) : {} }, extra || {});
     const volumes = [
-      vol('vol-0aa1f3c9d2e4b5a61', 80, instances[0], '/dev/xvda'), vol('vol-0aa2e4d0c3f5a6b72', 30, instances[1], '/dev/xvda'),
-      vol('vol-0aa3f5e1d4a6b7c83', 30, instances[2], '/dev/xvda', { az: 'eu-central-1b' }), vol('vol-0aa4a6f2e5b7c8d94', 8, instances[3], '/dev/xvda'),
+      vol('vol-0aa1f3c9d2e4b5a61', 80, instances[0], '/dev/xvda'), vol('vol-0aa2e4d0c3f5a6b72', 80, instances[1], '/dev/xvda'),
+      vol('vol-0aa3f5e1d4a6b7c83', 80, instances[2], '/dev/xvda'), vol('vol-0aa4a6f2e5b7c8d94', 8, instances[3], '/dev/xvda'),
       vol('vol-0aa5b7a3f6c8d9ea5', 50, instances[4], '/dev/sda1'),
-      vol('vol-0bb6c8d4a7e9f0ab6', 20, null, null, { state: 'available', name: 'win-client-restore-test', encrypted: false, tags: { Name: 'win-client-restore-test' } }),
+      vol('vol-0bb6c8d4a7e9f0ab6', 20, null, null, { state: 'available', name: 'mcu-client-restore-test', encrypted: false, tags: { Name: 'mcu-client-restore-test' } }),
     ];
     const sub = (id, name, cidr, az, rt, target) => ({ id, name, cidr, az, public: !!(target && target.startsWith('igw-')), route_table: rt, default_route: target, map_public_ip: !!(target && target.startsWith('igw-')), available_ips: 240 });
-    const rt = (id, name, main, routes, subnets) => ({ id, name, main, routes: [{ dest: '10.0.0.0/8', target: 'local', state: 'active' }].map(x => x).concat(routes), subnets, tags: name ? T(name) : {} });
     const vpcs = [
-      { id: VPC.pse, name: 'zpa-lab-pse-vpc', cidr: '10.91.0.0/16', default: false, state: 'available', dns_hostnames: true, igw: IGW.pse, nat_gateways: [],
-        subnets: [sub(SN.psePub, 'zpa-lab-pse-public', '10.91.10.0/24', 'eu-central-1a', RT.psePub, IGW.pse)],
+      { id: VPC.a, name: 'zpa-lab-vpc-a', cidr: '10.91.0.0/16', default: false, state: 'available', dns_hostnames: true, igw: IGW.a, nat_gateways: [],
+        subnets: [sub(SN.aPub, 'zpa-lab-public', '10.91.10.0/24', 'eu-central-1a', RT.aPub, IGW.a)],
         route_tables: [
-          { id: RT.pseMain, name: null, main: true, routes: [{ dest: '10.91.0.0/16', target: 'local', state: 'active' }], subnets: [], tags: {} },
-          { id: RT.psePub, name: 'zpa-lab-pse-public', main: false, routes: [{ dest: '10.91.0.0/16', target: 'local', state: 'active' }, { dest: '0.0.0.0/0', target: IGW.pse, state: 'active' }], subnets: [SN.psePub], tags: T('zpa-lab-pse-public') }],
-        tags: T('zpa-lab-pse-vpc') },
-      { id: VPC.app, name: 'zpa-lab-app-vpc', cidr: '10.90.0.0/16', default: false, state: 'available', dns_hostnames: true, igw: IGW.app, nat_gateways: [NAT],
+          { id: RT.aMain, name: null, main: true, routes: [{ dest: '10.91.0.0/16', target: 'local', state: 'active' }], subnets: [], tags: {} },
+          { id: RT.aPub, name: 'zpa-lab-public-rt', main: false, routes: [{ dest: '10.91.0.0/16', target: 'local', state: 'active' }, { dest: '0.0.0.0/0', target: IGW.a, state: 'active' }], subnets: [SN.aPub], tags: T('zpa-lab-public-rt') }],
+        tags: T('zpa-lab-vpc-a') },
+      { id: VPC.b, name: 'zpa-lab-vpc-b', cidr: '10.90.0.0/16', default: false, state: 'available', dns_hostnames: true, igw: IGW.b, nat_gateways: [NAT],
         subnets: [
-          sub(SN.appPub, 'zpa-lab-app-public', '10.90.0.0/24', 'eu-central-1a', RT.appPub, IGW.app),
-          sub(SN.appPriv, 'zpa-lab-app-private', '10.90.1.0/24', 'eu-central-1a', RT.appPriv, NAT),
-          sub(SN.appSrv, 'zpa-lab-app-server', '10.90.2.0/24', 'eu-central-1a', RT.appPriv, NAT),
-          sub(SN.appClient, 'zpa-lab-app-client', '10.90.3.0/24', 'eu-central-1a', RT.appPub, IGW.app)],
+          sub(SN.bPub, 'zpa-lab-b-public', '10.90.0.0/24', 'eu-central-1a', RT.bPub, IGW.b),
+          sub(SN.priv, 'zpa-lab-priv', '10.90.20.0/24', 'eu-central-1a', RT.bPriv, NAT),
+          sub(SN.mcu, 'zpa-lab-mcu', '10.90.30.0/24', 'eu-central-1a', RT.bPriv, NAT)],
         route_tables: [
-          { id: RT.appMain, name: null, main: true, routes: [{ dest: '10.90.0.0/16', target: 'local', state: 'active' }], subnets: [], tags: {} },
-          { id: RT.appPub, name: 'zpa-lab-app-public', main: false, routes: [{ dest: '10.90.0.0/16', target: 'local', state: 'active' }, { dest: '0.0.0.0/0', target: IGW.app, state: 'active' }], subnets: [SN.appPub, SN.appClient], tags: T('zpa-lab-app-public') },
-          { id: RT.appPriv, name: 'zpa-lab-app-private', main: false, routes: [{ dest: '10.90.0.0/16', target: 'local', state: 'active' }, { dest: '0.0.0.0/0', target: NAT, state: 'active' }, { dest: '10.91.0.0/16', target: 'pcx-0a1b2c3d4e5f60718', state: 'active' }], subnets: [SN.appPriv, SN.appSrv], tags: T('zpa-lab-app-private') }],
-        tags: T('zpa-lab-app-vpc') },
+          { id: RT.bMain, name: null, main: true, routes: [{ dest: '10.90.0.0/16', target: 'local', state: 'active' }], subnets: [], tags: {} },
+          { id: RT.bPub, name: 'zpa-lab-b-public-rt', main: false, routes: [{ dest: '10.90.0.0/16', target: 'local', state: 'active' }, { dest: '0.0.0.0/0', target: IGW.b, state: 'active' }], subnets: [SN.bPub], tags: T('zpa-lab-b-public-rt') },
+          { id: RT.bPriv, name: 'zpa-lab-b-private-rt', main: false, routes: [{ dest: '10.90.0.0/16', target: 'local', state: 'active' }, { dest: '0.0.0.0/0', target: NAT, state: 'active' }], subnets: [SN.priv, SN.mcu], tags: T('zpa-lab-b-private-rt') }],
+        tags: T('zpa-lab-vpc-b') },
       { id: VPC.def, name: null, cidr: '172.31.0.0/16', default: true, state: 'available', dns_hostnames: true, igw: IGW.def, nat_gateways: [],
         subnets: [sub(SN.d1, null, '172.31.0.0/20', 'eu-central-1a', RT.defMain, IGW.def), sub(SN.d2, null, '172.31.16.0/20', 'eu-central-1b', RT.defMain, IGW.def), sub(SN.d3, null, '172.31.32.0/20', 'eu-central-1c', RT.defMain, IGW.def)],
         route_tables: [{ id: RT.defMain, name: null, main: true, routes: [{ dest: '172.31.0.0/16', target: 'local', state: 'active' }, { dest: '0.0.0.0/0', target: IGW.def, state: 'active' }], subnets: [SN.d1, SN.d2, SN.d3], tags: {} }],
         tags: {} },
     ];
-    void rt;
-    const nat_gateways = [{ id: NAT, name: 'zpa-lab-app-nat', vpc: VPC.app, subnet: SN.appPub, state: 'available', public_ip: '18.196.44.9', private_ip: '10.90.0.12', connectivity_type: 'public', created: iso(up), monthly_usd: r2(RATE.nat * 730), tags: T('zpa-lab-app-nat') }];
+    const nat_gateways = [{ id: NAT, name: 'zpa-lab-nat', vpc: VPC.b, subnet: SN.bPub, state: 'available', public_ip: '18.193.163.38', private_ip: '10.90.0.12', connectivity_type: 'public', created: iso(up), monthly_usd: r2(RATE.nat * 730), tags: T('zpa-lab-nat') }];
     const eip = (ip, alloc, assoc, extra) => Object.assign({ ip, allocation_id: alloc, attached: !!assoc, instance: assoc && assoc.kind === 'instance' ? assoc.id : null, association: assoc, private_ip: null, name: null, monthly_usd: r2(RATE.ipv4 * 730), tags: {} }, extra || {});
     const eips = [
-      eip('63.188.16.52', 'eipalloc-0c2d3e4f5a6b7c8d9', { kind: 'instance', id: instances[0].id, eni: 'eni-0a1b2c3d4e5f60718' }, { private_ip: '10.91.10.5', name: 'zpa-lab-pse', tags: T('zpa-lab-pse') }),
-      eip('18.196.44.9', 'eipalloc-0d3e4f5a6b7c8d9e0', { kind: 'nat', id: NAT, eni: 'eni-0b2c3d4e5f607182a' }, { private_ip: '10.90.0.12', name: 'zpa-lab-nat', tags: T('zpa-lab-nat') }),
-      eip('3.72.118.204', 'eipalloc-0e4f5a6b7c8d9e0f1', { kind: 'instance', id: instances[4].id, eni: 'eni-0c3d4e5f6071829b3' }, { private_ip: '10.90.3.15', name: 'zpa-lab-win-client', tags: T('zpa-lab-win-client') }),
-      eip('3.120.55.17', 'eipalloc-0f5a6b7c8d9e0f1a2', null, { name: 'zpa-lab-pse-old', tags: T('zpa-lab-pse-old') }),
+      eip('63.188.16.52', 'eipalloc-0c2d3e4f5a6b7c8d9', { kind: 'instance', id: instances[0].id, eni: 'eni-0a1b2c3d4e5f60718' }, { private_ip: '10.91.10.5', name: 'zpa-lab-pse-eip', tags: T('zpa-lab-pse-eip') }),
+      eip('18.193.163.38', 'eipalloc-0d3e4f5a6b7c8d9e0', { kind: 'nat', id: NAT, eni: 'eni-0b2c3d4e5f607182a' }, { private_ip: '10.90.0.12', name: 'zpa-lab-nat-eip', tags: T('zpa-lab-nat-eip') }),
+      eip('3.120.55.17', 'eipalloc-0f5a6b7c8d9e0f1a2', null, { name: 'zpa-lab-pse-eip-old', tags: T('zpa-lab-pse-eip-old') }), // idle, still tagged: shows in the drawing as unattached
       eip('18.185.9.201', 'eipalloc-1a6b7c8d9e0f1a2b3', null, {}),
     ];
     const sg = (id, name, vpc, description, ingress, egress, attached_to, tags) => ({ id, name, vpc, description, ingress, egress, attached_to, tags: tags || {} });
     const rule = (proto, from, to, source) => ({ proto, from, to, source });
     const allOut = [rule('all', null, null, '0.0.0.0/0')];
     const security_groups = [
-      sg(SG.pse, 'zpa-lab-pse-sg', VPC.pse, 'Private Service Edge: client TLS in, SSH from the lab', [rule('tcp', 443, 443, '0.0.0.0/0'), rule('udp', 443, 443, '0.0.0.0/0'), rule('tcp', 22, 22, '10.0.0.0/8')], allOut, [instances[0].id], T('zpa-lab-pse-sg')),
-      sg(SG.conn, 'zpa-lab-connector-sg', VPC.app, 'App Connectors: outbound only, SSH from inside the VPC', [rule('tcp', 22, 22, '10.90.0.0/16')], allOut, [instances[1].id, instances[2].id], T('zpa-lab-connector-sg')),
-      sg(SG.nginx, 'zpa-lab-nginx-sg', VPC.app, 'Protected app: HTTP/S from the connectors only', [rule('tcp', 80, 80, SG.conn), rule('tcp', 443, 443, SG.conn)], allOut, [instances[3].id], T('zpa-lab-nginx-sg')),
-      sg(SG.client, 'zpa-lab-client-sg', VPC.app, 'Windows client: RDP for the demo operator', [rule('tcp', 3389, 3389, '0.0.0.0/0')], allOut, [instances[4].id], T('zpa-lab-client-sg')),
-      sg(SG.dPse, 'default', VPC.pse, 'default VPC security group', [rule('all', null, null, SG.dPse)], allOut, [], {}),
-      sg(SG.dApp, 'default', VPC.app, 'default VPC security group', [rule('all', null, null, SG.dApp)], allOut, [], {}),
+      sg(SG.pse, 'zpa-lab-pse', VPC.a, 'Private Service Edge: client TLS in, SSH from inside the VPC', [rule('tcp', 443, 443, '0.0.0.0/0'), rule('udp', 443, 443, '0.0.0.0/0'), rule('tcp', 22, 22, '10.91.0.0/16')], allOut, [instances[0].id], T('zpa-lab-pse')),
+      sg(SG.conn, 'zpa-lab-connector', VPC.a, 'App Connector: outbound only, SSH from inside the VPC', [rule('tcp', 22, 22, '10.91.0.0/16')], allOut, [instances[1].id], T('zpa-lab-connector')),
+      sg(SG.privConn, 'zpa-lab-priv-connector', VPC.b, 'PRIV App Connector: outbound only', [rule('tcp', 22, 22, '10.90.0.0/16')], allOut, [instances[2].id], T('zpa-lab-priv-connector')),
+      sg(SG.server, 'zpa-lab-server', VPC.b, 'Protected app: 8080 from the PRIV connector only', [rule('tcp', 8080, 8080, SG.privConn), rule('tcp', 22, 22, '10.90.20.0/24')], allOut, [instances[3].id], T('zpa-lab-server')),
+      sg(SG.mcu, 'zpa-lab-mcu-client', VPC.b, 'Windows client: RDP for the demo operator', [rule('tcp', 3389, 3389, '0.0.0.0/0')], allOut, [instances[4].id], T('zpa-lab-mcu-client')),
+      sg(SG.dA, 'default', VPC.a, 'default VPC security group', [rule('all', null, null, SG.dA)], allOut, [], {}),
+      sg(SG.dB, 'default', VPC.b, 'default VPC security group', [rule('all', null, null, SG.dB)], allOut, [], {}),
       sg(SG.dDef, 'default', VPC.def, 'default VPC security group', [rule('all', null, null, SG.dDef)], allOut, [], {}),
     ];
     const region = (r, extra) => Object.assign({ region: r, instances: [], vpcs: [], nat_gateways: [], eips: [], volumes: [], security_groups: [], monthly_usd: 0, resource_count: 0 }, extra || {});
@@ -2369,27 +3211,110 @@ SB.mock = (function () {
   }
   let inv = inventory(false);
 
+  /* ---- topology: the manifest's `topology` block per use case, and a builder that derives the
+          node/edge graph from the inventory exactly the way the backend does (SPEC v1.2) ---- */
+  const MANIFEST_TOPO = {
+    'zpa-private-service-edge': {
+      roles: { 'zpa-lab-pse': 'pse', 'zpa-lab-connector': 'connector', 'zpa-lab-priv-connector': 'connector', 'zpa-lab-server': 'app', 'zpa-lab-mcu-client': 'client' },
+      flows: [
+        { from: 'zpa-lab-mcu-client', to: 'zpa-lab-pse', label: 'dials :443', via: ['nat', 'internet'] },
+        { from: 'zpa-lab-priv-connector', to: 'zpa-lab-pse', label: 'dials :443', via: ['nat', 'internet'] },
+        { from: 'zpa-lab-connector', to: 'zpa-lab-pse', label: 'dials :443 (local)' },
+        { from: 'zpa-lab-priv-connector', to: 'zpa-lab-server', label: ':8080 brokered' },
+        { from: 'zpa-lab-pse', to: 'internet', label: 'control plane :443' },
+      ],
+      blocked: [{ from: 'zpa-lab-mcu-client', to: 'zpa-lab-server', label: 'no route' }],
+    },
+    'zia-cloud-connector-sandbox': {
+      roles: { 'zia-cc': 'connector', 'zia-workload': 'app' },
+      flows: [{ from: 'zia-workload', to: 'zia-cc', label: 'default route' }, { from: 'zia-cc', to: 'internet', label: 'ZIA tunnel :443', via: ['nat', 'internet'] }],
+      blocked: [],
+    },
+  };
+  function topologyFor(ucId, refresh) {
+    const uc = usecases[ucId];
+    const decl = MANIFEST_TOPO[ucId] || null;
+    const base = { generated_at: inv.generated_at, usecase: ucId, provider: uc.provider, region: uc.provider === 'aws' ? 'eu-central-1' : null, nodes: [], edges: [], enrolment: {}, unknown: [], declared: decl };
+    if (uc.provider !== 'aws') return Object.assign(base, { reason: 'Inventory is not built for ' + uc.provider + ' yet, so there is nothing to draw from' });
+    if (!connected.has('aws')) return Object.assign(base, { reason: 'Amazon Web Services is not connected' });
+    if (uc.state === 'off' || (ucId === 'zpa-private-service-edge' && PARAMS.get('topo') === 'off')) return Object.assign(base, { reason: 'The use case is off — nothing tagged ' + 'Project=' + uc.tags.Project + ' is running in eu-central-1' });
+    if (refresh) inv = inventory(true);
+    const r = inv.regions.find(x => x.region === 'eu-central-1');
+    const project = uc.tags.Project;
+    const tagged = x => !!(x && x.tags && x.tags.Project === project);
+    const nodes = [{ id: 'internet', kind: 'internet', label: 'Internet' }], edges = [], unknown = [];
+    const vpcs = r.vpcs.filter(tagged);
+    const vpcIds = new Set(vpcs.map(v => v.id));
+    const instances = r.instances.filter(tagged);
+    if (!vpcs.length && !instances.length) return Object.assign(base, { reason: 'No resources tagged Project=' + project + ' in eu-central-1' + (uc.state === 'turning_on' ? ' yet — the turn-on is still running' : '') });
+    const roles = (decl && decl.roles) || {};
+    for (const v of vpcs) {
+      nodes.push({ id: v.id, kind: 'vpc', label: v.name || v.id, cidr: v.cidr, parent: null, detail: v });
+      for (const sn of v.subnets || []) {
+        const t = sn.default_route; const exposure = !t ? 'isolated' : /^igw-/.test(t) ? 'public' : /^nat-/.test(t) ? 'private' : 'isolated';
+        nodes.push({ id: sn.id, kind: 'subnet', label: sn.name || sn.id, cidr: sn.cidr, parent: v.id, exposure, az: sn.az, detail: sn });
+        if (t) edges.push({ kind: 'route', from: sn.id, to: t, label: '0.0.0.0/0' });
+      }
+      if (v.igw) { nodes.push({ id: v.igw, kind: 'igw', label: 'IGW', parent: v.id }); edges.push({ kind: 'uplink', from: v.igw, to: 'internet' }); }
+    }
+    for (const n of r.nat_gateways) {
+      if (!tagged(n) && !vpcIds.has(n.vpc)) continue;
+      nodes.push({ id: n.id, kind: 'nat', label: n.name || 'NAT', parent: n.vpc, public_ip: n.public_ip, subnet: n.subnet, detail: n });
+      const v = vpcs.find(x => x.id === n.vpc); if (v && v.igw) edges.push({ kind: 'uplink', from: n.id, to: v.igw });
+    }
+    const byName = {};
+    for (const i of instances) {
+      nodes.push({ id: i.id, kind: 'instance', label: i.name || i.id, parent: i.subnet, role: roles[i.name] || null, type: i.type, state: i.state, private_ip: i.private_ip, public_ip: i.public_ip, detail: i });
+      byName[i.name] = i.id;
+      for (const g of i.security_groups || []) { const sg = r.security_groups.find(x => x.id === g.id); for (const rule of (sg && sg.ingress) || []) edges.push({ kind: 'allow', from: rule.source, to: i.id, label: (rule.proto === 'all' ? 'all' : rule.proto + '/' + (rule.from === rule.to ? rule.from : rule.from + '-' + rule.to)) }); }
+    }
+    const instIds = new Set(instances.map(i => i.id)), natIds = new Set(nodes.filter(n => n.kind === 'nat').map(n => n.id));
+    for (const e of r.eips) {
+      const a = e.association;
+      const to = a && a.kind === 'instance' && instIds.has(a.id) ? a.id : a && a.kind === 'nat' && natIds.has(a.id) ? a.id : null;
+      if (to || tagged(e)) nodes.push({ id: e.allocation_id, kind: 'eip', label: e.ip, attached_to: to, detail: e });
+    }
+    const natOf = instId => { const i = instances.find(x => x.id === instId); return nodes.find(n => n.kind === 'nat' && i && n.parent === i.vpc); };
+    const resolve = (name, what) => { if (name === 'internet') return 'internet'; if (byName[name]) return byName[name]; unknown.push({ kind: what, label: name, reason: 'no running instance named ' + name }); return null; };
+    for (const f of (decl && decl.flows) || []) {
+      const from = resolve(f.from, 'flow'), to = resolve(f.to, 'flow'); if (!from || !to) continue;
+      const via = []; let bad = null;
+      for (const v of f.via || []) { if (v === 'internet') via.push('internet'); else if (v === 'nat') { const n = natOf(from); if (n) via.push(n.id); else bad = 'no NAT gateway in the VPC of ' + f.from; } else via.push(v); }
+      if (bad) { unknown.push({ kind: 'flow', label: f.from + ' → ' + f.to, reason: bad }); continue; }
+      edges.push({ kind: 'flow', from, to, via, label: f.label, declared: true });
+    }
+    for (const b of (decl && decl.blocked) || []) { const from = resolve(b.from, 'blocked pair'), to = resolve(b.to, 'blocked pair'); if (from && to) edges.push({ kind: 'blocked', from, to, label: b.label || 'blocked', declared: true }); }
+    const enrolment = {};
+    for (const [k, v] of Object.entries(uc.status || {})) { if (!v || typeof v !== 'object' || !('status' in v)) continue; const id = byName['zpa-lab-' + k.replace(/_/g, '-')]; if (id) enrolment[id] = { authenticated: v.status === 'ZPN_STATUS_AUTHENTICATED', label: k === 'pse' ? 'Private Service Edge' : 'App Connector' }; }
+    return Object.assign(base, { generated_at: inv.generated_at, nodes, edges, enrolment, unknown });
+  }
 
-  const PSE_DESC = `## What it builds
 
-A **ZPA Private Service Edge** in its own VPC (\`10.91.0.0/16\`) so client traffic terminates
-inside the lab instead of on a public broker, plus a segmented application VPC (\`10.90.0.0/16\`)
-with two App Connectors, an nginx test server and a Windows client.
+  const PSE_DESC = `A reproducible **Zscaler Private Access — Private Service Edge** built end to end in AWS
+\`eu-central-1\`, with unattended provisioning-key enrolment. The network is the drawing above:
+structure from the live inventory, dashed flows from this manifest.
 
-### Components
+## What turning it on does
 
-1. \`zpa-lab-pse\` — m5.large, elastic IP, enrols against the PSE group
-2. \`zpa-lab-connector-a\` / \`-b\` — t3.medium, private subnet behind the NAT
-3. \`zpa-lab-nginx\` — t3.micro, the protected application
-4. \`zpa-lab-win-client\` — t3.medium, Zscaler Client Connector installed via user-data
+Creates the ZPA groups and provisioning keys (prefixed \`AWS-Lab\`, reused if present), seeds the
+keys into SSM Parameter Store as \`SecureString\`, applies the infrastructure, and waits until the
+Service Edge and both App Connectors report \`ZPN_STATUS_AUTHENTICATED\`. Each instance reads its
+own key from SSM at boot through its IAM role and self-enrols.
 
-Provisioning keys are created by \`scripts/zpa_create.py\` through OneAPI and seeded into SSM
-Parameter Store; the instances pull them at boot. State lives in S3 with \`use_lockfile\`.
+## What turning it off does
 
-> Turning this off destroys every instance and both VPCs. The ZPA objects (segments, groups)
-> are left in place so the next turn-on is fast.
+\`tofu destroy\` removes every AWS resource. The ZPA groups and keys deliberately survive; the enrolled
+components show as disconnected in the ZPA portal until the next turn-on.
 
-See the [lab repository](https://github.com/nilsujma-dev/zs-zpa-private-service-edge-lab) for the runbook.`;
+## Cost
+
+About **$285/month** at on-demand list price while on; zero when off. No vendor licensing: the ZPA
+AMIs bill as plain \`RunInstances\`. The Clouds page shows the live figure under \`Project=zpa-pse-lab\`.
+
+## Sharing
+
+Self-contained. The only shared object is the ZPA tenant; no VPC, segment, server group or policy is
+shared with anything else. See the [lab repository](https://github.com/nilsujma-dev/zs-zpa-private-service-edge-lab) for the runbook.`;
 
   const PROC_PSE = {
     on: [
@@ -2436,7 +3361,7 @@ See the [lab repository](https://github.com/nilsujma-dev/zs-zpa-private-service-
       summary: 'A Private Service Edge in an isolated VPC, plus a segmented client/server VPC.',
       state: 'on', resources: 5, description: PSE_DESC, procedure: PROC_PSE,
       source: { git: 'https://github.com/nilsujma-dev/zs-zpa-private-service-edge-lab.git', ref: 'main', commit: '8c1f4e2a9b3d7c6e5f4a3b2c1d0e9f8a7b6c5d4e' },
-      status: { pse: { enrolled: true, status: 'ZPN_STATUS_AUTHENTICATED', version: '25.62.1' }, connector_a: { status: 'ZPN_STATUS_AUTHENTICATED' }, connector_b: { status: 'ZPN_STATUS_AUTHENTICATED' }, client: { app_segment: 'zpa-lab-nginx', reachable: true }, checked_at: iso(40000) },
+      status: { pse: { enrolled: true, status: 'ZPN_STATUS_AUTHENTICATED', version: '25.62.1' }, connector: { status: 'ZPN_STATUS_AUTHENTICATED' }, priv_connector: { status: PARAMS.get('enrol') === 'partial' ? 'ZPN_STATUS_DISCONNECTED' : 'ZPN_STATUS_AUTHENTICATED' }, client: { app_segment: 'zpa-lab-server', reachable: true }, checked_at: iso(40000) },
       runs: [], tags: { Project: 'zpa-pse-lab' },
     },
     'zpa-branch-connector-pair': {
@@ -2945,7 +3870,7 @@ tofu -chdir=terraform apply
   /* ---- outline fixtures: a real-looking plan per use case and action ---- */
   const PSE_ADDRS = [
     'aws_vpc.pse', 'aws_vpc.app',
-    'aws_subnet.pse_public', 'aws_subnet.app_public', 'aws_subnet.app_private', 'aws_subnet.app_server', 'aws_subnet.app_client',
+    'aws_subnet.public', 'aws_subnet.b_public', 'aws_subnet.priv', 'aws_subnet.mcu',
     'aws_internet_gateway.pse', 'aws_internet_gateway.app',
     'aws_nat_gateway.app',
     'aws_eip.pse', 'aws_eip.nat',
@@ -2955,7 +3880,7 @@ tofu -chdir=terraform apply
     'aws_security_group.pse', 'aws_security_group.connector', 'aws_security_group.nginx', 'aws_security_group.client',
     'aws_vpc_security_group_ingress_rule.pse_tls_tcp', 'aws_vpc_security_group_ingress_rule.pse_tls_udp', 'aws_vpc_security_group_ingress_rule.pse_ssh', 'aws_vpc_security_group_ingress_rule.connector_ssh', 'aws_vpc_security_group_ingress_rule.nginx_http', 'aws_vpc_security_group_ingress_rule.nginx_https',
     'aws_vpc_security_group_egress_rule.pse', 'aws_vpc_security_group_egress_rule.connector', 'aws_vpc_security_group_egress_rule.nginx', 'aws_vpc_security_group_egress_rule.client',
-    'aws_instance.pse', 'aws_instance.connector[0]', 'aws_instance.connector[1]', 'aws_instance.nginx', 'aws_instance.win_client',
+    'aws_instance.pse', 'aws_instance.connector', 'aws_instance.priv_connector', 'aws_instance.server', 'aws_instance.mcu_client',
     'aws_iam_role.zpa', 'aws_iam_instance_profile.zpa', 'aws_iam_role_policy.ssm_read',
     'aws_key_pair.lab',
     'aws_network_acl.app',
@@ -3002,7 +3927,8 @@ tofu -chdir=terraform apply
   }
 
   /* ---- scenes: ?scene=checklist&provider=gcp&shown=3&fail=1  ?scene=form&provider=azure&mode=rotate
-          ?page=usecases&expand=<id>&code=1&confirm=1  ?region=eu-central-1&inst=<instance id> ---- */
+          ?page=usecases&expand=<id>&code=1&confirm=1  ?region=eu-central-1&inst=<instance id>
+          ?topo=off (PSE drawing in its off state)  ?topo=fail (OT relay drawing errors)  ?enrol=partial (one lamp red)  ?node=<id> (a node selected in the drawing) ---- */
   function scene(state) {
     const page = PARAMS.get('page');
     if (page === 'usecases' || page === 'clouds') location.hash = '#/' + page;
@@ -3018,13 +3944,14 @@ tofu -chdir=terraform apply
       state.connect = { provider: prov, mode: PARAMS.get('mode') || 'connect', stage: shown >= rep.checks.length ? 'done' : 'checking', fields: FORMS[prov], values: {}, fieldErrors: {}, report: rep, shown, error: null, busy: true };
     }
     if (PARAMS.get('expand')) state.expanded = PARAMS.get('expand');
+    if (PARAMS.get('expand') && PARAMS.get('node')) state.topo[PARAMS.get('expand')] = { loading: false, data: null, err: null, width: 0, sel: { node: PARAMS.get('node') }, refocus: null };
   }
   async function sceneAfter(state) {
     if (PARAMS.get('scene') === 'form') await openConnect(PARAMS.get('provider') || 'aws', PARAMS.get('mode') || 'connect');
     const id = PARAMS.get('expand');
     if (id && usecases[id]) {
       await loadDetail(id);
-      loadOutline(id, 'on'); loadOutline(id, 'off');
+      loadOutline(id, 'on'); loadOutline(id, 'off'); await loadTopology(id);
       if (PARAMS.get('code') === '1') await toggleCode(usecases[id]);
       if (PARAMS.get('confirm') === '1') { if (!ucById(id)) await loadUsecases(true); if (ucById(id)) requestFlip(ucById(id)); }
     }
@@ -3066,6 +3993,7 @@ tofu -chdir=terraform apply
     },
     usecases: async () => { await need(); return Object.values(usecases).map(listItem); },
     usecase: async (id) => { await need(); const uc = usecases[id]; if (!uc) throw new ApiError('No such use case.', 404, 'not_found'); return Object.assign(listItem(uc), { description: uc.description, procedure: uc.procedure, source: uc.source, status: uc.status, runs: uc.runs.slice(0, 20) }); },
+    topology: async (id, refresh) => { await need(); const uc = usecases[id]; if (!uc) throw new ApiError('No such use case.', 404, 'not_found'); await sleep(refresh ? 900 : 350); if (id === 'ot-edge-relay' && PARAMS.get('topo') === 'fail') throw new ApiError('Inventory scan failed: RequestLimitExceeded', 502, 'inventory_failed'); return topologyFor(id, refresh); },
     outline: async (id, action) => {
       await need(); const uc = usecases[id]; if (!uc) throw new ApiError('No such use case.', 404, 'not_found');
       if (action !== 'on' && action !== 'off') throw new ApiError("Unknown action '" + action + "'", 400, 'bad_action');
@@ -3087,7 +4015,7 @@ tofu -chdir=terraform apply
     job: async (jobId) => { await need(); const j = jobs[jobId]; if (!j) throw new ApiError('No such job.', 404, 'not_found'); return { id: j.id, usecase: j.usecase, action: j.action, state: j.state, steps: j.steps.map(s => Object.assign({}, s)), started: j.started, ended: j.ended }; },
     jobLog: async (jobId, since) => { await need(); const j = jobs[jobId]; if (!j) throw new ApiError('No such job.', 404, 'not_found'); since = since || 0; return { lines: j._lines.slice(since), next: j._lines.length }; },
   };
-  return { api, usecases, jobs, scene, sceneAfter, report, reportGcp, reportAzure, outlineFor, inventory };
+  return { api, usecases, jobs, scene, sceneAfter, report, reportGcp, reportAzure, outlineFor, inventory, topologyFor, MANIFEST_TOPO };
 })();
 
 /* ==========================================================================

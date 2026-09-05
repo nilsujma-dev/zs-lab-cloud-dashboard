@@ -1007,3 +1007,165 @@ tr.is-flash td { animation: flash-row 1.6s var(--ease); }
 .probe-table td { padding: 6px 8px; border-bottom: 1px solid var(--border-soft, var(--border)); vertical-align: top; }
 .probe-table td.mono { font-family: var(--mono); }
 .table-scroll { overflow-x: auto; }
+
+/* ==========================================================================
+   v1.2 — topology drawing (inline SVG), inspector, legend, off-state schematic
+   ========================================================================== */
+.topo-block { margin-bottom: 24px; }
+.topo-head { align-items: flex-start; }
+.topo-headings { display: flex; flex-direction: column; gap: 3px; }
+.topo-hint { color: var(--text-faint); font-size: 12px; }
+.topo-tools { display: flex; align-items: center; gap: 12px; flex: none; }
+.topo-when { font-size: 11.5px; color: var(--text-dim); }
+.topo-when span { color: var(--text); }
+
+.topo-stage { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; align-items: start; }
+@media (min-width: 1500px) { .topo-stage { grid-template-columns: minmax(0, 1fr) 248px; } }
+.topo-stage.is-loading { position: relative; }
+.topo-loading { position: absolute; top: 16px; left: 16px; }
+.topo-canvas {
+  overflow-x: auto; overflow-y: hidden; overscroll-behavior-x: contain;
+  border: 1px solid var(--line); border-radius: var(--radius-lg);
+  background: var(--bg-inset);
+  background-image: radial-gradient(var(--line-faint) 1px, transparent 1px); background-size: 16px 16px;
+  padding: 4px 0; text-align: center;
+}
+.topo-canvas:focus-visible { outline-offset: -2px; }
+.topo-svg { display: inline-block; vertical-align: top; max-width: none; font-family: var(--font-sans); }
+.topo-svg text { fill: var(--text); user-select: none; -webkit-user-select: none; }
+.topo-svg .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+
+/* nodes */
+.tn { cursor: pointer; outline: none; }
+.tn .tn-box { transition: stroke .12s var(--ease), fill .12s var(--ease); }
+.tn:focus-visible .tn-box { stroke: var(--focus); stroke-width: 2; }
+.tn-vpc .tn-box { fill: var(--bg-panel); stroke: var(--line-strong); stroke-width: 1.2; }
+.tn-vpc-name { font-size: 13px; font-weight: 600; }
+.tn-vpc-cidr { font-size: 11.5px; fill: var(--text-dim); }
+.tn-note { font-size: 11px; fill: var(--text-faint); font-style: italic; }
+.tn-subnet .tn-box { fill: var(--bg-raised); stroke: var(--line); stroke-width: 1; }
+.tn-exp-public .tn-box { stroke-dasharray: none; }
+.tn-exp-isolated .tn-box { stroke-dasharray: 4 3; }
+.tn-sub-name { font-size: 12px; font-weight: 600; }
+.tn-sub-cidr { font-size: 11px; fill: var(--text-dim); }
+.badge rect { fill: var(--bg-inset); stroke: var(--line-strong); }
+.badge text { font-family: var(--font-mono); font-size: 9.5px; letter-spacing: .1em; text-transform: uppercase; fill: var(--text-dim); }
+.tn-exp-public .badge rect { stroke: var(--accent); }
+.tn-exp-public .badge text { fill: var(--accent); }
+.tn-exp-private .badge text { fill: var(--text); }
+.tn-exp-isolated .badge rect { stroke-dasharray: 2 2; }
+.tn-instance .tn-box { fill: var(--bg-panel); stroke: var(--line-strong); }
+.tn-name { font-size: 12px; font-weight: 600; }
+.tn-sub { font-size: 10.5px; fill: var(--text-dim); }
+.glyph path, .glyph circle, .glyph rect { fill: none; stroke: var(--text-dim); stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; }
+.glyph .fill { fill: var(--text-dim); stroke: none; }
+.tn-role-pse .glyph path, .tn-role-pse .glyph circle { stroke: var(--accent); }
+.tn-role-pse .glyph .fill { fill: var(--accent); }
+.tn-role-pse .tn-box { stroke: var(--accent); }
+.tn-lamp { fill: var(--bg-inset); stroke: var(--line-strong); stroke-width: 1; }
+.lamp-on .tn-lamp { fill: var(--accent); stroke: var(--accent); filter: drop-shadow(0 0 4px var(--accent-glow)); }
+.lamp-bad .tn-lamp { fill: var(--bad); stroke: var(--bad); }
+.lamp-running .tn-lamp { fill: var(--text-faint); stroke: var(--text-faint); }
+.tn-gw .tn-box { fill: var(--bg-raised); stroke: var(--line-strong); stroke-width: 1.2; }
+.tn-gw-name { font-family: var(--font-mono); font-size: 10.5px; letter-spacing: .1em; font-weight: 600; }
+.tn-igw .tn-box { stroke: var(--text-dim); }
+.tn-internet .tn-box { fill: var(--bg-raised); stroke: var(--text-dim); stroke-width: 1.4; stroke-dasharray: 6 4; }
+.tn-inet-name { font-size: 13px; font-weight: 600; letter-spacing: .04em; }
+.tn-eip .tn-box { fill: var(--bg-inset); stroke: var(--accent); stroke-width: 1; }
+.tn-eip-ip { font-size: 10.5px; fill: var(--text); }
+.tn-eip.is-idle .tn-box { stroke: var(--bad); stroke-dasharray: 3 2; }
+.tn-eip.is-idle .tn-eip-ip { fill: var(--bad); }
+.tray-box { fill: none; stroke: var(--line-strong); stroke-dasharray: 3 3; }
+.tray-title { font-family: var(--font-mono); font-size: 9.5px; letter-spacing: .1em; text-transform: uppercase; fill: var(--text-faint); }
+
+/* edges */
+.te-hit { fill: none; stroke: transparent; stroke-width: 12; pointer-events: stroke; cursor: pointer; }
+.te-line { fill: none; stroke-linejoin: round; stroke-linecap: butt; pointer-events: none; transition: stroke .12s var(--ease), opacity .12s var(--ease); }
+.te-route .te-line { stroke: var(--line-strong); stroke-width: 1; }
+.te-uplink .te-line { stroke: var(--text-dim); stroke-width: 1.6; }
+.te-dot { fill: var(--text-dim); }
+.te-flow .te-line { stroke: var(--accent); stroke-width: 1.5; stroke-dasharray: 5 4; }
+.te-blocked .te-line { stroke: var(--bad); stroke-width: 1.4; }
+.te-strike { fill: none; stroke: var(--bad); stroke-width: 2; stroke-linecap: round; pointer-events: none; }
+.mk path { fill: var(--accent); }
+.te-label {
+  font-family: var(--font-mono); font-size: 10.5px; fill: var(--text); pointer-events: none; opacity: 0;
+  paint-order: stroke; stroke: var(--bg-inset); stroke-width: 4px; stroke-linejoin: round;
+  transition: opacity .12s var(--ease);
+}
+.te-blocked .te-label { fill: var(--bad); }
+.te-flow .te-label { fill: var(--accent); }
+.te.is-hi .te-label { opacity: 1; }
+
+/* hover / focus emphasis: the chosen thing stays, everything else recedes */
+.topo-svg.is-focus .tn:not(.is-hi) { opacity: .38; }
+.topo-svg.is-focus .te:not(.is-hi) .te-line, .topo-svg.is-focus .te:not(.is-hi) .te-strike, .topo-svg.is-focus .te:not(.is-hi) .te-dot { opacity: .22; }
+.topo-svg.is-focus .tn-vpc:not(.is-hi), .topo-svg.is-focus .tn-subnet:not(.is-hi), .topo-svg.is-focus .topo-tray { opacity: .75; }
+.topo-svg.is-focus .tn-subnet:not(.is-hi) .tn-box, .topo-svg.is-focus .tn-vpc:not(.is-hi) .tn-box { opacity: .6; }
+.tn.is-hi .tn-box { stroke: var(--accent); stroke-width: 1.6; }
+.tn.is-hi.tn-eip.is-idle .tn-box { stroke: var(--bad); }
+.te.is-hi .te-line { stroke-width: 2.2; }
+.te-route.is-hi .te-line { stroke: var(--text); }
+.te-uplink.is-hi .te-line { stroke: var(--text); }
+.te-flow.is-hi .te-line { stroke-dasharray: 6 3; }
+
+/* off-state schematic: greyed, declared only */
+.topo-stage.is-off .topo-canvas { background-image: none; }
+.topo-stage.is-off .topo-svg { filter: grayscale(1); opacity: .72; }
+.topo-stage.is-off .tn-instance .tn-box, .topo-stage.is-off .tn-subnet .tn-box, .topo-stage.is-off .tn-vpc .tn-box { stroke-dasharray: 4 3; }
+.topo-offbar { grid-column: 1 / -1; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 12.5px; padding: 8px 12px; border: 1px dashed var(--line-strong); border-radius: var(--radius); }
+.topo-offbar .dim { color: var(--text-dim); }
+.topo-offbar-run { margin-left: auto; font-size: 11.5px; color: var(--text-dim); }
+.topo-offstate { padding: 28px 24px; border: 1px dashed var(--line-strong); border-radius: var(--radius-lg); text-align: center; }
+.topo-off-title { font-weight: 600; margin-bottom: 4px; }
+.topo-off-reason { color: var(--text-dim); font-size: 13px; }
+.topo-off-hint { color: var(--text-faint); font-size: 12.5px; margin-top: 8px; }
+
+/* inspector */
+.topo-inspector { border: 1px solid var(--line); border-radius: var(--radius-lg); background: var(--bg-raised); padding: 12px 14px; min-height: 96px; font-size: 12.5px; }
+.ti-kicker { font-family: var(--font-mono); font-size: 10px; letter-spacing: .12em; text-transform: uppercase; color: var(--text-dim); }
+.ti-title { font-size: 14px; font-weight: 600; margin: 2px 0 8px; word-break: break-word; }
+.ti-title.ti-edge-flow { color: var(--accent); }
+.ti-title.ti-edge-blocked { color: var(--bad); }
+.ti-hint { color: var(--text-faint); font-size: 12px; margin: -4px 0 8px; }
+.ti-row { display: grid; grid-template-columns: 84px minmax(0, 1fr); gap: 8px; padding: 4px 0; border-top: 1px solid var(--line-faint); }
+.ti-k { color: var(--text-dim); font-family: var(--font-mono); font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase; padding-top: 2px; }
+.ti-v { min-width: 0; word-break: break-word; }
+.ti-v .mono { font-size: 12px; }
+.ti-v .ok { color: var(--ok); }
+.ti-v .bad { color: var(--bad); }
+.ti-v .dim { color: var(--text-faint); }
+.ti-list { display: grid; gap: 2px; }
+.ti-world { color: var(--accent); }
+.ti-open { margin-top: 10px; }
+@media (max-width: 1499px) {
+  .topo-insp-body { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 0 24px; align-items: start; }
+  .ti-rows { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 0 20px; }
+  .ti-open { margin-top: 8px; }
+}
+
+/* legend */
+.topo-legend { display: flex; align-items: center; gap: 6px 16px; flex-wrap: wrap; margin-top: 10px; font-size: 11.5px; color: var(--text-dim); }
+.lg-item { display: inline-flex; align-items: center; gap: 6px; }
+.lg-sw { width: 44px; height: 14px; }
+.lg-sw path { fill: none; }
+.lg-route { stroke: var(--line-strong); stroke-width: 1; }
+.lg-uplink { stroke: var(--text-dim); stroke-width: 1.6; }
+.lg-flow { stroke: var(--accent); stroke-width: 1.5; stroke-dasharray: 5 4; }
+.lg-blocked { stroke: var(--bad); stroke-width: 1.4; }
+.lg-strike { stroke: var(--bad); stroke-width: 2; stroke-linecap: round; }
+.lg-sep { width: 1px; height: 14px; background: var(--line-strong); }
+.lg-lamp { width: 8px; height: 8px; border-radius: 50%; background: var(--bg-inset); border: 1px solid var(--line-strong); display: inline-block; }
+.lg-lamp.on { background: var(--accent); border-color: var(--accent); box-shadow: 0 0 4px var(--accent-glow); }
+.lg-lamp.bad { background: var(--bad); border-color: var(--bad); }
+.lg-lamp.running { background: var(--text-faint); border-color: var(--text-faint); }
+.lg-badge { font-family: var(--font-mono); font-size: 9.5px; letter-spacing: .1em; text-transform: uppercase; padding: 1px 6px; border-radius: 3px; border: 1px solid var(--line-strong); }
+.lg-exp-public { color: var(--accent); border-color: var(--accent); }
+.lg-exp-private { color: var(--text); }
+.lg-exp-isolated { border-style: dashed; color: var(--text-faint); }
+.lg-glyph { width: 16px; height: 16px; }
+.lg-glyph path, .lg-glyph circle, .lg-glyph rect { fill: none; stroke: var(--text-dim); stroke-width: 1.5; stroke-linejoin: round; stroke-linecap: round; }
+.lg-glyph .fill { fill: var(--text-dim); stroke: none; }
+.topo-unknown { margin-top: 8px; font-size: 12px; color: var(--text); }
+.topo-unknown .mono { font-size: 11.5px; }
+.topo-unknown .dim { color: var(--text-faint); }

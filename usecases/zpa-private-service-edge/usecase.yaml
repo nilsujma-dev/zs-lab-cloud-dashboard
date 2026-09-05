@@ -8,10 +8,9 @@ description: |                          # markdown; the card shows it
   provisioning-key enrolment. Source:
   [zs-zpa-private-service-edge-lab](https://github.com/nilsujma-dev/zs-zpa-private-service-edge-lab).
 
-  The drawing above is generated from the live AWS inventory; structure comes from AWS,
-  the dashed flows are declared in this manifest. Two isolated VPCs with no link between
-  them; VPC B's private zones reach the Private Service Edge only by leaving through the NAT
-  and coming back in over the internet, and the MCU client has no route to the PRIV server.
+  The drawing above is generated from the live AWS inventory: boxes and lines come from
+  AWS, the dashed flows and the blocked pair are declared in this manifest. Hover anything
+  for its facts; click it to open the region drawer.
 
   ## What turning it on does
 
