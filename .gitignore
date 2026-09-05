@@ -1,0 +1,45 @@
+# Local config & secrets — never commit
+*.local.conf
+.env
+.env.*
+secrets/
+config/local*
+*.pem
+*.key
+credentials*
+
+# Runtime state
+state/
+*.log
+*.csv.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!example.tfvars
+.terraform.lock.hcl
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# --- Switchboard --------------------------------------------------------------
+.env
+data/
+tmpdata/
+*.tfstate
+*.tfstate.*
+*.tfplan
+.terraform/
+ui-shots/
