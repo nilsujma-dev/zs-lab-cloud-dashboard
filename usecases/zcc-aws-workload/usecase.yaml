@@ -96,7 +96,7 @@ secrets:                                # host-provided; engine maps these in
   - name: Create ZPA connector group and app segment
     run: python3 scripts/zpa_create.py
   - name: Create CC admin, templates and secret
-    run: python3 scripts/ztw_create.py && python3 scripts/put_cc_secret.py
+    run: python3 scripts/ztw_create.py --allow-super-admin && python3 scripts/put_cc_secret.py
   - name: Seed provisioning key into SSM
     run: python3 scripts/put_keys_ssm.py
   - name: Apply infrastructure
