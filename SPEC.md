@@ -596,3 +596,90 @@ use case that is off). Add `&provider=<id>` to preselect.
   selected, and the keyboard focus ring, into `scratchpad/ui-shots/v13/`.
 - No change outside `app/static/`. No external requests. All existing behaviour — card
   expand, topology, outline, drawer return path — unchanged.
+
+---
+
+# v1.4 delta — the off state draws what ON would deploy
+
+Product owner, on the v1.2 off state (a "roles" strip under an Internet node): *"It doesn't
+show what would be deployed if someone hits the ON button. The experience between both
+should be the same, although clearly to understand what is deployed and what not."*
+
+## Principle
+
+One drawing, two registers. When the use case is on, the graph comes from the cloud
+(**deployed**). When it is off, the *same* graph — VPCs, subnets, instances, gateways,
+addresses, routes, flows — comes from a real `tofu plan` of the use case (**planned**),
+because the plan is the truthful answer to "what happens if I hit ON". Layout, glyphs,
+hover, legend and inspector are identical; only the register changes. The v1.2 "declared
+topology" roles schematic is retired; it remains only as the last fallback when no plan can
+be made (provider disconnected).
+
+## Backend — `GET /api/usecases/{id}/topology` when the use case is off
+
+- **One plan, two consumers.** The ON outline already runs `tofu plan -json`. Unify: a
+  single `_plan(manifest, "on")` runs `tofu plan -json -out=<planfile>` (never apply; the
+  plan file lives in the checkout dir and is deleted after use), parses the JSON stream for
+  the outline as today, and runs `tofu show -json <planfile>` for the graph. One cache
+  (60 s, `?refresh=1` re-plans, invalidated when a job ends) serves both endpoints, so the
+  outline's resource count and the drawing's are the same number from the same plan.
+- **Graph from the plan.** Build the same node/edge vocabulary as v1.2 from
+  `planned_values.root_module.resources` (types, names, known attributes: CIDRs, tags,
+  instance types, protocols/ports) plus `configuration.root_module.resources[].expressions`
+  references for structure (subnet→vpc, instance→subnet, instance→security groups,
+  NAT→subnet and →EIP, EIP→instance, route tables→routes→gateway, associations→subnet,
+  rule→group and →source). Node `id` is the resource address (`aws_instance.pse`); `label`
+  is `tags.Name` else the resource name. Attributes unknown until apply (private/public IPs,
+  allocation ids) are `null` — never invented. Subnet `exposure` from the associated route
+  table's default route target, as v1.2. Flows/blocked from the manifest resolved by Name
+  as today; `enrolment` is `{}`.
+- **Type mapping is a table.** `app/usecases/plan_graph.py` is provider-neutral; an AWS
+  table maps resource types to kinds (`aws_vpc→vpc`, `aws_subnet→subnet`,
+  `aws_instance→instance`, `aws_nat_gateway→nat`, `aws_internet_gateway→igw`,
+  `aws_eip→eip`, and the linking types: route tables, routes, associations, security
+  groups and rules). Nothing AWS-specific escapes the table and `detail`.
+- **Every node carries `source: {path, line}`** — the file (relative to the use-case repo
+  root, the same path form `GET /usecases/{id}/code` accepts) and the line where
+  `resource "<type>" "<name>"` is declared in `terraform_dir`. Live (deployed) nodes get
+  the same field when the address can be matched from state (`tofu state list` ↔ tags), else
+  omit it.
+- **Response additions:** `register: "deployed" | "planned"`; when planned also
+  `plan: {generated_at, resources: <count of create changes>, error?}`. A failed plan
+  returns `nodes: []`, `reason`, `register: "planned"`, and the error scrubbed. When the
+  provider is disconnected, `nodes: []`, `reason: "Connect <provider> to plan …"`, and
+  `declared` (v1.2) for the fallback.
+- **Tests:** a hand-built `tofu show -json` fixture modelled on the PSE lab's terraform
+  (2 VPCs, 4 subnets with route tables and associations, 5 instances, NAT, 2 IGWs, 3 EIPs,
+  security groups with the 443 rules) → same counts and exposures as the live fixture, ids
+  are addresses, IPs null, flows resolved through the NAT, blocked pair, `source` lines
+  resolved against a temp checkout containing the resource blocks, outline and topology
+  share one plan run (assert the runner is invoked once for both). No cloud, no tofu binary
+  in tests (monkeypatch the runner).
+
+## Frontend — one drawing, two registers
+
+- **Planned register:** the same `topoLayout`/`topoSvg` path with the planned graph. VPCs,
+  subnets and cards keep their exact shapes and positions; the register is expressed by
+  dashed container strokes, a subtle diagonal hatch on subnet fills, hollow enrolment lamps,
+  and value slots reading `assigned at ON` (mono, muted) where IPs and addresses are null.
+  A banner above the drawing replaces "NOT RUNNING": `PLANNED · this is what ON deploys ·
+  45 resources · plan 2 min ago` with the last-run note kept at the right. When on, the
+  banner reads `DEPLOYED · eu-central-1 · generated 1 min ago` — same bar, two registers.
+- **Legend** gains the register pair: `deployed` (solid) / `planned` (dashed, hatched).
+- **Inspector** works identically, header `PLANNED · not deployed` or `DEPLOYED`; a
+  `source` row `main.tf:112` on every node that has one.
+- **Click:** deployed → region drawer (v1.2). Planned → nothing exists in the cloud, so
+  click/Enter opens the card's **code view** at `source.path`, scrolled to `source.line`
+  with the resource block flashed. The inspector button reads `Open source` in that case.
+- **Fallbacks:** plan failed → the error verbatim with Retry; provider disconnected → the
+  v1.2 declared schematic, labelled as such.
+- **Mock:** `&topo=planned` renders the planned PSE graph (ids as addresses, null IPs,
+  `source` lines); `&topo=planfail`; `&topo=disconnected`.
+
+## Definition of done (v1.4)
+
+- Off state shows the full lab as it will be deployed, from a real plan; on state
+  unchanged; the two are visibly the same drawing in two registers.
+- Outline and topology agree on the resource count from one plan run.
+- Tests green, no cloud in tests; screenshots at 1280/1920, dark/light: planned, deployed,
+  hover in each, click-through to source, plan-failed, disconnected — `ui-shots/v14/`.
