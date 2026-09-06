@@ -1937,6 +1937,54 @@ function renderJobPanel(uc, d, entry) {
   return block;
 }
 
+/* v1.6 — the prune bookkeeping the probe carries: flat counts under `stale`, a short
+   `keys` list. Both are rendered on purpose (a line and a table) instead of being
+   flattened into the key/value grid, so `stale.count` never shows up as a lone number. */
+const STALE_KINDS = [
+  ['connectors', 'connector', 'connectors'],
+  ['service_edges', 'service edge', 'service edges'],
+  ['cc_vms', 'CC VM', 'CC VMs'],
+  ['cc_groups', 'CC group', 'CC groups'],
+  ['locations', 'location', 'locations'],
+];
+
+/** `stale entries: 3 connectors · 1 CC group` — zero kinds omitted, `none` when all zero. */
+function renderStale(stale) {
+  if (!stale || typeof stale !== 'object' || Array.isArray(stale)) return null;
+  const parts = [];
+  let summed = 0;
+  for (const [key, one, many] of STALE_KINDS) {
+    const n = Number(stale[key]);
+    if (!Number.isFinite(n) || n <= 0) continue;
+    summed += n;
+    parts.push(n + ' ' + (n === 1 ? one : many));
+  }
+  const total = Number.isFinite(Number(stale.count)) ? Number(stale.count) : summed;
+  const text = parts.length ? parts.join(' · ') : total > 0 ? total + (total === 1 ? ' entry' : ' entries') : 'none';
+  const row = h('div', { class: 'probe-stale' + (total > 0 ? ' is-stale' : '') },
+    h('span', { class: 'lamp' + (total > 0 ? ' on' : '') }),
+    h('span', { class: 'k' }, 'stale entries:'),
+    h('span', { class: 'v' }, text));
+  if (stale.last_prune) {
+    const n = Number(stale.last_prune_deleted);
+    row.appendChild(h('span', { class: 'when' }, 'last prune ' + fmtTime(stale.last_prune) + (Number.isFinite(n) ? ' · ' + n + ' deleted' : '')));
+  }
+  return row;
+}
+
+/** Provisioning keys: type · name · usage/max, the current one marked. */
+function renderKeys(rows) {
+  const cols = ['type', 'name', 'usage'].filter(c => rows.some(r => r[c] != null));
+  const usage = (r) => r.usage != null ? String(r.usage) : r.max != null ? String(r.used != null ? r.used : '?') + '/' + r.max : '—';
+  const t = h('table', { class: 'drawer-table probe-table probe-keys' },
+    h('thead', null, h('tr', null, cols.map(c => h('th', null, c)))),
+    h('tbody', null, rows.map(r => h('tr', { class: r.current ? 'is-current' : null }, cols.map(c =>
+      h('td', { class: 'mono' },
+        h('span', null, c === 'usage' ? usage(r) : r[c] == null ? '—' : String(r[c])),
+        c === 'name' && r.current ? h('span', { class: 'chip chip-current' }, 'current') : null))))));
+  return h('div', { class: 'table-scroll' }, t);
+}
+
 function renderProbe(d) {
   const block = h('div', { class: 'detail-block' });
   block.appendChild(h('div', { class: 'section-title', style: 'margin-bottom:8px' }, 'Status probe'));
@@ -1951,10 +1999,17 @@ function renderProbe(d) {
     else if (Array.isArray(v)) items.push([prefix, v.map(cell).join(', ')]);
     else items.push([prefix, cell(v)]);
   }
-  walk('', s);
+  const keys = Array.isArray(s.keys) && s.keys.length && s.keys.every(k => k && typeof k === 'object' && !Array.isArray(k)) ? s.keys : null;
+  for (const k of Object.keys(s)) { if (k === 'stale' || (k === 'keys' && keys)) continue; walk(k, s[k]); }
+  const stale = renderStale(s.stale);
+  if (stale) block.appendChild(stale);
   if (items.length > 24) { block.appendChild(h('pre', { class: 'probe-raw' }, JSON.stringify(s, null, 2))); return block; }
   block.appendChild(h('div', { class: 'probe' }, items.map(([k, v]) =>
     h('div', { class: 'probe-item' }, h('span', { class: 'k' }, k), h('span', { class: 'v' + tone(v) }, v)))));
+  if (keys) {
+    block.appendChild(h('div', { class: 'section-title', style: 'margin:12px 0 6px' }, 'provisioning keys (' + keys.length + ')'));
+    block.appendChild(renderKeys(keys));
+  }
   for (const [name, rows] of tables) {
     // Columns in first-seen order; drop ids that only mean something to the backend.
     const cols = [...new Set(rows.flatMap(r => Object.keys(r)))].filter(c => !/^(group_id|id)$/.test(c));
@@ -3983,11 +4038,15 @@ shared with anything else. See the [lab repository](https://github.com/nilsujma-
     on: [
       { name: 'Create ZPA groups and keys', run: 'python3 scripts/zpa_create.py' },
       { name: 'Create PRIV connector group', run: 'python3 scripts/zpa_create_priv.py' },
+      { name: 'Prune stale entries', run: 'python3 scripts/prune.py --phase on-pre --apply' },
       { name: 'Seed provisioning keys into SSM', run: 'python3 scripts/put_keys_ssm.py' },
       { name: 'Apply infrastructure', run: 'tofu -chdir=terraform apply -auto-approve -input=false' },
       { name: 'Wait for enrolment', run: 'python3 scripts/wait_enrolled.py --timeout 900' },
     ],
-    off: [{ name: 'Destroy infrastructure', run: 'tofu -chdir=terraform destroy -auto-approve -input=false' }],
+    off: [
+      { name: 'Destroy infrastructure', run: 'tofu -chdir=terraform destroy -auto-approve -input=false' },
+      { name: 'Prune stale entries', run: 'python3 scripts/prune.py --phase off --apply' },
+    ],
   };
   const PROC_BRANCH = {
     on: [
@@ -4007,16 +4066,21 @@ shared with anything else. See the [lab repository](https://github.com/nilsujma-
       { name: 'Preflight quotas and secret', run: 'python3 scripts/preflight.py' },
       { name: 'Create ZPA connector group and app segment', run: 'python3 scripts/zpa_create.py' },
       { name: 'Create CC admin, templates and secret', run: 'python3 scripts/ztw_create.py && python3 scripts/put_cc_secret.py' },
+      { name: 'Prune stale entries', run: 'python3 scripts/prune.py --phase on-pre --apply' },
       { name: 'Seed provisioning key into SSM', run: 'python3 scripts/put_keys_ssm.py' },
       { name: 'Apply infrastructure', run: 'tofu -chdir=terraform apply -auto-approve -input=false' },
       { name: 'Wait for CC and connector registration', run: 'python3 scripts/wait_registered.py --timeout 1200' },
       { name: 'Forward the app segment to ZPA', run: 'python3 scripts/ztw_policy.py' },
       { name: 'Allow the lab CC group to the private app', run: 'python3 scripts/zpa_policy.py' },
       { name: 'ZIA URL and DLP policy', run: 'python3 scripts/zia_policy.py' },
+      { name: 'Prune superseded CC group and location', run: 'python3 scripts/prune.py --phase on-post --apply' },
       { name: 'Verify nothing pre-existing changed', run: 'python3 scripts/tenant_verify.py' },
       { name: 'Wait for egress and ZPA evidence', run: 'python3 scripts/wait_evidence.py --timeout 600' },
     ],
-    off: [{ name: 'Destroy infrastructure', run: 'tofu -chdir=terraform destroy -auto-approve -input=false' }],
+    off: [
+      { name: 'Destroy infrastructure', run: 'tofu -chdir=terraform destroy -auto-approve -input=false' },
+      { name: 'Prune stale entries', run: 'python3 scripts/prune.py --phase off --apply' },
+    ],
   };
   const CC_DESC = `A reproducible **Zscaler Cloud Connector** lab built end to end in AWS \`eu-central-1\`: one
 migrated workload whose internet egress goes out through ZIA and whose only private application
@@ -4061,7 +4125,13 @@ traffic that is not this lab's. See the [lab repository](https://github.com/nils
       summary: 'A Private Service Edge in an isolated VPC, plus a segmented client/server VPC.',
       state: TOPO_MODE === 'planned' || TOPO_MODE === 'planfail' ? 'off' : 'on', resources: TOPO_MODE === 'planned' || TOPO_MODE === 'planfail' ? 0 : 5, cost_monthly: TOPO_MODE === 'planned' || TOPO_MODE === 'planfail' ? 0 : 284.89, description: PSE_DESC, procedure: PROC_PSE,
       source: { git: 'https://github.com/nilsujma-dev/zs-zpa-private-service-edge-lab.git', ref: 'main', commit: '8c1f4e2a9b3d7c6e5f4a3b2c1d0e9f8a7b6c5d4e' },
-      status: TOPO_MODE === 'planned' || TOPO_MODE === 'planfail' ? null : { pse: { enrolled: true, status: 'ZPN_STATUS_AUTHENTICATED', version: '25.62.1' }, connector: { status: 'ZPN_STATUS_AUTHENTICATED' }, priv_connector: { status: PARAMS.get('enrol') === 'partial' ? 'ZPN_STATUS_DISCONNECTED' : 'ZPN_STATUS_AUTHENTICATED' }, client: { app_segment: 'zpa-lab-server', reachable: true }, checked_at: iso(40000) },
+      status: TOPO_MODE === 'planned' || TOPO_MODE === 'planfail' ? null : { pse: { enrolled: true, status: 'ZPN_STATUS_AUTHENTICATED', version: '25.62.1' }, connector: { status: 'ZPN_STATUS_AUTHENTICATED' }, priv_connector: { status: PARAMS.get('enrol') === 'partial' ? 'ZPN_STATUS_DISCONNECTED' : 'ZPN_STATUS_AUTHENTICATED' }, client: { app_segment: 'zpa-lab-server', reachable: true }, checked_at: iso(40000),
+        stale: { count: 3, connectors: 2, service_edges: 1, cc_vms: 0, cc_groups: 0, locations: 0, last_prune: iso(9000000), last_prune_deleted: 4 },
+        keys: [
+          { type: 'connector', name: 'AWS-Lab CONNECTOR_GRP key v2', usage: '7/200', current: true },
+          { type: 'connector', name: 'AWS-Lab PRIV CONNECTOR_GRP key v2', usage: '7/200', current: true },
+          { type: 'service edge', name: 'AWS-Lab SERVICE_EDGE_GRP key v2', usage: '8/200', current: true },
+          { type: 'connector', name: 'AWS-Lab CONNECTOR_GRP key v1', usage: '5/5', current: false }] },
       runs: [], tags: { Project: 'zpa-pse-lab' },
     },
     'zpa-branch-connector-pair': {
@@ -4077,8 +4147,10 @@ traffic that is not this lab's. See the [lab repository](https://github.com/nils
       summary: 'A migrated workload keeps internet and private-app access under zero trust through a Cloud Connector.',
       state: PLANNED ? 'off' : 'on', resources: PLANNED ? 0 : 4, cost_monthly: PLANNED ? 0 : 192.43, procedure: PROC_CC, description: CC_DESC,
       source: { git: 'https://github.com/nilsujma-dev/zs-zcc-aws-workload-lab.git', ref: 'main', commit: '3f9a1c7e5b2d4068a1c3e5f70982b4d6c8e0a2f4' },
-      status: PLANNED ? null : { healthy: true, summary: 'Cloud Connector and App Connector registered; all six checks pass',
+      status: PLANNED ? null : { healthy: true, summary: 'Cloud Connector and App Connector registered; all six checks pass, 2 stale entries',
         region: 'eu-central-1', checked_at: iso(52000),
+        stale: { count: 2, connectors: 1, service_edges: 0, cc_vms: 1, cc_groups: 0, locations: 0, last_prune: iso(1800000), last_prune_deleted: 3 },
+        keys: [{ type: 'connector', name: 'AWS-Lab ZCC CONNECTOR_GRP key v1', usage: '2/200', current: true }],
         components: [
           { id: 'cc', label: 'Cloud Connector', authenticated: true, control_channel: 'ACTIVE', private_ip: '10.92.200.11', version: '4.7.1', group: 'AWS-Lab ZCC' },
           { id: 'connector', label: 'App Connector', authenticated: true, control_channel: 'ZPN_STATUS_AUTHENTICATED', private_ip: '10.93.10.10', version: '25.62.1' }],
@@ -4501,6 +4573,8 @@ on:
     run: python3 scripts/zpa_create.py
   - name: Create PRIV connector group
     run: python3 scripts/zpa_create_priv.py
+  - name: Prune stale entries
+    run: python3 scripts/prune.py --phase on-pre --apply
   - name: Seed provisioning keys into SSM
     run: python3 scripts/put_keys_ssm.py
   - name: Apply infrastructure
@@ -4510,6 +4584,8 @@ on:
 off:
   - name: Destroy infrastructure
     run: tofu -chdir=terraform destroy -auto-approve -input=false
+  - name: Prune stale entries
+    run: python3 scripts/prune.py --phase off --apply
 status:
   run: python3 scripts/status.py --json
   interval_s: 60
@@ -5046,6 +5122,7 @@ import json
 import sys
 from datetime import datetime, timezone
 
+import prune
 from oneapi import Client, creds_from_env
 
 if __name__ == "__main__":
@@ -5054,6 +5131,9 @@ if __name__ == "__main__":
     for name in ("pse", "connector_a", "connector_b"):
         obj = client.find("connector" if "connector" in name else "serviceEdge", name=f"zpa-lab-{name.replace('_', '-')}")
         out[name] = {"status": obj["status"] if obj else "MISSING"}
+    # What prune.py would delete on its next run: flat counts, detail stays in the job log.
+    out["stale"] = prune.counts(client)
+    out["keys"] = prune.key_usage(client)
     out["checked_at"] = datetime.now(timezone.utc).isoformat()
     json.dump(out, sys.stdout)
 `,
@@ -5097,7 +5177,7 @@ Infrastructure for the **ZPA Private Service Edge** lab, driven by Switchboard.
 ## Layout
 
 - \`terraform/\` — two VPCs, five instances, one NAT
-- \`scripts/\` — OneAPI helpers, enrolment wait, status probe
+- \`scripts/\` — OneAPI helpers, enrolment wait, status probe, stale-entry prune
 - \`tools/cost.py\` — the cost estimate Switchboard is checked against
 
 ## Running by hand
@@ -5137,6 +5217,8 @@ secrets:                                # host-provided; engine maps these in
     run: python3 scripts/zpa_create.py
   - name: Create CC admin, templates and secret
     run: python3 scripts/ztw_create.py && python3 scripts/put_cc_secret.py
+  - name: Prune stale entries
+    run: python3 scripts/prune.py --phase on-pre --apply
   - name: Seed provisioning key into SSM
     run: python3 scripts/put_keys_ssm.py
   - name: Apply infrastructure
@@ -5149,6 +5231,8 @@ secrets:                                # host-provided; engine maps these in
     run: python3 scripts/zpa_policy.py
   - name: ZIA URL and DLP policy
     run: python3 scripts/zia_policy.py
+  - name: Prune superseded CC group and location
+    run: python3 scripts/prune.py --phase on-post --apply
   - name: Verify nothing pre-existing changed
     run: python3 scripts/tenant_verify.py
   - name: Wait for egress and ZPA evidence
@@ -5156,6 +5240,8 @@ secrets:                                # host-provided; engine maps these in
 "off":
   - name: Destroy infrastructure
     run: tofu -chdir=terraform destroy -auto-approve -input=false
+  - name: Prune stale entries
+    run: python3 scripts/prune.py --phase off --apply
 status:                                 # optional; must print JSON on stdout
   run: python3 scripts/status.py --json
   interval_s: 60

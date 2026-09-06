@@ -28,24 +28,33 @@ description: |                          # markdown; the card shows it
      connector reads at boot. Everything is prefixed `AWS-Lab ZCC`, created only
      if missing and resolved by name — the tenant's existing API key is read,
      never regenerated, because production Branch Connectors use it.
-  3. **Seed the provisioning key into SSM** — the App Connector key goes straight
+  3. **Prune stale entries** — stale entries from earlier rebuilds are pruned
+     before apply: disconnected App Connectors and Cloud Connector VMs whose EC2
+     instance no longer exists. Ownership is decided by membership of the
+     `AWS-Lab` groups, never by an entry's name and never by its status.
+  4. **Seed the provisioning key into SSM** — the App Connector key goes straight
      from ZPA into SSM Parameter Store as a `SecureString`. Credentials are never
      written to disk, never put in `user_data`, never stored in OpenTofu state.
-  4. **Apply infrastructure** — `tofu apply` builds both VPCs, subnets, routing,
+  5. **Apply infrastructure** — `tofu apply` builds both VPCs, subnets, routing,
      NACLs, security groups, the NAT gateway, the elastic IP, the Cloud
      Connector's two interfaces and the four instances. Each instance reads what
      it needs at boot through its IAM role and registers itself; no console login.
-  5. **Wait for registration, then write policy** — the Cloud Connector group and
+  6. **Wait for registration, then write policy** — the Cloud Connector group and
      the ZIA location only exist once the connector dials in, so the forwarding
      rule, the ZPA access rule and the ZIA URL and DLP rules are written after
      registration and scoped to the lab's own group and location. A rule with no
      group would apply to every connector in the tenant; scoping is not optional.
-  6. **Wait for evidence** — runs the demo's checks on the workload itself and
+  7. **Prune superseded CC group and location** — the previous ZIA location is
+     unreferenced only once the rules point at the new one, so the superseded
+     empty Cloud Connector group and that location are removed here, after the
+     re-scope.
+  8. **Wait for evidence** — runs the demo's checks on the workload itself and
      reports each one: egress is ZIA, a blocked URL is blocked, a DLP pattern is
      blocked, the private app answers, the direct path to it does not.
 
-  Every rebuild consumes one use of the connector provisioning key (`maxUsage 25`)
-  and leaves a stale, disconnected entry for the previous instance.
+  Every rebuild consumes one use of the connector provisioning key. **Nothing
+  accumulates:** stale entries are pruned at OFF and again before ON, and the
+  status probe carries the count that is left.
 
   ## What turning it off does
 
@@ -53,11 +62,12 @@ description: |                          # markdown; the card shows it
   network interfaces, NAT gateway, elastic IP, subnets and both VPCs. Nothing
   keeps billing.
 
-  **Zscaler objects deliberately survive**, and so does the Secrets Manager
-  secret. The groups, templates, application segment and policy rules live
-  outside OpenTofu; the registered Cloud Connector and the enrolled App Connector
-  simply show as disconnected until the next turn-on. Pruning them is manual on
-  purpose.
+  **The Zscaler groups, templates, rules and the Secrets Manager secret
+  deliberately survive**; the entries enrolled inside them do not. They live
+  outside OpenTofu, so a prune step runs after the destroy: stale disconnected
+  entries in the lab's own groups are deleted, and one ZIA location survives until
+  the next ON — a rule whose location list emptied would apply to the whole
+  organisation, so the location the lab's rules point at is never a candidate.
 
   ## Cost
 
@@ -97,6 +107,8 @@ secrets:                                # host-provided; engine maps these in
     run: python3 scripts/zpa_create.py
   - name: Create CC admin, templates and secret
     run: python3 scripts/ztw_create.py --allow-super-admin && python3 scripts/put_cc_secret.py
+  - name: Prune stale entries
+    run: python3 scripts/prune.py --phase on-pre --apply
   - name: Seed provisioning key into SSM
     run: python3 scripts/put_keys_ssm.py
   - name: Apply infrastructure
@@ -109,6 +121,8 @@ secrets:                                # host-provided; engine maps these in
     run: python3 scripts/zpa_policy.py --allow-unlinked
   - name: ZIA URL and DLP policy
     run: python3 scripts/zia_policy.py
+  - name: Prune superseded CC group and location
+    run: python3 scripts/prune.py --phase on-post --apply
   - name: Verify nothing pre-existing changed
     run: python3 scripts/tenant_verify.py
   - name: Wait for egress and ZPA evidence
@@ -116,6 +130,8 @@ secrets:                                # host-provided; engine maps these in
 "off":
   - name: Destroy infrastructure
     run: tofu -chdir=terraform destroy -auto-approve -input=false
+  - name: Prune stale entries
+    run: python3 scripts/prune.py --phase off --apply
 status:                                 # optional; must print JSON on stdout
   run: python3 scripts/status.py --json
   interval_s: 60
@@ -131,14 +147,16 @@ effects:                                # what happens OUTSIDE OpenTofu; the liv
       - "Secrets Manager ZS/CC/credentials/aws-lab-zcc in eu-central-1 holding the deployment admin's credentials — created only if absent, never overwritten, never printed"
       - "Two SSM parameters under /zcc-lab/: the connector provisioning key (SecureString) and the Cloud Connector provisioning URL (String)"
       - "A registered Cloud Connector and an enrolled App Connector once the instances boot (~5-10 minutes)"
+      - "Nothing accumulates: stale entries from earlier rebuilds are pruned before apply, and the superseded Cloud Connector group and ZIA location once the rules have been re-scoped — inside the AWS-Lab groups only, decided by group membership"
     retains: []
   "off":
     destroys:
       - "Everything OpenTofu manages in this use case: both VPCs and all their subnets, routes, NACLs and security groups, the internet gateways, the NAT gateway and its elastic IP, the Cloud Connector's two network interfaces, all four instances and their volumes, the IAM roles and instance profiles — see the plan"
+      - "The disconnected App Connector entry and the registered Cloud Connector VM of this run: after the destroy, stale disconnected entries in the lab's own groups are deleted; one ZIA location survives until the next ON"
     retains:
       - "The Secrets Manager secret ZS/CC/credentials/aws-lab-zcc — the next ON reuses it rather than minting a second admin"
-      - "Every AWS-Lab ZCC object in ZPA, Cloud & Branch Connector and ZIA, including the auto-created connector group and ZIA location — inert while nothing is registered; pruning them is deliberately manual"
-      - "The registered Cloud Connector and App Connector entries, which show as disconnected and accumulate one per rebuild"
+      - "Every AWS-Lab ZCC object in ZPA, Cloud & Branch Connector and ZIA: the groups, templates, application segment and policy rules — inert while nothing is registered, reused by name on the next ON"
+      - "The current ZIA location and its now-empty Cloud Connector group: the lab's URL and DLP rules still name that location, and a rule whose location list emptied would apply to the whole organisation — it is retired at the next ON, after the rules have been re-scoped"
       - "The two SSM parameters under /zcc-lab/ (harmless; overwritten on the next ON)"
       - "The S3 state object (versioned, so this OFF is recoverable) and the remote lock"
 

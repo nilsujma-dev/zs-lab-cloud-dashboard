@@ -146,13 +146,17 @@ def test_manifest_loads_with_the_contracted_shape(manifest) -> None:
     assert manifest.terraform_dir == "terraform" and manifest.state_key == "usecases/zcc-aws-workload/terraform.tfstate"
     assert manifest.tags == {"Project": "zcc-workload-lab"} and manifest.secrets == ("zscaler_oneapi",)
     assert manifest.status is not None and manifest.status.run == "python3 scripts/status.py --json" and manifest.status.interval_s == 60
+    # v1.6: two prune hooks in ON — after the create scripts (the groups resolve by name) and
+    # after the ZIA re-scope (only then is the superseded location unreferenced) — and one at OFF.
     assert [s.name for s in manifest.on] == [
         "Baseline the tenant", "Preflight quotas and secret", "Create ZPA connector group and app segment",
-        "Create CC admin, templates and secret", "Seed provisioning key into SSM", "Apply infrastructure",
-        "Wait for CC and connector registration", "Forward the app segment to ZPA",
+        "Create CC admin, templates and secret", "Prune stale entries", "Seed provisioning key into SSM",
+        "Apply infrastructure", "Wait for CC and connector registration", "Forward the app segment to ZPA",
         "Allow the lab CC group to the private app", "ZIA URL and DLP policy",
+        "Prune superseded CC group and location",
         "Verify nothing pre-existing changed", "Wait for egress and ZPA evidence"]
-    assert [s.run for s in manifest.off] == ["tofu -chdir=terraform destroy -auto-approve -input=false"]
+    assert [s.run for s in manifest.off] == ["tofu -chdir=terraform destroy -auto-approve -input=false",
+                                             "python3 scripts/prune.py --phase off --apply"]
     assert manifest.topology.roles == {"zcc-lab-cc": "cloud-connector", "zcc-lab-workload": "workload",
                                        "zcc-lab-app-connector": "connector", "zcc-lab-app": "app"}
     assert len(manifest.topology.flows) == 4 and len(manifest.topology.blocked) == 1
@@ -169,7 +173,7 @@ def test_it_is_listed_beside_the_pse_lab(logged_in, tmp_path: Path) -> None:
     card = cards["zcc-aws-workload"]
     assert card["name"] == "Cloud Connector — AWS workload zero trust" and card["state"] in ("off", "unknown")
     detail = logged_in.get("/api/usecases/zcc-aws-workload").json()
-    assert len(detail["procedure"]["on"]) == 12 and detail["procedure"]["on"][3]["name"] == "Create CC admin, templates and secret"
+    assert len(detail["procedure"]["on"]) == 14 and detail["procedure"]["on"][3]["name"] == "Create CC admin, templates and secret"
     assert "$192/month" in detail["description"]
 
 

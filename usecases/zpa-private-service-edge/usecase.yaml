@@ -20,27 +20,34 @@ description: |                          # markdown; the card shows it
      the run can prove it touched nothing else.
   2. **Create PRIV connector group** — the second App Connector Group and key for
      the PRIV zone.
-  3. **Seed provisioning keys into SSM** — the keys go straight from ZPA into SSM
+  3. **Prune stale entries** — stale entries from earlier rebuilds are pruned
+     before apply, so nothing the lab waits on can latch onto a dead record.
+     Ownership is decided by membership of the `AWS-Lab` groups, never by an
+     entry's name and never by its status; an authenticated entry is kept and
+     reported, never deleted.
+  4. **Seed provisioning keys into SSM** — the keys go straight from ZPA into SSM
      Parameter Store as `SecureString`. They are never written to disk, never put
      in `user_data`, never stored in OpenTofu state.
-  4. **Apply infrastructure** — `tofu apply` builds both VPCs, subnets, routing,
+  5. **Apply infrastructure** — `tofu apply` builds both VPCs, subnets, routing,
      security groups, the NAT gateway, elastic IPs and the five instances. Each
      instance reads its own key from SSM at boot through its IAM role and
      self-enrols; no OAuth code, no console login.
-  5. **Wait for enrolment** — polls ZPA until the Service Edge and both App
+  6. **Wait for enrolment** — polls ZPA until the Service Edge and both App
      Connectors report `ZPN_STATUS_AUTHENTICATED` (up to 15 minutes).
 
-  Every rebuild consumes one use of each provisioning key (`maxUsage 25`) and leaves
-  a stale, disconnected entry in ZPA for the previous instance.
+  Every rebuild consumes one use of each provisioning key. **Nothing accumulates:**
+  stale entries are pruned at OFF and again before ON, and the status probe carries
+  the count that is left.
 
   ## What turning it off does
 
   `tofu destroy` removes **every AWS resource** in the lab: instances, volumes, NAT
   gateway, elastic IPs, subnets and both VPCs. Nothing keeps billing.
 
-  **ZPA objects deliberately survive.** The groups and provisioning keys live
-  outside OpenTofu; the enrolled Service Edge and App Connectors simply show as
-  disconnected in the ZPA admin portal until the next turn-on.
+  **The ZPA groups and keys deliberately survive**; the entries enrolled inside them
+  do not. They live outside OpenTofu, so a prune step runs after the destroy: stale
+  disconnected entries in the lab's own groups are deleted, and anything it cannot
+  prove is the lab's own is left alone and reported.
 
   ## Cost
 
@@ -72,6 +79,8 @@ secrets:                                # host-provided; engine maps these in
     run: python3 scripts/zpa_create.py
   - name: Create PRIV connector group
     run: python3 scripts/zpa_create_priv.py
+  - name: Prune stale entries
+    run: python3 scripts/prune.py --phase on-pre --apply
   - name: Seed provisioning keys into SSM
     run: python3 scripts/put_keys_ssm.py
   - name: Apply infrastructure
@@ -81,6 +90,8 @@ secrets:                                # host-provided; engine maps these in
 "off":
   - name: Destroy infrastructure
     run: tofu -chdir=terraform destroy -auto-approve -input=false
+  - name: Prune stale entries
+    run: python3 scripts/prune.py --phase off --apply
 status:                                 # optional; must print JSON on stdout
   run: python3 scripts/status.py --json
   interval_s: 60
@@ -93,13 +104,15 @@ effects:                                # what happens OUTSIDE OpenTofu; the liv
       - "ZPA Service Edge Group, App Connector Groups and provisioning keys — reused by name if they already exist, never duplicated"
       - "Three SSM SecureString parameters under /zpa-lab/ holding the provisioning keys (overwritten on every run)"
       - "An enrolled Service Edge and two App Connectors in ZPA once the instances boot and dial in (~3 minutes)"
+      - "Nothing accumulates: stale entries from earlier rebuilds are pruned before apply — inside the AWS-Lab groups only, decided by group membership, with the candidate list in the job log"
     retains: []
   "off":
     destroys:
       - "Everything OpenTofu manages in this use case: both VPCs and all their subnets, routes, NACLs and security groups, the NAT gateway, both elastic IPs, all five instances and their volumes, the IAM role and instance profile — see the plan"
+      - "The disconnected Service Edge and App Connector entries of this run: after the destroy, stale disconnected entries in the lab's own groups are deleted, one DELETE per entry in the log"
     retains:
       - "ZPA Service Edge Group, App Connector Groups and provisioning keys — deleting these is deliberately manual"
-      - "The enrolled Service Edge and App Connector entries in ZPA, which will show as disconnected and accumulate one per rebuild"
+      - "Any lab entry the prune deliberately kept (still authenticated, too young, or an ownership check that was not unambiguous) — the status probe counts it under stale and the next ON prunes it before apply"
       - "The three SSM parameters under /zpa-lab/ (harmless; overwritten on the next ON)"
       - "The S3 state object (versioned, so this OFF is recoverable) and the remote lock"
 

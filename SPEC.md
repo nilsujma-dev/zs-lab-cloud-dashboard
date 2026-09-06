@@ -799,3 +799,103 @@ and the secret that holds its credentials are one idea and the contract names th
   second AWS use case in both registers, and `&labs=real` trims the mock to the two use cases
   that actually ship (the others exist only to give the v1.3 rail a running and a failed card);
   screenshots at 1280 dark and light in `scratchpad/ui-shots/v15/`.
+
+---
+
+# v1.6 delta — stale entries are pruned, and the card says so
+
+The two labs enrol into a **shared** Zscaler tenant, and every rebuild left a disconnected entry
+behind. The lab repos gain a `prune.py` that deletes them; the architecture note
+(`prune-architecture.md`, §1 ownership, §2 hooks, §5 safety) is the contract. Switchboard owes it
+three things: the steps in the manifests, the counts in the status probe, and card text that no
+longer says pruning is manual. **No API and no schema change** — steps are `name` + `run`, and the
+status probe's JSON already passes through untouched.
+
+## A. The status probe — `stale` and `keys`
+
+`status.py --json` gains two optional keys. Everything else in the probe is unchanged, and a probe
+without them renders exactly as before.
+
+```json
+"stale": {"count": 3, "connectors": 1, "service_edges": 0, "cc_vms": 1, "cc_groups": 0,
+          "locations": 1, "last_prune": "2026-09-06T18:02:11Z", "last_prune_deleted": 4},
+"keys": [{"type": "connector", "name": "AWS-Lab ZCC CONNECTOR_GRP key v1", "usage": "2/200", "current": true}]
+```
+
+- `stale` is **flat counts**, never nested per-object detail: the per-entry lines live in the job
+  log (`prune.py --json`), which is where a decision about one entry belongs. `count` is the total;
+  a kind the lab does not have is `0` (the PSE lab has no `cc_*` or `locations`). `last_prune` /
+  `last_prune_deleted` describe the last run that actually deleted something.
+- `keys` is a **list of records** (`type`, `name`, `usage` as `used/max`, `current`), so
+  `renderProbe`'s existing "array of records → table" rule already has the right shape; the current
+  key of each type is flagged rather than ordered first, because the list is short and the order is
+  the tenant's.
+- `summary` gains `, N stale entries` when `N > 0`. `healthy` is **not** affected by a stale count:
+  a stale entry is bookkeeping, not a broken lab.
+
+## B. Frontend — one line and one table
+
+In the status-probe block, above the key/value grid:
+
+- **The stale line.** `stale entries: 3 connectors · 1 service edge · 1 CC group`, kinds in a fixed
+  order (connectors, service edges, CC VMs, CC groups, locations), singular and plural spelled out,
+  **zero kinds omitted**, and `none` when everything is zero. A **lamp: amber when the total is
+  > 0**, unlit when it is zero — the same lamp vocabulary the rest of the panel uses, so "there is
+  something left over" reads at a glance without turning the card red. `last prune <time> · N
+  deleted` follows in dim text when the probe carries it.
+- **The keys table.** `type · name · usage`, small and mono, the current key marked with a
+  `current` chip. It is rendered by the same table code as any other array of records, given its
+  own column order and the chip; `keys` and `stale` are taken out of the generic walk so they
+  cannot also appear as flattened `stale.count` items.
+
+The topology inspector is **unchanged**: `stale` is use-case bookkeeping, not a property of a node,
+and a component whose probe carries it maps to its instance exactly as before (`_parse_components`
+ignores keys it does not know).
+
+## C. Manifests
+
+Steps (`name` ≤ 40 chars, `name` + `run` only), placed where the architecture note puts the hooks —
+OFF after the destroy, ON after the create scripts and before the SSM seed and `tofu apply`, and
+for the CC lab once more after `ZIA URL and DLP policy`, because the superseded ZIA location is
+only unreferenced after the rules have been re-scoped:
+
+```yaml
+# zpa-private-service-edge          # zcc-aws-workload
+"on":                               "on":
+  … Create PRIV connector group       … Create CC admin, templates and secret
+  - name: Prune stale entries         - name: Prune stale entries
+    run: python3 scripts/prune.py --phase on-pre --apply
+  … Seed provisioning keys into SSM   … ZIA URL and DLP policy
+                                      - name: Prune superseded CC group and location
+                                        run: python3 scripts/prune.py --phase on-post --apply
+"off":                              "off":
+  - name: Destroy infrastructure      - name: Destroy infrastructure
+  - name: Prune stale entries         - name: Prune stale entries
+    run: python3 scripts/prune.py --phase off --apply
+```
+
+`--apply` is explicit in the manifest because `prune.py` is dry-run by default; the phase names the
+hook, so one script serves all three placements and the log line says which one ran.
+
+## D. Card text
+
+The declared `effects` are what the confirm dialog reads out, so they carry the change:
+
+- ON `creates` gains "Nothing accumulates: stale entries from earlier rebuilds are pruned before
+  apply" (the CC lab's line also names the superseded group and location after the re-scope).
+- OFF `destroys` gains "stale disconnected entries in the lab's own groups are deleted" — and for
+  the CC lab "one ZIA location survives until the next ON".
+- OFF `retains` no longer says entries "accumulate one per rebuild" or that pruning is "deliberately
+  manual". What it retains now is what the prune deliberately keeps: an entry it could not prove was
+  the lab's own, and the CC lab's current ZIA location with its empty group.
+- The descriptions lose "leaves a stale, disconnected entry" and gain the prune step in the numbered
+  ON list.
+
+## Definition of done (v1.6)
+
+- Both manifests load and `GET /api/usecases/{id}` lists the new steps in the contracted order:
+  six ON / two OFF for the PSE lab, fourteen ON / two OFF for the CC lab.
+- A probe carrying `stale` and `keys` renders the stale line (amber lamp when > 0, `none` when all
+  zero) and the keys table, and still maps its components onto instances in the drawing.
+- Tests green with no cloud calls, and no deploy from this change; screenshots of both cards'
+  probe blocks at 1280 dark in `scratchpad/ui-shots/v16/`.
