@@ -10,8 +10,14 @@ envelope) are shared with `plan_graph.py`, which fills the same vocabulary from 
 instead of the cloud (SPEC v1.4): one drawing, two registers.
 
 Node kinds:   internet · vpc · subnet · instance · nat · igw · eip
-Edge kinds:   route (subnet → gateway, its default route) · uplink (nat → igw, igw → internet)
-              · allow (security-rule source → instance) · flow / blocked (declared in the manifest)
+Edge kinds:   route (subnet → gateway *or an appliance instance*, its default route)
+              · uplink (nat → igw, igw → internet) · allow (security-rule source → instance)
+              · flow / blocked (declared in the manifest)
+
+A default route can also point at a network interface rather than a gateway (SPEC v1.5): the
+subnet's traffic is steered into an appliance — a Cloud Connector — and is `inspected` rather
+than merely private. The interface is resolved to the instance that owns it through the
+inventory's own ENI records, never by recognising an id format.
 """
 
 from __future__ import annotations
@@ -46,7 +52,9 @@ def _default_route_target(subnet: dict[str, Any], route_tables: dict[str, dict[s
 
 def _exposure(target: str | None, subnet: dict[str, Any], igws: set[str], nats: set[str]) -> str:
     """public: default route to an internet gateway; private: to a NAT (or any other egress
-    device); isolated: no default route at all. The inventory's own `public` flag is honoured."""
+    device); isolated: no default route at all. The inventory's own `public` flag is honoured.
+    `inspected` (a default route into an appliance's interface) is decided by the caller, which
+    is the only place that can resolve an interface to the instance behind it."""
     if not target:
         return "isolated"
     if target in igws or subnet.get("public") is True:
@@ -141,6 +149,9 @@ class Graph:
                     subnet_vpc[sn["id"]] = vpc["id"]
         instances = [i for i in region.get("instances", []) or [] if i.get("id") and i.get("state") != "terminated"]
         nats = {n["id"]: n for n in region.get("nat_gateways", []) or [] if n.get("id")}
+        # A default route may point at a network interface; only the ENI record says whose it is.
+        enis = {e["id"]: e for e in region.get("network_interfaces", []) or [] if e.get("id")}
+        instance_ids = {i["id"] for i in instances}
 
         tagged_vpcs = {vid for vid, v in vpcs.items() if _tagged(v, tags)}
         tagged_instances = [i for i in instances if _tagged(i, tags)]
@@ -181,15 +192,24 @@ class Graph:
                 self.add({"id": vpc["igw"], "kind": "igw", "label": "IGW", "parent": vid, "region": region_name, "tagged": vid in tagged_vpcs,
                           "detail": {"id": vpc["igw"], "vpc": vid}})
 
+        # Subnet -> the appliance instance its default route steers into, and the interface it goes through.
+        inspected: list[tuple[str, str, dict[str, Any] | None]] = []
         for sid in sorted(want_subnets, key=lambda s: (subnets[s].get("cidr") or "", s)):
             sn = subnets[sid]
             target = _default_route_target(sn, route_tables)
-            self.add({
+            eni = enis.get(target or "")
+            owner = (eni or {}).get("instance") or (target if target in instance_ids else None)
+            node = {
                 "id": sid, "kind": "subnet", "label": sn.get("name") or sid, "cidr": sn.get("cidr"), "parent": subnet_vpc.get(sid),
                 "az": sn.get("az"), "exposure": _exposure(target, sn, igw_ids, want_nats), "default_route": target, "region": region_name,
                 "tagged": _tagged(sn, tags) or subnet_vpc.get(sid) in tagged_vpcs, "detail": dict(sn),
-            })
-            if target and (target in want_nats or target in igw_ids and target in self.nodes):
+            }
+            if owner:
+                # Steered into an appliance: the drawing names the instance, not the interface id.
+                node["exposure"], node["default_route"] = "inspected", owner
+                inspected.append((sid, owner, eni))
+            self.add(node)
+            if target and not owner and (target in want_nats or target in igw_ids and target in self.nodes):
                 self.add_edge({"kind": "route", "from": sid, "to": target, "label": DEFAULT_ROUTE})
 
         for nid in sorted(want_nats):
@@ -222,6 +242,17 @@ class Graph:
                                      "reason": "Tagged instance is not in any subnet or VPC the inventory describes"})
                 continue
             self.add(node)
+
+        # The appliance routes, now that the instances they point at exist as nodes.
+        for sid, owner, eni in inspected:
+            if owner not in self.nodes:
+                self.unknown.append({"kind": "route", "id": sid, "label": self.nodes[sid]["label"], "region": region_name,
+                                     "reason": f"Default route steers into instance {owner}, which this use case does not describe"})
+                continue
+            edge: dict[str, Any] = {"kind": "route", "from": sid, "to": owner, "label": DEFAULT_ROUTE, "inspected": True}
+            if eni:
+                edge["eni"] = {"id": eni.get("id"), "name": eni.get("name"), "private_ip": eni.get("private_ip")}
+            self.add_edge(edge)
 
         # Elastic IPs: tagged, or bound to a node that is drawn.
         for eip in region.get("eips", []) or []:

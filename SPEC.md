@@ -683,3 +683,119 @@ be made (provider disconnected).
 - Outline and topology agree on the resource count from one plan run.
 - Tests green, no cloud in tests; screenshots at 1280/1920, dark/light: planned, deployed,
   hover in each, click-through to source, plan-failed, disconnected — `ui-shots/v14/`.
+
+---
+
+# v1.5 delta — a second use case, and routes that end at an appliance
+
+The second use case, **Cloud Connector — AWS workload zero trust** (`zcc-aws-workload`), arrives
+as a manifest. Almost everything it needs already exists: the drawing, the two registers, the
+outline, the code view and the region drawer are use-case-neutral by construction. Three things
+do not exist yet, and they are what this delta adds.
+
+The lab: one workload in a cloud VPC whose **default route points at a Cloud Connector's service
+interface**, and a private application in a second, unconnected VPC reached through an App
+Connector. Repo `nilsujma-dev/zs-zcc-aws-workload-lab`, tag `Project=zcc-workload-lab`,
+`eu-central-1`. The build contract for the lab repo is its own `DECISIONS.md`; this section is
+only what Switchboard owes it.
+
+## A. Two new roles
+
+`topology.roles` already accepts any string; the frontend has to know these two.
+
+| role | word | glyph |
+|---|---|---|
+| `cloud-connector` | Cloud Connector | a shield with an arrow through it — traffic passing through something that inspects it |
+| `workload` | Workload | a two-tier server stack |
+
+`ROLE_RANK` gains them (`pse · cloud-connector · connector · app · client · workload`) so
+instances still sort deterministically inside a subnet. Nothing else in the drawing changes.
+
+## B. `inspected` — a default route that ends at an appliance, not a gateway
+
+A subnet whose `0.0.0.0/0` points at a **network interface** is not `private` and it is certainly
+not `isolated`: its traffic is steered into an appliance that inspects it. That is the whole
+point of the use case, so the drawing has to say it.
+
+- **New subnet exposure `inspected`**, alongside `public` / `private` / `isolated`. Badge: amber
+  outline, label `INSPECTED`, in the subnet header and in the legend. Ranked between `public` and
+  `private` when subnets are ordered inside a VPC.
+- **The route resolves to the instance, not the interface.** The subnet node carries
+  `exposure: "inspected"` and `default_route: <instance>` (id in the deployed register, resource
+  address in the planned one), and a `route` edge runs subnet → instance with
+  `inspected: true` and `eni: {id, name, private_ip}` naming the interface it goes through.
+  Drawing an ENI as its own node was rejected: it is a port on a box that is already drawn.
+- **Neither builder recognises an id format.** `topology.py` resolves the target through the
+  inventory's own ENI records; `plan_graph.py` resolves it through the plan's references. An
+  interface whose owner is not part of the use case leaves the subnet `inspected` with **no**
+  edge and an `unknown` entry saying which instance is missing — never an invented line.
+
+### Live register — `app/providers/aws.py`, `app/usecases/topology.py`
+- Inventory gains `regions[].network_interfaces[]`:
+  `{id, name, description, vpc, subnet, az, private_ip, instance, device_index, status,
+  interface_type, source_dest_check, tags}` from `describe_network_interfaces`. Only the ENI
+  knows which instance owns it, and a route target only ever gives the interface's id.
+  ENIs are not drawn and do not count towards `region.resource_count`.
+- `topology.py` maps `default_route → network_interfaces[].instance` (and accepts a route that
+  already names an instance), sets the exposure, and emits the route edge once the instance node
+  exists.
+
+### Planned register — `app/usecases/plan_graph.py`
+- Two new linking kinds in the AWS table: `aws_network_interface` (`network_interface`) and
+  `aws_network_interface_attachment` (`attachment`).
+- `network_interface_id` joins `gateway_id` / `nat_gateway_id` as a route target on
+  `aws_route_table`, `aws_default_route_table` and `aws_route`, in `TARGET_KINDS`, and therefore
+  in the pooled-reference fallback (the AWS provider models `route` as a set attribute, so the
+  target that is unknown until apply is identified by the key the planned item *omits*).
+- An interface's owner comes from either shape: an `aws_network_interface_attachment` joining
+  the two, or `aws_instance`'s inline `network_interface` blocks (`TypeSpec.attach` names the
+  reference key and the ordering key).
+- **An appliance takes no `subnet_id`.** When an instance references no subnet, it is placed in
+  the subnet of its lowest-device-index interface, and its security groups are collected from
+  its interfaces as well as from itself — otherwise the Cloud Connector would land in `unknown`
+  and its rules would draw no `allow` edges.
+
+## C. Secrets Manager in the cost rollup
+
+The lab keeps the Cloud Connector's deployment credentials in one Secrets Manager secret, which
+survives OFF. It is small and it is real, so it is in the estimate.
+
+- Inventory gains `regions[].secrets[]` (`{arn, id, name, description, created, last_changed,
+  rotation_enabled, monthly_usd, tags}`); deleted secrets are skipped. Listing them needs its own
+  permission, so a failure yields an empty list and never breaks a region scan.
+- `pricing.py` gains `SECRET_MONTHLY_USD = 0.40` — a flat per-secret rate, identical in every
+  commercial region, so a constant rather than a Pricing API lookup. API calls are usage, not a
+  standing rate, and are excluded like NAT data processing (a note says so).
+- Cost line `Secrets Manager secret`, unit `secret-mo`, attributed by the secret's own tags — so
+  a secret the lab does not tag lands in `untagged`, and the lab repo is expected to tag it
+  `Project=zcc-workload-lab`.
+
+## D. The manifest
+
+`usecases/zcc-aws-workload/usecase.yaml`, sibling in structure and tone to the PSE lab's:
+source `https://github.com/nilsujma-dev/zs-zcc-aws-workload-lab.git` @ `main`, terraform dir
+`terraform`, state key `usecases/zcc-aws-workload/terraform.tfstate`, `tags: {Project:
+zcc-workload-lab}`, `secrets: [zscaler_oneapi]`, status probe `python3 scripts/status.py --json`
+every 60 s, twelve `on` steps (baseline · preflight · ZPA objects · CC admin, templates and
+secret · SSM key · apply · wait for registration · forward to ZPA · ZPA access rule · ZIA URL and
+DLP · verify the tenant is unchanged · wait for evidence), one `off` step, an `effects` block,
+and a `topology` block with four roles, four flows and one blocked pair. The description keeps
+the PSE lab's four headings — what it is, what ON and OFF do, cost (≈ $192/month on at list),
+sharing — and no network prose: the drawing carries that.
+
+Two steps run in one shell step (`ztw_create.py && put_cc_secret.py`) because the tenant admin
+and the secret that holds its credentials are one idea and the contract names the step once.
+
+## Definition of done (v1.5)
+
+- `GET /api/usecases` lists both AWS use cases; the CC card expands to a drawing with two VPCs,
+  five subnets, four instances, the NAT, both IGWs, the workload subnet badged `INSPECTED` and a
+  route line from it to the Cloud Connector, the three dashed flows and the red blocked pair.
+- Off and on are the same drawing in two registers, and the `inspected` route survives both.
+- The cost estimate carries the Secrets Manager line; the region total still equals the sum of
+  its lines.
+- Tests green with no cloud calls; the CC fixtures cover the inline and standalone route shapes
+  and the inline and attachment-resource interface shapes. `?mock=1` carries the CC lab as a
+  second AWS use case in both registers, and `&labs=real` trims the mock to the two use cases
+  that actually ship (the others exist only to give the v1.3 rail a running and a failed card);
+  screenshots at 1280 dark and light in `scratchpad/ui-shots/v15/`.

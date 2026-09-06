@@ -14,7 +14,7 @@ from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
 from app.providers.base import Check, ConnectionReport, ConnectResult, FormError, FormField, Identity, Provider
-from app.providers.pricing import HOURS_PER_MONTH, PUBLIC_IPV4_HOURLY_USD, Pricing, platform_to_operating_system
+from app.providers.pricing import HOURS_PER_MONTH, PUBLIC_IPV4_HOURLY_USD, SECRET_MONTHLY_USD, Pricing, platform_to_operating_system
 from app.store import utcnow_iso
 
 log = logging.getLogger("switchboard.aws")
@@ -336,6 +336,8 @@ class AwsProvider(Provider):
             "eips": [],
             "volumes": [],
             "security_groups": [],
+            "network_interfaces": [],
+            "secrets": [],
             "monthly_usd": 0.0,
             "resource_count": 0,
             "error": None,
@@ -343,7 +345,8 @@ class AwsProvider(Provider):
         now = datetime.now(timezone.utc)
         try:
             # One session per thread: boto3 sessions are not safe to share for client creation.
-            ec2 = self._client(self._session(credentials), "ec2", region)
+            session = self._session(credentials)
+            ec2 = self._client(session, "ec2", region)
 
             # ---- instances
             raw_instances: list[dict[str, Any]] = []
@@ -459,6 +462,28 @@ class AwsProvider(Provider):
                 )
             for subnets in subnets_by_vpc.values():
                 subnets.sort(key=lambda x: (x["cidr"] or "", x["id"]))
+
+            # ---- network interfaces: a route can point at one, and only the ENI knows whose it is
+            for eni in self._paginate(ec2, "describe_network_interfaces", "NetworkInterfaces"):
+                tags = {t["Key"]: t["Value"] for t in eni.get("TagSet", []) or [] if "Key" in t}
+                attachment = eni.get("Attachment") or {}
+                result["network_interfaces"].append(
+                    {
+                        "id": eni["NetworkInterfaceId"],
+                        "name": tags.get("Name"),
+                        "description": eni.get("Description") or None,
+                        "vpc": eni.get("VpcId"),
+                        "subnet": eni.get("SubnetId"),
+                        "az": eni.get("AvailabilityZone"),
+                        "private_ip": eni.get("PrivateIpAddress"),
+                        "instance": attachment.get("InstanceId"),
+                        "device_index": attachment.get("DeviceIndex"),
+                        "status": eni.get("Status"),
+                        "interface_type": eni.get("InterfaceType"),
+                        "source_dest_check": eni.get("SourceDestCheck"),
+                        "tags": tags,
+                    }
+                )
 
             # ---- NAT gateways (before VPCs so each VPC can list its NAT ids)
             nat_by_vpc: dict[str, list[str]] = {}
@@ -579,11 +604,42 @@ class AwsProvider(Provider):
                         "tags": tags,
                     }
                 )
+            # ---- Secrets Manager: a flat monthly charge per secret, so the rollup needs the list
+            result["secrets"] = self._secrets(session, region)
         except (ClientError, BotoCoreError) as exc:
             result["error"] = _err(exc)
             log.warning("inventory scan failed in %s: %s", region, result["error"])
         result["resource_count"] = self.resource_count(result)
         return result
+
+    def _secrets(self, session: Any, region: str) -> list[dict[str, Any]]:
+        """Secrets Manager secrets in one region. Listing them needs its own permission, and a
+        role that lacks it must still get an inventory — so a failure here yields an empty list."""
+        out: list[dict[str, Any]] = []
+        try:
+            client = self._client(session, "secretsmanager", region)
+            for page in client.get_paginator("list_secrets").paginate():
+                for secret in page.get("SecretList", []) or []:
+                    if secret.get("DeletedDate"):
+                        continue
+                    tags = {t["Key"]: t["Value"] for t in secret.get("Tags", []) or [] if "Key" in t}
+                    out.append(
+                        {
+                            "arn": secret.get("ARN"),
+                            "id": secret.get("ARN") or secret.get("Name"),
+                            "name": secret.get("Name"),
+                            "description": secret.get("Description") or None,
+                            "created": _iso(secret.get("CreatedDate")),
+                            "last_changed": _iso(secret.get("LastChangedDate")),
+                            "rotation_enabled": bool(secret.get("RotationEnabled")),
+                            "monthly_usd": None,
+                            "tags": tags,
+                        }
+                    )
+        except Exception as exc:  # noqa: BLE001 - a secret listing must never break an inventory
+            log.info("secrets not listed in %s: %s", region, _err(exc))
+            return []
+        return out
 
     @staticmethod
     def resource_count(region: dict[str, Any]) -> int:
@@ -619,6 +675,7 @@ class AwsProvider(Provider):
         missing: set[str] = set()
         group_instances: dict[str, int] = {}
         stopped = 0
+        secrets_seen = 0
 
         def add(item: str, region: str, group: str, qty: float, unit: str, unit_usd: float | None) -> None:
             key = (item, region, group, unit_usd)
@@ -686,8 +743,15 @@ class AwsProvider(Provider):
             for _ip, group in public_ips.items():
                 add("Public IPv4 address", region, group, HOURS_PER_MONTH, "hr", PUBLIC_IPV4_HOURLY_USD)
 
+            for secret in r.get("secrets", []) or []:
+                secret["monthly_usd"] = monthly(1, SECRET_MONTHLY_USD)
+                add("Secrets Manager secret", region, self._group_key(secret.get("tags") or {}), 1, "secret-mo", SECRET_MONTHLY_USD)
+                secrets_seen += 1
+
         if stopped:
             notes.append(f"{stopped} stopped instance(s): storage only")
+        if secrets_seen:
+            notes.append(f"{secrets_seen} Secrets Manager secret(s) at ${SECRET_MONTHLY_USD:.2f}/month; API calls not included")
         for item in sorted(missing):
             notes.append(f"No list price found for {item}; excluded from the estimate")
 

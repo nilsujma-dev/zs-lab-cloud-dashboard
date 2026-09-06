@@ -11,7 +11,9 @@ Two sources inside one plan document:
 
 Nothing provider-specific escapes the `PlanSchema` table and a node's `detail`: the builder
 only knows kinds (vpc, subnet, instance, nat, igw, eip) and linking roles (route table,
-route, association, security group, ingress rule). Node ids are resource addresses
+route, association, security group, ingress rule, network interface, attachment). A default
+route into a network interface resolves to the instance that attaches it, and its subnet is
+`inspected` (SPEC v1.5). Node ids are resource addresses
 (`aws_instance.pse`), labels come from the name tag else the resource name.
 
 `SourceIndex` scans the use case's `terraform_dir` for `resource "<type>" "<name>"` blocks so
@@ -30,9 +32,11 @@ from app.usecases.manifest import Manifest
 from app.usecases.topology import DEFAULT_ROUTE, Graph, assemble, rule_label
 
 STRUCTURE_KINDS = ("vpc", "subnet", "instance", "nat", "igw", "eip")
-LINK_KINDS = ("route_table", "route", "association", "security_group", "ingress_rule")
+LINK_KINDS = ("route_table", "route", "association", "security_group", "ingress_rule", "network_interface", "attachment")
 # Route target attribute -> the kind of node it points at (used when the plan pools a set's references).
-TARGET_KINDS = {"gateway_id": "igw", "nat_gateway_id": "nat"}
+TARGET_KINDS = {"gateway_id": "igw", "nat_gateway_id": "nat", "network_interface_id": "network_interface"}
+# What a default route may point at: the two gateways, or — SPEC v1.5 — an appliance's interface.
+ROUTE_TARGET_KINDS = ("igw", "nat", "network_interface")
 
 
 # ---------------------------------------------------------------------- the provider table
@@ -43,9 +47,10 @@ class TypeSpec:
     kind:    a node kind or a linking kind (see STRUCTURE_KINDS / LINK_KINDS)
     refs:    role -> expression key whose `references` point at another resource
     fields:  node field -> attribute key carrying a value known at plan time
-    blocks:  role -> name of a nested block (inline routes / inline ingress rules)
+    blocks:  role -> name of a nested block (inline routes / inline ingress rules / interfaces)
     rule:    attribute keys of a rule-shaped thing (dest/targets for routes; proto/from/to and
              cidr(s)/groups for security rules)
+    attach:  keys inside an attachment block: what it attaches (`ref`) and its ordering (`index`)
     only_if: attribute equalities the resource must satisfy to count (e.g. type == ingress)
     default: a route table that applies to subnets with no explicit association
     """
@@ -55,6 +60,7 @@ class TypeSpec:
     fields: dict[str, str] = field(default_factory=dict)
     blocks: dict[str, str] = field(default_factory=dict)
     rule: dict[str, Any] = field(default_factory=dict)
+    attach: dict[str, str] = field(default_factory=dict)
     only_if: dict[str, Any] = field(default_factory=dict)
     default: bool = False
 
@@ -84,21 +90,30 @@ AWS = PlanSchema(
             "instance",
             refs={"subnet": "subnet_id", "groups": "vpc_security_group_ids"},
             fields={"type": "instance_type", "private_ip": "private_ip", "public_ip": "public_ip", "az": "availability_zone"},
+            # An appliance attaches its own interfaces instead of taking a `subnet_id`.
+            blocks={"interfaces": "network_interface"},
+            attach={"ref": "network_interface_id", "index": "device_index"},
+        ),
+        "aws_network_interface": TypeSpec(
+            "network_interface", refs={"subnet": "subnet_id", "groups": "security_groups"}, fields={"private_ip": "private_ip"}
+        ),
+        "aws_network_interface_attachment": TypeSpec(
+            "attachment", refs={"instance": "instance_id", "interface": "network_interface_id"}, fields={"index": "device_index"}
         ),
         "aws_nat_gateway": TypeSpec("nat", refs={"subnet": "subnet_id", "eip": "allocation_id"}, fields={"public_ip": "public_ip", "private_ip": "private_ip"}),
         "aws_internet_gateway": TypeSpec("igw", refs={"vpc": "vpc_id"}),
         "aws_eip": TypeSpec("eip", refs={"instance": "instance"}, fields={"ip": "public_ip"}),
         "aws_route_table": TypeSpec(
             "route_table", refs={"vpc": "vpc_id"}, blocks={"routes": "route"},
-            rule={"dest": "cidr_block", "targets": ("gateway_id", "nat_gateway_id")},
+            rule={"dest": "cidr_block", "targets": ("gateway_id", "nat_gateway_id", "network_interface_id")},
         ),
         "aws_default_route_table": TypeSpec(
             "route_table", refs={"vpc": "default_route_table_id"}, blocks={"routes": "route"},
-            rule={"dest": "cidr_block", "targets": ("gateway_id", "nat_gateway_id")}, default=True,
+            rule={"dest": "cidr_block", "targets": ("gateway_id", "nat_gateway_id", "network_interface_id")}, default=True,
         ),
         "aws_route": TypeSpec(
-            "route", refs={"route_table": "route_table_id", "gateway": "gateway_id", "nat": "nat_gateway_id"},
-            rule={"dest": "destination_cidr_block", "targets": ("gateway_id", "nat_gateway_id")},
+            "route", refs={"route_table": "route_table_id", "gateway": "gateway_id", "nat": "nat_gateway_id", "eni": "network_interface_id"},
+            rule={"dest": "destination_cidr_block", "targets": ("gateway_id", "nat_gateway_id", "network_interface_id")},
         ),
         "aws_route_table_association": TypeSpec("association", refs={"subnet": "subnet_id", "route_table": "route_table_id"}),
         "aws_security_group": TypeSpec(
@@ -287,7 +302,8 @@ class _PlanGraph:
 
     # -- routing
     def default_route_target(self, rt_addr: str) -> str | None:
-        """Where a route table's 0.0.0.0/0 goes: an inline route, else a standalone route resource."""
+        """Where a route table's 0.0.0.0/0 goes: a gateway, or an appliance's network interface —
+        an inline route first, else a standalone route resource."""
         spec = self._spec(rt_addr)
         block = spec.blocks.get("routes")
         module = self.plan.module_of.get(strip_index(rt_addr), "")
@@ -301,7 +317,7 @@ class _PlanGraph:
                 continue
             for key in spec.rule.get("targets", ()):
                 for target in self.plan.resolve(item.get(key), module):
-                    if self.kind_of.get(target) in ("igw", "nat"):
+                    if self.kind_of.get(target) in ROUTE_TARGET_KINDS:
                         return target
             for key in spec.rule.get("targets", ()):
                 if key in item:
@@ -316,9 +332,38 @@ class _PlanGraph:
                 continue
             for key in rspec.rule.get("targets", ()):
                 for target in self.plan.refs(route, key):
-                    if self.kind_of.get(target) in ("igw", "nat"):
+                    if self.kind_of.get(target) in ROUTE_TARGET_KINDS:
                         return target
         return None
+
+    # -- interfaces
+    def interfaces_of(self, inst_addr: str) -> list[tuple[Any, str]]:
+        """(device index, interface address) for the interfaces an instance attaches inline."""
+        spec = self._spec(inst_addr)
+        block, attach = spec.blocks.get("interfaces"), spec.attach
+        if not (block and attach.get("ref")):
+            return []
+        module = self.plan.module_of.get(strip_index(inst_addr), "")
+        out: list[tuple[Any, str]] = []
+        for item in self.plan.blocks(inst_addr, block):
+            index = _Plan.const(item, attach.get("index", ""))
+            for eni in self.plan.resolve(item.get(attach["ref"]), module):
+                if self.kind_of.get(eni) == "network_interface":
+                    out.append((index if index is not None else len(out), eni))
+        return out
+
+    def interface_owners(self) -> dict[str, str]:
+        """Interface address -> the instance that attaches it, whether the instance declares the
+        interface inline or a separate attachment resource joins the two."""
+        owners: dict[str, str] = {}
+        for attach in self.of_kind("attachment"):
+            eni, inst = self.first_ref(attach, "interface", "network_interface"), self.first_ref(attach, "instance", "instance")
+            if eni and inst:
+                owners.setdefault(eni, inst)
+        for inst in self.of_kind("instance"):
+            for _index, eni in self.interfaces_of(inst):
+                owners.setdefault(eni, inst)
+        return owners
 
     def build(self) -> Graph:
         g = self.graph
@@ -351,14 +396,23 @@ class _PlanGraph:
         nat_subnet = {n: self.first_ref(n, "subnet", "subnet") for n in nats}
         nat_vpc = {n: subnet_vpc.get(nat_subnet[n] or "") for n in nats}
 
+        eni_owner = self.interface_owners()
         subnets = self.of_kind("subnet")
+        inspected: list[tuple[str, str, str]] = []  # (subnet, appliance instance, interface)
         for sid in sorted(subnets, key=lambda s: (str(self.plan.known(s, self._spec(s).fields.get("cidr", "")) or ""), s)):
             vpc = subnet_vpc.get(sid)
             rt = subnet_rt.get(sid) or default_rt.get(vpc or "")
             target = rt_target.get(rt) if rt else None
+            owner = eni_owner.get(target or "") if self.kind_of.get(target or "") == "network_interface" else None
             exposure = "isolated" if not target else ("public" if self.kind_of.get(target) == "igw" else "private")
-            g.add(self.node(sid, "subnet", parent=vpc, exposure=exposure, default_route=target, route_table=rt))
-            if target:
+            if owner:
+                # Steered into an appliance's interface: the drawing names the instance behind it.
+                exposure, route_to = "inspected", owner
+                inspected.append((sid, owner, target or ""))
+            else:
+                route_to = target
+            g.add(self.node(sid, "subnet", parent=vpc, exposure=exposure, default_route=route_to, route_table=rt))
+            if target and not owner:
                 g.add_edge({"kind": "route", "from": sid, "to": target, "label": DEFAULT_ROUTE})
 
         for nid in sorted(nats):
@@ -376,6 +430,12 @@ class _PlanGraph:
         inst_groups: dict[str, list[str]] = {}
         for iid in sorted(instances, key=lambda i: (self.label(i), i)):
             subnet = self.first_ref(iid, "subnet", "subnet")
+            if subnet is None:
+                # An appliance takes no `subnet_id`: it sits where its first interface does.
+                for _index, eni in sorted(self.interfaces_of(iid), key=lambda pair: str(pair[0])):
+                    subnet = self.first_ref(eni, "subnet", "subnet")
+                    if subnet:
+                        break
             parent = subnet if subnet in g.nodes else None
             node = self.node(iid, "instance", parent=parent, role=roles.get(self.label(iid)), state=None)
             if parent is None:
@@ -386,7 +446,23 @@ class _PlanGraph:
                 node["az"] = g.nodes[subnet].get("az")
             g.add(node)
             key = self._spec(iid).refs.get("groups")
-            inst_groups[iid] = [a for a in (self.plan.refs(iid, key) if key else []) if self.kind_of.get(a) == "security_group"]
+            groups = [a for a in (self.plan.refs(iid, key) if key else []) if self.kind_of.get(a) == "security_group"]
+            for _index, eni in self.interfaces_of(iid):
+                # An appliance's groups hang off its interfaces, not off the instance.
+                ekey = self._spec(eni).refs.get("groups")
+                groups += [a for a in (self.plan.refs(eni, ekey) if ekey else []) if self.kind_of.get(a) == "security_group" and a not in groups]
+            inst_groups[iid] = groups
+
+        # The appliance routes, now that the instances they point at exist as nodes.
+        for sid, owner, eni in inspected:
+            if owner not in g.nodes:
+                g.unknown.append({"kind": "route", "id": sid, "label": g.nodes[sid]["label"], "region": region,
+                                  "reason": f"Default route steers into {owner}, which the plan places in no subnet"})
+                continue
+            edge: dict[str, Any] = {"kind": "route", "from": sid, "to": owner, "label": DEFAULT_ROUTE, "inspected": True}
+            if eni:
+                edge["eni"] = {"id": eni, "name": self.label(eni), "private_ip": self.plan.known(eni, self._spec(eni).fields.get("private_ip", ""))}
+            g.add_edge(edge)
 
         # Elastic IPs: attached to the instance that names them, or to the NAT that consumes them.
         eip_nat = {}

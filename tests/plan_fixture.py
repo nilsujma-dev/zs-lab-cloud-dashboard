@@ -1,6 +1,10 @@
-"""The PSE lab as `tofu plan -json` / `tofu show -json` see it before ON, modelled resource by
-resource on the lab repo's `terraform/main.tf` and `terraform/vpc_b.tf` (same types, names,
-tags, CIDRs, ports and references). Hand-built: nothing here ran tofu.
+"""The labs as `tofu plan -json` / `tofu show -json` see them before ON, modelled resource by
+resource on each lab repo's terraform (same types, names, tags, CIDRs, ports and references).
+Hand-built: nothing here ran tofu.
+
+`pse_show()` is the PSE lab (`main.tf` + `vpc_b.tf`); `cc_show()` is the Cloud Connector lab,
+whose point is a default route into a network interface (SPEC v1.5) — it comes in the two route
+shapes and the two interface-attachment shapes that occur in the wild.
 
 Unknown-until-apply attributes (ids, IPs, allocation ids, the NAT-derived cidr) are absent from
 `values` and listed in `after_unknown`, exactly as a real plan document has them.
@@ -154,7 +158,10 @@ def _constants(values: dict[str, Any]) -> dict[str, Any]:
 
 def pse_show(*, spare_eip: bool = True) -> dict[str, Any]:
     """A `tofu show -json <planfile>` document for ON from an empty state."""
-    resources = list(RESOURCES) + ([SPARE_EIP] if spare_eip else [])
+    return _show(list(RESOURCES) + ([SPARE_EIP] if spare_eip else []), {"Project": "zpa-pse-lab", "ManagedBy": "opentofu", "Owner": "nujma"})
+
+
+def _show(resources: list[tuple[str, str, dict[str, Any], dict[str, Any], list[str]]], default_tags: dict[str, str]) -> dict[str, Any]:
     planned, changes, config = [], [], []
     for rtype, name, values, exprs, unknown in resources:
         addr = f"{rtype}.{name}"
@@ -178,7 +185,7 @@ def pse_show(*, spare_eip: bool = True) -> dict[str, Any]:
         "prior_state": {"format_version": "1.0", "terraform_version": "1.12.6", "values": {"root_module": {"resources": prior}}},
         "configuration": {
             "provider_config": {"aws": {"name": "aws", "full_name": PROVIDER_NAME, "version_constraint": "~> 5.0",
-                                        "expressions": {"region": {"constant_value": PLAN_REGION}, "default_tags": [{"tags": {"constant_value": {"Project": "zpa-pse-lab", "ManagedBy": "opentofu", "Owner": "nujma"}}}]}}},
+                                        "expressions": {"region": {"constant_value": PLAN_REGION}, "default_tags": [{"tags": {"constant_value": dict(default_tags)}}]}}},
             "root_module": {"resources": config, "variables": {"pse_ami": {"default": "ami-07811cc3852902146"}, "conn_ami": {"default": "ami-0aaa3d92aff1df4a0"}, "region": {"default": PLAN_REGION}}},
         },
         "timestamp": "2026-09-06T10:00:00Z",
@@ -363,3 +370,128 @@ def write_checkout(checkout: Path) -> Path:
     (tf / "vpc_b.tf").write_text(VPC_B_TF, encoding="utf-8")
     (tf / "backend.tf").write_text('terraform {\n  backend "s3" {}\n}\n', encoding="utf-8")
     return checkout
+
+
+# ---------------------------------------------------------------- the CC lab (SPEC v1.5)
+# A small `zs-zcc-aws-workload-lab` plan: VPC C with a public subnet (IGW), the Cloud
+# Connector's own subnet (NAT) and a workload subnet whose default route points at the
+# connector's *service interface*; VPC D with the App Connector and the private app.
+# Two shapes of the same fact are modelled, because both occur in the wild:
+#   route_style   "inline"     the route lives in the table's nested `route` set (pooled refs)
+#                 "standalone" the route is its own `aws_route` resource
+#   attach_style  "inline"     the instance declares `network_interface` blocks, no subnet_id
+#                 "resource"   the instance takes a subnet_id and an attachment resource joins them
+CC_TAGS = {"Project": "zcc-workload-lab", "ManagedBy": "opentofu", "Owner": "nujma"}
+_UNKNOWN_SUBNET = ["id", "vpc_id"]
+_UNKNOWN_INSTANCE = ["id", "arn", "private_ip", "public_ip", "subnet_id", "vpc_security_group_ids", "availability_zone"]
+
+
+def _pooled_route(target_key: str) -> dict[str, Any]:
+    """The planned value of a table whose 0.0.0.0/0 target is unknown until apply: every other
+    target key is "" and the one that will hold the id is simply absent."""
+    keys = ["gateway_id", "nat_gateway_id", "network_interface_id", "vpc_peering_connection_id"]
+    return {"cidr_block": "0.0.0.0/0", **{k: "" for k in keys if k != target_key}}
+
+
+CC_BASE: list[tuple[str, str, dict[str, Any], dict[str, Any], list[str]]] = [
+    ("aws_vpc", "c", {"cidr_block": "10.92.0.0/16", "enable_dns_support": True, "enable_dns_hostnames": True, "tags": {"Name": "zcc-lab-vpc-c"}}, {}, ["id", "arn", "default_route_table_id"]),
+    ("aws_vpc", "d", {"cidr_block": "10.93.0.0/16", "enable_dns_support": True, "enable_dns_hostnames": True, "tags": {"Name": "zcc-lab-vpc-d"}}, {}, ["id", "arn", "default_route_table_id"]),
+    ("aws_internet_gateway", "c", {"tags": {"Name": "zcc-lab-igw-c"}}, {"vpc_id": {"references": ["aws_vpc.c.id", "aws_vpc.c"]}}, ["id", "vpc_id"]),
+    ("aws_internet_gateway", "d", {"tags": {"Name": "zcc-lab-igw-d"}}, {"vpc_id": {"references": ["aws_vpc.d.id", "aws_vpc.d"]}}, ["id", "vpc_id"]),
+    ("aws_subnet", "public", {"cidr_block": "10.92.0.0/24", "availability_zone": "eu-central-1a", "map_public_ip_on_launch": True, "tags": {"Name": "zcc-lab-public"}}, {"vpc_id": {"references": ["aws_vpc.c.id", "aws_vpc.c"]}}, _UNKNOWN_SUBNET),
+    ("aws_subnet", "workload", {"cidr_block": "10.92.1.0/24", "availability_zone": "eu-central-1a", "tags": {"Name": "zcc-lab-workload"}}, {"vpc_id": {"references": ["aws_vpc.c.id", "aws_vpc.c"]}}, _UNKNOWN_SUBNET),
+    ("aws_subnet", "cc", {"cidr_block": "10.92.200.0/24", "availability_zone": "eu-central-1a", "tags": {"Name": "zcc-lab-cc"}}, {"vpc_id": {"references": ["aws_vpc.c.id", "aws_vpc.c"]}}, _UNKNOWN_SUBNET),
+    ("aws_subnet", "connector", {"cidr_block": "10.93.10.0/24", "availability_zone": "eu-central-1a", "map_public_ip_on_launch": True, "tags": {"Name": "zcc-lab-connector"}}, {"vpc_id": {"references": ["aws_vpc.d.id", "aws_vpc.d"]}}, _UNKNOWN_SUBNET),
+    ("aws_subnet", "app", {"cidr_block": "10.93.20.0/24", "availability_zone": "eu-central-1a", "tags": {"Name": "zcc-lab-app"}}, {"vpc_id": {"references": ["aws_vpc.d.id", "aws_vpc.d"]}}, _UNKNOWN_SUBNET),
+    ("aws_eip", "nat", {"domain": "vpc", "tags": {"Name": "zcc-lab-nat-eip"}}, {}, ["id", "allocation_id", "public_ip", "private_ip", "instance"]),
+    ("aws_nat_gateway", "c", {"connectivity_type": "public", "tags": {"Name": "zcc-lab-nat"}},
+     {"allocation_id": {"references": ["aws_eip.nat.id", "aws_eip.nat"]}, "subnet_id": {"references": ["aws_subnet.public.id", "aws_subnet.public"]}}, ["id", "allocation_id", "subnet_id", "public_ip", "private_ip"]),
+    # public subnet -> IGW, Cloud Connector subnet -> NAT, connector subnet -> IGW, app subnet -> nothing
+    ("aws_route_table", "public", {"tags": {"Name": "zcc-lab-public-rt"}, "route": [_pooled_route("gateway_id")]},
+     {"vpc_id": {"references": ["aws_vpc.c.id", "aws_vpc.c"]}, "route": {"references": ["aws_internet_gateway.c.id", "aws_internet_gateway.c"]}}, ["id", "vpc_id"]),
+    ("aws_route_table", "cc", {"tags": {"Name": "zcc-lab-cc-rt"}, "route": [_pooled_route("nat_gateway_id")]},
+     {"vpc_id": {"references": ["aws_vpc.c.id", "aws_vpc.c"]}, "route": {"references": ["aws_nat_gateway.c.id", "aws_nat_gateway.c"]}}, ["id", "vpc_id"]),
+    ("aws_route_table", "d_public", {"tags": {"Name": "zcc-lab-connector-rt"}, "route": [_pooled_route("gateway_id")]},
+     {"vpc_id": {"references": ["aws_vpc.d.id", "aws_vpc.d"]}, "route": {"references": ["aws_internet_gateway.d.id", "aws_internet_gateway.d"]}}, ["id", "vpc_id"]),
+    ("aws_route_table", "app", {"tags": {"Name": "zcc-lab-app-rt"}}, {"vpc_id": {"references": ["aws_vpc.d.id", "aws_vpc.d"]}}, ["id", "vpc_id"]),
+    ("aws_route_table_association", "public", {}, {"subnet_id": {"references": ["aws_subnet.public.id", "aws_subnet.public"]}, "route_table_id": {"references": ["aws_route_table.public.id", "aws_route_table.public"]}}, ["id"]),
+    ("aws_route_table_association", "cc", {}, {"subnet_id": {"references": ["aws_subnet.cc.id", "aws_subnet.cc"]}, "route_table_id": {"references": ["aws_route_table.cc.id", "aws_route_table.cc"]}}, ["id"]),
+    ("aws_route_table_association", "workload", {}, {"subnet_id": {"references": ["aws_subnet.workload.id", "aws_subnet.workload"]}, "route_table_id": {"references": ["aws_route_table.workload.id", "aws_route_table.workload"]}}, ["id"]),
+    ("aws_route_table_association", "connector", {}, {"subnet_id": {"references": ["aws_subnet.connector.id", "aws_subnet.connector"]}, "route_table_id": {"references": ["aws_route_table.d_public.id", "aws_route_table.d_public"]}}, ["id"]),
+    ("aws_route_table_association", "app", {}, {"subnet_id": {"references": ["aws_subnet.app.id", "aws_subnet.app"]}, "route_table_id": {"references": ["aws_route_table.app.id", "aws_route_table.app"]}}, ["id"]),
+    ("aws_security_group", "cc_service", {"name": "zcc-lab-cc-service", "description": "Cloud Connector service interface: everything from the workload subnet", "tags": {"Name": "zcc-lab-cc-service"}},
+     {"vpc_id": {"references": ["aws_vpc.c.id", "aws_vpc.c"]}}, ["id", "vpc_id", "ingress", "egress"]),
+    ("aws_security_group", "cc_mgmt", {"name": "zcc-lab-cc-mgmt", "description": "Cloud Connector management interface: outbound only", "tags": {"Name": "zcc-lab-cc-mgmt"}},
+     {"vpc_id": {"references": ["aws_vpc.c.id", "aws_vpc.c"]}}, ["id", "vpc_id", "ingress", "egress"]),
+    ("aws_security_group", "workload", {"name": "zcc-lab-workload", "description": "Workload: no inbound", "tags": {"Name": "zcc-lab-workload"}},
+     {"vpc_id": {"references": ["aws_vpc.c.id", "aws_vpc.c"]}}, ["id", "vpc_id", "ingress", "egress"]),
+    ("aws_security_group", "app_connector", {"name": "zcc-lab-app-connector", "description": "App Connector: dials outbound only", "tags": {"Name": "zcc-lab-app-connector"}},
+     {"vpc_id": {"references": ["aws_vpc.d.id", "aws_vpc.d"]}}, ["id", "vpc_id", "ingress", "egress"]),
+    ("aws_security_group", "app", {"name": "zcc-lab-app", "description": "Private app: 8080 from the App Connector only", "tags": {"Name": "zcc-lab-app"}},
+     {"vpc_id": {"references": ["aws_vpc.d.id", "aws_vpc.d"]}}, ["id", "vpc_id", "ingress", "egress"]),
+    ("aws_vpc_security_group_ingress_rule", "cc_service_all", {"cidr_ipv4": "10.92.1.0/24", "from_port": 0, "to_port": 65535, "ip_protocol": "tcp", "description": "steered workload traffic"},
+     {"security_group_id": {"references": ["aws_security_group.cc_service.id", "aws_security_group.cc_service"]}}, ["id", "security_group_id"]),
+    ("aws_vpc_security_group_ingress_rule", "app_from_connector", {"from_port": 8080, "to_port": 8080, "ip_protocol": "tcp", "description": "brokered app traffic from the connector only"},
+     {"security_group_id": {"references": ["aws_security_group.app.id", "aws_security_group.app"]},
+      "referenced_security_group_id": {"references": ["aws_security_group.app_connector.id", "aws_security_group.app_connector"]}}, ["id", "security_group_id", "referenced_security_group_id"]),
+    ("aws_network_interface", "cc_service", {"private_ips": ["10.92.200.10"], "private_ip": "10.92.200.10", "source_dest_check": False, "description": "zcc-lab Cloud Connector service", "tags": {"Name": "zcc-lab-cc-service"}},
+     {"subnet_id": {"references": ["aws_subnet.cc.id", "aws_subnet.cc"]}, "security_groups": {"references": ["aws_security_group.cc_service.id", "aws_security_group.cc_service"]}}, ["id", "subnet_id", "security_groups", "mac_address"]),
+    ("aws_instance", "workload", {"instance_type": "t3.micro", "user_data": "#!/bin/bash\nresolvectl dns\n", "tags": {"Name": "zcc-lab-workload"},
+                                  "root_block_device": [{"volume_size": 8, "volume_type": "gp3", "encrypted": True}]},
+     {"subnet_id": {"references": ["aws_subnet.workload.id", "aws_subnet.workload"]},
+      "vpc_security_group_ids": {"references": ["aws_security_group.workload.id", "aws_security_group.workload"]},
+      "ami": {"references": ["data.aws_ami.al2023.id", "data.aws_ami.al2023"]}}, [*_UNKNOWN_INSTANCE, "ami"]),
+    ("aws_instance", "app_connector", {"ami": "ami-0aaa3d92aff1df4a0", "instance_type": "t3.medium", "tags": {"Name": "zcc-lab-app-connector"},
+                                       "root_block_device": [{"volume_size": 80, "volume_type": "gp3", "encrypted": True}]},
+     {"subnet_id": {"references": ["aws_subnet.connector.id", "aws_subnet.connector"]},
+      "vpc_security_group_ids": {"references": ["aws_security_group.app_connector.id", "aws_security_group.app_connector"]}}, _UNKNOWN_INSTANCE),
+    ("aws_instance", "app", {"instance_type": "t3.micro", "user_data": "#!/bin/bash\npython3 -m http.server 8080\n", "tags": {"Name": "zcc-lab-app"},
+                             "root_block_device": [{"volume_size": 8, "volume_type": "gp3", "encrypted": True}]},
+     {"subnet_id": {"references": ["aws_subnet.app.id", "aws_subnet.app"]},
+      "vpc_security_group_ids": {"references": ["aws_security_group.app.id", "aws_security_group.app"]},
+      "ami": {"references": ["data.aws_ami.al2023.id", "data.aws_ami.al2023"]}}, [*_UNKNOWN_INSTANCE, "ami"]),
+]
+
+# The workload table's default route, in either shape.
+CC_ROUTE_INLINE = [
+    ("aws_route_table", "workload", {"tags": {"Name": "zcc-lab-workload-rt"}, "route": [_pooled_route("network_interface_id")]},
+     {"vpc_id": {"references": ["aws_vpc.c.id", "aws_vpc.c"]}, "route": {"references": ["aws_network_interface.cc_service.id", "aws_network_interface.cc_service"]}}, ["id", "vpc_id"]),
+]
+CC_ROUTE_STANDALONE = [
+    ("aws_route_table", "workload", {"tags": {"Name": "zcc-lab-workload-rt"}}, {"vpc_id": {"references": ["aws_vpc.c.id", "aws_vpc.c"]}}, ["id", "vpc_id"]),
+    ("aws_route", "workload_default", {"destination_cidr_block": "0.0.0.0/0"},
+     {"route_table_id": {"references": ["aws_route_table.workload.id", "aws_route_table.workload"]},
+      "network_interface_id": {"references": ["aws_network_interface.cc_service.id", "aws_network_interface.cc_service"]}}, ["id", "route_table_id", "network_interface_id"]),
+]
+# The Cloud Connector itself: interfaces declared on the instance (upstream's shape), or joined
+# to it by an attachment resource.
+CC_ATTACH_INLINE = [
+    ("aws_network_interface", "cc_mgmt", {"private_ips": ["10.92.200.11"], "private_ip": "10.92.200.11", "description": "zcc-lab Cloud Connector management", "tags": {"Name": "zcc-lab-cc-mgmt"}},
+     {"subnet_id": {"references": ["aws_subnet.cc.id", "aws_subnet.cc"]}, "security_groups": {"references": ["aws_security_group.cc_mgmt.id", "aws_security_group.cc_mgmt"]}}, ["id", "subnet_id", "security_groups", "mac_address"]),
+    ("aws_instance", "cc", {"ami": "ami-0cc1oudconnector", "instance_type": "m6i.large", "tags": {"Name": "zcc-lab-cc"},
+                            "root_block_device": [{"volume_size": 8, "volume_type": "gp3", "encrypted": True}]},
+     {"network_interface": [
+         {"device_index": {"constant_value": 0}, "network_interface_id": {"references": ["aws_network_interface.cc_mgmt.id", "aws_network_interface.cc_mgmt"]}},
+         {"device_index": {"constant_value": 1}, "network_interface_id": {"references": ["aws_network_interface.cc_service.id", "aws_network_interface.cc_service"]}}]},
+     ["id", "arn", "private_ip", "public_ip", "availability_zone", "network_interface"]),
+]
+CC_ATTACH_RESOURCE = [
+    ("aws_instance", "cc", {"ami": "ami-0cc1oudconnector", "instance_type": "m6i.large", "tags": {"Name": "zcc-lab-cc"},
+                            "root_block_device": [{"volume_size": 8, "volume_type": "gp3", "encrypted": True}]},
+     {"subnet_id": {"references": ["aws_subnet.cc.id", "aws_subnet.cc"]},
+      "vpc_security_group_ids": {"references": ["aws_security_group.cc_mgmt.id", "aws_security_group.cc_mgmt"]}}, _UNKNOWN_INSTANCE),
+    ("aws_network_interface_attachment", "cc_service", {"device_index": 1},
+     {"instance_id": {"references": ["aws_instance.cc.id", "aws_instance.cc"]},
+      "network_interface_id": {"references": ["aws_network_interface.cc_service.id", "aws_network_interface.cc_service"]}}, ["id", "instance_id", "network_interface_id", "attachment_id"]),
+]
+
+
+def cc_resources(*, route_style: str = "inline", attach_style: str = "inline") -> list[tuple[str, str, dict[str, Any], dict[str, Any], list[str]]]:
+    route = CC_ROUTE_INLINE if route_style == "inline" else CC_ROUTE_STANDALONE
+    attach = CC_ATTACH_INLINE if attach_style == "inline" else CC_ATTACH_RESOURCE
+    return [*CC_BASE, *route, *attach]
+
+
+def cc_show(*, route_style: str = "inline", attach_style: str = "inline") -> dict[str, Any]:
+    """A `tofu show -json <planfile>` document for the CC lab's ON from an empty state."""
+    return _show(cc_resources(route_style=route_style, attach_style=attach_style), CC_TAGS)

@@ -12,7 +12,7 @@ import pytest
 from botocore.exceptions import ClientError
 
 from app.providers.aws import AwsProvider, _flatten_rules
-from app.providers.pricing import HOURS_PER_MONTH, PUBLIC_IPV4_HOURLY_USD
+from app.providers.pricing import HOURS_PER_MONTH, PUBLIC_IPV4_HOURLY_USD, SECRET_MONTHLY_USD
 
 NOW = datetime.now(timezone.utc)
 LAUNCHED = NOW - timedelta(hours=49, minutes=30)
@@ -54,6 +54,19 @@ class _EC2:
                  "Routes": [{"DestinationCidrBlock": "10.91.0.0/16", "GatewayId": "local", "State": "active"}, {"DestinationCidrBlock": "0.0.0.0/0", "GatewayId": "igw-1", "State": "active"}]},
             ]}],
             "describe_internet_gateways": [{"InternetGateways": [{"InternetGatewayId": "igw-1", "Attachments": [{"VpcId": "vpc-a", "State": "available"}]}]}],
+            "describe_network_interfaces": [{"NetworkInterfaces": [
+                {"NetworkInterfaceId": "eni-pse", "VpcId": "vpc-a", "SubnetId": "subnet-pub", "AvailabilityZone": "eu-central-1a", "PrivateIpAddress": "10.91.10.5",
+                 "Description": "", "Status": "in-use", "InterfaceType": "interface", "SourceDestCheck": True,
+                 "Attachment": {"InstanceId": "i-pse", "DeviceIndex": 0, "Status": "attached"}, "TagSet": [{"Key": "Name", "Value": "zpa-lab-pse-eni"}]},
+                {"NetworkInterfaceId": "eni-nat", "VpcId": "vpc-a", "SubnetId": "subnet-pub", "AvailabilityZone": "eu-central-1a", "PrivateIpAddress": "10.91.10.200",
+                 "Description": "Interface for NAT Gateway nat-1", "Status": "in-use", "InterfaceType": "nat_gateway", "TagSet": []},
+            ]}],
+            "list_secrets": [{"SecretList": [
+                {"ARN": "arn:aws:secretsmanager:eu-central-1:1:secret:ZS/CC/credentials/aws-lab-zcc-AbCdEf", "Name": "ZS/CC/credentials/aws-lab-zcc",
+                 "Description": "Cloud Connector deployment admin", "CreatedDate": LAUNCHED, "LastChangedDate": LAUNCHED, "RotationEnabled": False,
+                 "Tags": [{"Key": "Project", "Value": "zcc-workload-lab"}]},
+                {"ARN": "arn:aws:secretsmanager:eu-central-1:1:secret:old-Gone", "Name": "old", "DeletedDate": LAUNCHED, "Tags": []},
+            ]}],
             "describe_nat_gateways": [{"NatGateways": [
                 {"NatGatewayId": "nat-1", "VpcId": "vpc-a", "SubnetId": "subnet-pub", "State": "available", "ConnectivityType": "public", "CreateTime": LAUNCHED,
                  "NatGatewayAddresses": [{"AllocationId": "eipalloc-nat", "PublicIp": "63.1.1.9", "PrivateIp": "10.91.10.200"}], "Tags": TAGS},
@@ -115,13 +128,26 @@ class _EC2:
         return {"EnableDnsHostnames": {"Value": VpcId == "vpc-a"}}
 
 
+class _Secrets:
+    """Secrets Manager: only `list_secrets` is used, and only for the cost rollup."""
+
+    def __init__(self, ec2: _EC2, *, denied: bool = False) -> None:
+        self.ec2, self.denied = ec2, denied
+
+    def get_paginator(self, name: str) -> _Paginator:
+        if self.denied:
+            raise ClientError({"Error": {"Code": "AccessDeniedException", "Message": "not authorized"}}, "ListSecrets")
+        return self.ec2.get_paginator(name)
+
+
 class _Session:
-    def __init__(self, ec2: _EC2) -> None:
+    def __init__(self, ec2: _EC2, *, secrets_denied: bool = False) -> None:
         self.ec2 = ec2
+        self.secrets = _Secrets(ec2, denied=secrets_denied)
 
     def client(self, service: str, region_name: str, config: Any = None) -> Any:
-        assert service == "ec2"
-        return self.ec2
+        assert service in ("ec2", "secretsmanager")
+        return self.ec2 if service == "ec2" else self.secrets
 
 
 class _StubPricing:
@@ -210,7 +236,40 @@ def test_nat_eips_volumes_security_groups(scanned) -> None:
         {"proto": "all", "from": None, "to": None, "source": "::/0"},
     ]
     assert sg["egress"] == [{"proto": "all", "from": None, "to": None, "source": "0.0.0.0/0"}]
-    assert region["resource_count"] == 2 + 2 + 1 + 3 + 2 + 1
+    assert region["resource_count"] == 2 + 2 + 1 + 3 + 2 + 1  # ENIs and secrets are not drawn resources
+
+
+def test_network_interfaces_carry_their_instance(scanned) -> None:
+    """v1.5: a default route can point at an ENI, and only the ENI record knows whose it is."""
+    region, _, _ = scanned
+    enis = {e["id"]: e for e in region["network_interfaces"]}
+    assert enis["eni-pse"]["instance"] == "i-pse" and enis["eni-pse"]["device_index"] == 0
+    assert enis["eni-pse"]["subnet"] == "subnet-pub" and enis["eni-pse"]["vpc"] == "vpc-a"
+    assert enis["eni-pse"]["private_ip"] == "10.91.10.5" and enis["eni-pse"]["name"] == "zpa-lab-pse-eni"
+    assert enis["eni-pse"]["source_dest_check"] is True and enis["eni-pse"]["status"] == "in-use"
+    assert enis["eni-nat"]["instance"] is None and enis["eni-nat"]["interface_type"] == "nat_gateway"
+
+
+def test_secrets_are_listed_and_priced(scanned) -> None:
+    region, _, provider = scanned
+    assert [s["name"] for s in region["secrets"]] == ["ZS/CC/credentials/aws-lab-zcc"]  # the deleted one is skipped
+    secret = region["secrets"][0]
+    assert secret["tags"] == {"Project": "zcc-workload-lab"} and secret["rotation_enabled"] is False
+    cost, groups = provider._cost([region], _StubPricing())  # type: ignore[arg-type]
+    line = next(l for l in cost["lines"] if l["item"] == "Secrets Manager secret")
+    assert line["qty"] == 1 and line["unit"] == "secret-mo" and line["unit_usd"] == SECRET_MONTHLY_USD
+    assert line["monthly_usd"] == SECRET_MONTHLY_USD and line["group"] == "Project=zcc-workload-lab"
+    assert secret["monthly_usd"] == SECRET_MONTHLY_USD
+    assert any("Secrets Manager secret(s)" in n for n in cost["notes"])
+    assert next(g for g in groups if g["key"] == "Project=zcc-workload-lab")["monthly_usd"] == SECRET_MONTHLY_USD
+
+
+def test_secrets_denied_leaves_the_inventory_intact(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A role without secretsmanager:ListSecrets still gets a full inventory, minus the line."""
+    ec2 = _EC2()
+    monkeypatch.setattr(AwsProvider, "_session", staticmethod(lambda creds: _Session(ec2, secrets_denied=True)))
+    region = AwsProvider(tmp_path / "c.json")._scan_region({"access_key_id": "a", "secret_access_key": "b"}, "eu-central-1")
+    assert region["error"] is None and region["secrets"] == [] and len(region["instances"]) == 2
 
 
 def test_flatten_rules_prefix_lists_and_empty_sources() -> None:
@@ -248,8 +307,9 @@ def test_per_resource_cost_and_region_total_equals_sum_of_lines(scanned) -> None
     storage = sum(v["monthly_usd"] for v in region["volumes"])
     nat = sum(n["monthly_usd"] for n in region["nat_gateways"])
     ips = sum(e["monthly_usd"] for e in region["eips"])
-    assert round(compute + storage + nat + ips, 2) == region["monthly_usd"]
-    assert {g["key"] for g in groups} == {"Project=zpa-pse-lab", "untagged"}
+    secrets = sum(s["monthly_usd"] for s in region["secrets"])
+    assert round(compute + storage + nat + ips + secrets, 2) == region["monthly_usd"]
+    assert {g["key"] for g in groups} == {"Project=zpa-pse-lab", "Project=zcc-workload-lab", "untagged"}
 
 
 def test_unknown_price_leaves_monthly_null_but_region_total_consistent(scanned) -> None:

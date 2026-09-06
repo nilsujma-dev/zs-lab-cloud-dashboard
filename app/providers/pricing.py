@@ -13,6 +13,10 @@ log = logging.getLogger("switchboard.pricing")
 
 HOURS_PER_MONTH = 730
 PUBLIC_IPV4_HOURLY_USD = 0.005
+# Secrets Manager is a flat per-secret charge, identical in every commercial region and not
+# broken down by SKU the way EC2 is, so it is a constant rather than a Pricing API lookup.
+# API calls ($0.05 / 10k) are usage, not a standing rate, and are excluded like NAT processing.
+SECRET_MONTHLY_USD = 0.40
 CACHE_TTL_S = 24 * 60 * 60
 MISS_TTL_S = 60 * 60
 

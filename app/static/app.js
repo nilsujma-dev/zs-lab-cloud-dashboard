@@ -1405,13 +1405,13 @@ function renderVpc(r, v) {
     tbl.appendChild(h('thead', null, h('tr', null, h('th', null, 'Subnet'), h('th', null, 'CIDR'), h('th', null, 'AZ'), h('th', null, 'Default route'))));
     tbl.appendChild(h('tbody', null, subnets.map(s => {
       const target = s.default_route !== undefined ? s.default_route : defaultRouteFor(v, s.route_table);
-      const kind = !target ? 'none' : /^igw-/.test(target) ? 'igw' : /^nat-/.test(target) ? 'nat' : 'other';
+      const kind = !target ? 'none' : /^igw-/.test(target) ? 'igw' : /^nat-/.test(target) ? 'nat' : /^(eni-|i-)/.test(target) ? 'eni' : 'other';
       return h('tr', { dataset: { resId: s.id } },
         h('td', null, h('div', null, s.name || h('span', { class: 'dim' }, 'unnamed')), copyable(s.id, { fk: 'c:' + s.id, cls: 'copy-sm' })),
         h('td', { class: 'mono' }, s.cidr),
         h('td', { class: 'mono dim' }, s.az ? s.az.replace(/^.*-(\d[a-z])$/, '$1') : '—'),
         h('td', null, h('span', { class: 'route route-' + kind },
-          h('span', { class: 'route-badge' }, kind === 'igw' ? 'public' : kind === 'nat' ? 'private' : kind === 'none' ? 'isolated' : 'routed'),
+          h('span', { class: 'route-badge' }, kind === 'igw' ? 'public' : kind === 'nat' ? 'private' : kind === 'eni' ? 'inspected' : kind === 'none' ? 'isolated' : 'routed'),
           h('span', { class: 'mono' }, '0.0.0.0/0 → ', target ? (kind === 'nat' ? link('nat_gateways', target) : target) : 'none')),
           s.route_table ? h('div', { class: 'mono dim', style: 'font-size:11px;margin-top:2px' }, 'via ', s.route_table) : null));
     })));
@@ -2012,9 +2012,17 @@ function s(tag, attrs, ...children) {
   for (const c of children.flat(Infinity)) { if (c === null || c === undefined || c === false) continue; el.appendChild(c instanceof Node ? c : document.createTextNode(String(c))); }
   return el;
 }
-const ROLE_RANK = { pse: 0, connector: 1, app: 2, client: 3 };
-const EXPOSURE_RANK = { public: 0, private: 1, isolated: 2 };
-const ROLE_WORD = { pse: 'Private Service Edge', connector: 'App Connector', app: 'Application', client: 'Client' };
+const ROLE_RANK = { pse: 0, 'cloud-connector': 1, connector: 2, app: 3, client: 4, workload: 5 };
+const EXPOSURE_RANK = { public: 0, inspected: 1, private: 2, isolated: 3 };
+const ROLE_WORD = { pse: 'Private Service Edge', 'cloud-connector': 'Cloud Connector', connector: 'App Connector', app: 'Application', client: 'Client', workload: 'Workload' };
+const ROLE_LEGEND = { pse: 'service edge', 'cloud-connector': 'cloud connector', connector: 'connector', app: 'app', client: 'client', workload: 'workload' };
+// what a subnet's default route ends at, in one phrase — the inspector's Exposure row
+const EXPOSURE_WORD = {
+  public: ' — default route to an internet gateway',
+  private: ' — default route through a NAT',
+  inspected: ' — default route into an appliance that inspects it',
+  isolated: ' — no default route',
+};
 const SLOT_TEXT = 'assigned at ON'; // the planned register's value slot: never an invented address
 const SLOT_CHIP = 'eip · at ON';    // the same slot on an address chip, where there is no room for the full phrase
 
@@ -2058,7 +2066,7 @@ function topoLayout(g, avail) {
 
   // VPC plans: subnets, gateways, columns, gutter side
   const plans = vpcs.map((v, i) => {
-    const subnets = children(v.id, 'subnet').sort((a, b) => ((EXPOSURE_RANK[a.exposure] ?? 3) - (EXPOSURE_RANK[b.exposure] ?? 3)) || cmpLabel(a, b));
+    const subnets = children(v.id, 'subnet').sort((a, b) => ((EXPOSURE_RANK[a.exposure] ?? 4) - (EXPOSURE_RANK[b.exposure] ?? 4)) || cmpLabel(a, b));
     const gws = [...children(v.id, 'nat').sort(cmpLabel), ...children(v.id, 'igw').sort(cmpLabel)];
     const maxInst = Math.max(1, ...subnets.map(sn => children(sn.id, 'instance').length));
     return { v, subnets, gws, cols: Math.min(C.MAX_COLS, maxInst), side: vpcs.length === 2 && i === 1 ? 'left' : 'right' };
@@ -2152,7 +2160,7 @@ function topoLayout(g, avail) {
     });
     let sy = yVpc + C.VPC_HEAD;
     for (const sn of p.subnets) {
-      const insts = children(sn.id, 'instance').sort((a, b) => ((ROLE_RANK[a.role] ?? 4) - (ROLE_RANK[b.role] ?? 4)) || cmpLabel(a, b));
+      const insts = children(sn.id, 'instance').sort((a, b) => ((ROLE_RANK[a.role] ?? 6) - (ROLE_RANK[b.role] ?? 6)) || cmpLabel(a, b));
       const S = { kind: 'subnet', node: sn, x: V.subLeft, y: sy, w: sw, h: subH(sn), headH: headH(sn, sw), vpc: p.v.id, side: p.side, dir, insts: [], cols: p.cols, rows: [] };
       insts.forEach((inst, i) => {
         const row = Math.floor(i / p.cols), col = i % p.cols;
@@ -2328,6 +2336,15 @@ function labelSpot(pts, preferVertical) {
   return best;
 }
 
+/** How to name the interface a default route goes through: `zcc-lab-cc-service` on the instance
+    `zcc-lab-cc` reads as "service ENI"; anything else is named in full. */
+function eniWord(eni, instanceLabel) {
+  const name = (eni && (eni.name || eni.id)) || '';
+  if (!name) return 'ENI';
+  const short = instanceLabel && name.indexOf(instanceLabel + '-') === 0 ? name.slice(instanceLabel.length + 1) : name;
+  return short + ' ENI';
+}
+
 /* ---- glyphs: one simple shape per role ---- */
 function roleGlyph(role) {
   const g = s('g', { class: 'glyph glyph-' + (role || 'none') });
@@ -2335,6 +2352,10 @@ function roleGlyph(role) {
   else if (role === 'connector') { g.appendChild(s('circle', { cx: 4.5, cy: 9, r: 3 })); g.appendChild(s('circle', { cx: 13.5, cy: 9, r: 3 })); g.appendChild(s('path', { d: 'M7.5 9h3' })); }
   else if (role === 'app') { g.appendChild(s('rect', { x: 2, y: 3, width: 14, height: 12, rx: 1.5 })); g.appendChild(s('path', { d: 'M2 7h14M5 11h5' })); }
   else if (role === 'client') { g.appendChild(s('rect', { x: 2, y: 2.5, width: 14, height: 10, rx: 1.5 })); g.appendChild(s('path', { d: 'M9 12.5v3M5.5 15.5h7' })); }
+  // a shield with an arrow through it: traffic passes through something that inspects it
+  else if (role === 'cloud-connector') { g.appendChild(s('path', { d: 'M9 1.5l6 2.4v4.7c0 3.3-2.4 5.6-6 7.4-3.6-1.8-6-4.1-6-7.4V3.9z' })); g.appendChild(s('path', { d: 'M5.5 8.5h6M9.2 6.2l2.5 2.3-2.5 2.3' })); }
+  // a two-tier server stack
+  else if (role === 'workload') { g.appendChild(s('rect', { x: 2, y: 2.5, width: 14, height: 5.5, rx: 1.2 })); g.appendChild(s('rect', { x: 2, y: 10, width: 14, height: 5.5, rx: 1.2 })); g.appendChild(s('circle', { cx: 4.8, cy: 5.25, r: 0.9, class: 'fill' })); g.appendChild(s('circle', { cx: 4.8, cy: 12.75, r: 0.9, class: 'fill' })); }
   else { g.appendChild(s('circle', { cx: 9, cy: 9, r: 6 })); }
   return g;
 }
@@ -2544,6 +2565,7 @@ function topoInspector(g, L, sel, uc) {
     box.appendChild(h('div', { class: 'ti-title ti-edge-' + e.kind }, words[e.kind] || e.kind));
     add(row('From', nameOf(e.from)));
     add(row('To', nameOf(e.to)));
+    if (e.eni) add(row('Through', [mono(e.eni.private_ip || e.eni.name || e.eni.id), h('span', { class: 'dim' }, ' ' + eniWord(e.eni, nameOf(e.to)))]));
     add(row('Label', e.label ? mono(e.label) : null));
     if (e.via && e.via.length) add(row('Via', e.via.map(nameOf).join(' → ')));
     add(row('Source', e.kind === 'flow' || e.kind === 'blocked' ? 'manifest' : planned ? 'plan' : 'cloud inventory'));
@@ -2575,8 +2597,11 @@ function topoInspector(g, L, sel, uc) {
     const v = byId.get(n.parent);
     const route = g.edges.find(e => e.kind === 'route' && e.from === n.id);
     add(row('CIDR', n.cidr ? mono(n.cidr) : null));
-    add(row('Exposure', n.exposure ? [n.exposure, h('span', { class: 'dim' }, n.exposure === 'public' ? ' — default route to an internet gateway' : n.exposure === 'private' ? ' — default route through a NAT' : ' — no default route')] : null));
-    add(row('Default route', route ? [mono(route.label || '0.0.0.0/0'), ' → ', nameOf(route.to)] : (n.pseudo ? null : h('span', { class: 'dim' }, 'none'))));
+    add(row('Exposure', n.exposure ? [n.exposure, h('span', { class: 'dim' }, EXPOSURE_WORD[n.exposure] || '')] : null));
+    // a route into an appliance names the interface it goes through: "0.0.0.0/0 → zcc-lab-cc service ENI"
+    const eni = route && route.eni ? route.eni : null;
+    add(row('Default route', route ? [mono(route.label || '0.0.0.0/0'), ' → ', nameOf(route.to), eni ? h('span', { class: 'dim' }, ' ' + eniWord(eni, nameOf(route.to))) : null]
+      : (n.pseudo ? null : h('span', { class: 'dim' }, n.exposure === 'inspected' && n.default_route ? '0.0.0.0/0 → ' + n.default_route : 'none'))));
     add(row('AZ', n.az ? mono(n.az) : null));
     add(row('Instances', mono(String(g.nodes.filter(x => x.kind === 'instance' && x.parent === n.id).length))));
     add(row('VPC', v ? [v.label || v.id, v.cidr ? [' ', mono(v.cidr)] : null] : null));
@@ -2773,6 +2798,13 @@ function topoBar(mode, data, uc, g) {
     h('span', { class: 'topo-bar-run mono' }, lr ? ['last run: ' + lr.action + ' ' + lr.state + ' · ', rel(lr.ended || lr.started)] : 'never run'));
 }
 
+/** The roles this drawing actually uses, in rank order — a legend for what is on screen. */
+function legendRoles(g) {
+  const present = [...new Set(g.nodes.filter(n => n.kind === 'instance' && n.role).map(n => n.role))];
+  if (!present.length) return ['pse', 'connector', 'app', 'client'];
+  return present.sort((a, b) => ((ROLE_RANK[a] ?? 6) - (ROLE_RANK[b] ?? 6)) || a.localeCompare(b));
+}
+
 function topoLegend(g, uc) {
   const sw = (cls, d) => s('svg', { class: 'lg-sw', viewBox: '0 0 44 14', 'aria-hidden': 'true' }, s('path', { class: cls, d: d || 'M2 7H42' }));
   const item = (svgEl, text, cls) => h('span', { class: 'lg-item' + (cls ? ' ' + cls : '') }, svgEl, text);
@@ -2798,11 +2830,9 @@ function topoLegend(g, uc) {
     item(lamp('on'), 'enrolled'), item(lamp('bad'), 'not enrolled'), item(lamp('running'), 'running'),
     h('span', { class: 'lg-sep' }),
     badge('public'), badge('private'), badge('isolated'),
+    g.nodes.some(n => n.exposure === 'inspected') ? badge('inspected') : null,
     h('span', { class: 'lg-sep' }),
-    item(s('svg', { class: 'lg-glyph', viewBox: '0 0 18 18', 'aria-hidden': 'true' }, roleGlyph('pse')), 'service edge'),
-    item(s('svg', { class: 'lg-glyph', viewBox: '0 0 18 18', 'aria-hidden': 'true' }, roleGlyph('connector')), 'connector'),
-    item(s('svg', { class: 'lg-glyph', viewBox: '0 0 18 18', 'aria-hidden': 'true' }, roleGlyph('app')), 'app'),
-    item(s('svg', { class: 'lg-glyph', viewBox: '0 0 18 18', 'aria-hidden': 'true' }, roleGlyph('client')), 'client'));
+    legendRoles(g).map(r => item(s('svg', { class: 'lg-glyph', viewBox: '0 0 18 18', 'aria-hidden': 'true' }, roleGlyph(r)), ROLE_LEGEND[r] || r)));
   void uc;
   return legend;
 }
@@ -3436,6 +3466,8 @@ SB.mock = (function () {
   const connected = new Set((PARAMS.get('connected') === '1' ? 'aws' : PARAMS.get('connected') || '').split(',').filter(Boolean));
   // ?topo=planned (alias: off) draws the PSE lab from its plan; planfail = the plan errors; disconnected = AWS unplugged, declared fallback
   const TOPO_MODE = { off: 'planned', planned: 'planned', planfail: 'planfail', disconnected: 'disconnected' }[PARAMS.get('topo')] || null;
+  const PLANNED = TOPO_MODE === 'planned' || TOPO_MODE === 'planfail';
+  const REAL_LABS = PARAMS.get('labs') === 'real'; // only the use cases that actually ship as manifests
   if (TOPO_MODE === 'disconnected') connected.delete('aws');
   const connectedAtBoot = iso(2 * H);
   const jobs = {};
@@ -3446,7 +3478,7 @@ SB.mock = (function () {
 
   /* ---- inventory fixture: every v1.1 field on eu-central-1; money derived from one rate table so
           region totals equal the sum of their lines by construction ---- */
-  const RATE = { 'm5.large': 0.115, 't3.medium': 0.048, 't3.micro': 0.012, 't3.medium:win': 0.0744, nat: 0.052, gp3: 0.0952, gp2: 0.08, ipv4: 0.005 };
+  const RATE = { 'm5.large': 0.115, 'm6i.large': 0.115, 't3.medium': 0.048, 't3.micro': 0.012, 't3.medium:win': 0.0744, nat: 0.052, gp3: 0.0952, gp2: 0.08, ipv4: 0.005, secret: 0.40 };
   const r2 = n => Math.round(n * 100) / 100;
   function inventory(fresh) {
     const lab = { Project: 'zpa-pse-lab', ManagedBy: 'opentofu' };
@@ -3520,10 +3552,76 @@ SB.mock = (function () {
       sg(SG.dB, 'default', VPC.b, 'default VPC security group', [rule('all', null, null, SG.dB)], allOut, [], {}),
       sg(SG.dDef, 'default', VPC.def, 'default VPC security group', [rule('all', null, null, SG.dDef)], allOut, [], {}),
     ];
-    const region = (r, extra) => Object.assign({ region: r, instances: [], vpcs: [], nat_gateways: [], eips: [], volumes: [], security_groups: [], monthly_usd: 0, resource_count: 0 }, extra || {});
+    /* ---- the CC lab (v1.5), deployed in the same region: VPC C carries the workload and the
+            Cloud Connector, VPC D the App Connector and the private app. The workload subnet's
+            default route points at the connector's service ENI, which is the whole point. ---- */
+    const CC = { Project: 'zcc-workload-lab', ManagedBy: 'opentofu' };
+    const CT = name => Object.assign({ Name: name }, CC);
+    const CVPC = { c: 'vpc-0c7d8e9f0a1b2c3d4', d: 'vpc-0d8e9f0a1b2c3d4e5' };
+    const CIGW = { c: 'igw-0c7d8e9f0a1b2c3d4', d: 'igw-0d8e9f0a1b2c3d4e5' };
+    const CSN = { pub: 'subnet-0c00a1b2c3d4e5f60', wl: 'subnet-0c01b2c3d4e5f6071', cc: 'subnet-0c20c3d4e5f607182', conn: 'subnet-0d10d4e5f60718293', app: 'subnet-0d20e5f6071829304' };
+    const CRT = { pub: 'rtb-0c00a1b2c3d4e5f60', wl: 'rtb-0c01b2c3d4e5f6071', cc: 'rtb-0c20c3d4e5f607182', conn: 'rtb-0d10d4e5f60718293', app: 'rtb-0d20e5f6071829304', cMain: 'rtb-0c99f8e7d6c5b4a39', dMain: 'rtb-0d99f8e7d6c5b4a39' };
+    const CNAT = 'nat-0c1a2b3c4d5e6f708';
+    const CENI = { svc: 'eni-0c10a1b2c3d4e5f60', mgmt: 'eni-0c11b2c3d4e5f6071', nat: 'eni-0c12c3d4e5f607182' };
+    const CSG = { svc: 'sg-0c1a2b3c4d5e6f708', mgmt: 'sg-0c2b3c4d5e6f70819', wl: 'sg-0c3c4d5e6f7081920', ac: 'sg-0d4d5e6f70819203a', app: 'sg-0d5e6f70819203a4b', cDef: 'sg-0c6f70819203a4b5c', dDef: 'sg-0d70819203a4b5c6d' };
+    const CI = { cc: 'i-0f1a2b3c4d5e6f708', wl: 'i-0a2b3c4d5e6f70819', ac: 'i-0b3c4d5e6f7081920', app: 'i-0c4d5e6f70819203a' };
+    const ccUp = 2 * D + 4 * H;
+    const cInst = (id, name, type, vpc, subnet, priv, sg, extra) => Object.assign({
+      id, name, type, state: 'running', private_ip: priv, public_ip: null, launched: iso(ccUp), uptime_h: ccUp / H,
+      platform: 'Linux/UNIX', architecture: 'x86_64', az: 'eu-central-1a', vpc, subnet, ami: AMI.al,
+      ami_name: 'al2023-ami-2023.6.20250801.0-kernel-6.1-x86_64', iam_instance_profile: 'zcc-lab-node', key_name: null,
+      security_groups: [{ id: sg, name: sg }], root_device: '/dev/xvda', monitoring: false, ebs_optimized: true,
+      volumes: ['vol-' + id.slice(2, 12)], user_data_present: true, monthly_usd: r2(RATE[type] * 730), tags: CT(name) }, extra || {});
+    const ccInstances = [
+      cInst(CI.cc, 'zcc-lab-cc', 'm6i.large', CVPC.c, CSN.cc, '10.92.200.11', CSG.mgmt, { ami: 'ami-0cc1c2d3e4f5a6b78', ami_name: 'zscaler-cloud-connector-4.7.1-x86_64' }),
+      cInst(CI.wl, 'zcc-lab-workload', 't3.micro', CVPC.c, CSN.wl, '10.92.1.10', CSG.wl),
+      cInst(CI.ac, 'zcc-lab-app-connector', 't3.medium', CVPC.d, CSN.conn, '10.93.10.10', CSG.ac, { public_ip: '3.72.201.44', ami: AMI.zpa, ami_name: 'zpa-connector-el9-25.62.1-x86_64' }),
+      cInst(CI.app, 'zcc-lab-app', 't3.micro', CVPC.d, CSN.app, '10.93.20.10', CSG.app),
+    ];
+    const cSub = (id, name, cidr, rt, target) => ({ id, name, cidr, az: 'eu-central-1a', public: !!(target && target.startsWith('igw-')), route_table: rt, default_route: target, map_public_ip: !!(target && target.startsWith('igw-')), available_ips: 250, tags: CT(name) });
+    const cRt = (id, name, target, subnets, cidr) => ({ id, name, main: false, routes: [{ dest: cidr, target: 'local', state: 'active' }].concat(target ? [{ dest: '0.0.0.0/0', target, state: 'active' }] : []), subnets, tags: CT(name) });
+    const ccVpcs = [
+      { id: CVPC.c, name: 'zcc-lab-vpc-c', cidr: '10.92.0.0/16', default: false, state: 'available', dns_hostnames: true, igw: CIGW.c, nat_gateways: [CNAT],
+        subnets: [cSub(CSN.pub, 'zcc-lab-public', '10.92.0.0/24', CRT.pub, CIGW.c), cSub(CSN.wl, 'zcc-lab-workload', '10.92.1.0/24', CRT.wl, CENI.svc), cSub(CSN.cc, 'zcc-lab-cc', '10.92.200.0/24', CRT.cc, CNAT)],
+        route_tables: [
+          { id: CRT.cMain, name: null, main: true, routes: [{ dest: '10.92.0.0/16', target: 'local', state: 'active' }], subnets: [], tags: {} },
+          cRt(CRT.pub, 'zcc-lab-public-rt', CIGW.c, [CSN.pub], '10.92.0.0/16'),
+          cRt(CRT.wl, 'zcc-lab-workload-rt', CENI.svc, [CSN.wl], '10.92.0.0/16'),
+          cRt(CRT.cc, 'zcc-lab-cc-rt', CNAT, [CSN.cc], '10.92.0.0/16')],
+        tags: CT('zcc-lab-vpc-c') },
+      { id: CVPC.d, name: 'zcc-lab-vpc-d', cidr: '10.93.0.0/16', default: false, state: 'available', dns_hostnames: true, igw: CIGW.d, nat_gateways: [],
+        subnets: [cSub(CSN.conn, 'zcc-lab-connector', '10.93.10.0/24', CRT.conn, CIGW.d), cSub(CSN.app, 'zcc-lab-app', '10.93.20.0/24', CRT.app, null)],
+        route_tables: [
+          { id: CRT.dMain, name: null, main: true, routes: [{ dest: '10.93.0.0/16', target: 'local', state: 'active' }], subnets: [], tags: {} },
+          cRt(CRT.conn, 'zcc-lab-connector-rt', CIGW.d, [CSN.conn], '10.93.0.0/16'),
+          cRt(CRT.app, 'zcc-lab-app-rt', null, [CSN.app], '10.93.0.0/16')],
+        tags: CT('zcc-lab-vpc-d') },
+    ];
+    const ccNats = [{ id: CNAT, name: 'zcc-lab-nat', vpc: CVPC.c, subnet: CSN.pub, state: 'available', public_ip: '18.194.77.9', private_ip: '10.92.0.20', connectivity_type: 'public', created: iso(ccUp), monthly_usd: r2(RATE.nat * 730), tags: CT('zcc-lab-nat') }];
+    const ccEips = [eip('18.194.77.9', 'eipalloc-0c8d9e0f1a2b3c4d5', { kind: 'nat', id: CNAT, eni: CENI.nat }, { private_ip: '10.92.0.20', name: 'zcc-lab-nat-eip', tags: CT('zcc-lab-nat-eip') })];
+    const ccVolumes = ccInstances.map(i => vol('vol-' + i.id.slice(2, 12), i.type === 't3.medium' ? 80 : 8, i, '/dev/xvda'));
+    const cEni = (id, name, subnet, ip, instance, index) => ({ id, name, description: name ? 'zcc-lab ' + name : 'Interface for NAT Gateway ' + CNAT, vpc: CVPC.c, subnet, az: 'eu-central-1a', private_ip: ip, instance, device_index: index, status: 'in-use', interface_type: instance ? 'interface' : 'nat_gateway', source_dest_check: !instance, tags: name ? CT(name) : {} });
+    const ccEnis = [
+      cEni(CENI.svc, 'zcc-lab-cc-service', CSN.cc, '10.92.200.10', CI.cc, 1),
+      cEni(CENI.mgmt, 'zcc-lab-cc-mgmt', CSN.cc, '10.92.200.11', CI.cc, 0),
+      cEni(CENI.nat, null, CSN.pub, '10.92.0.20', null, null),
+    ];
+    const ccSgs = [
+      sg(CSG.svc, 'zcc-lab-cc-service', CVPC.c, 'Cloud Connector service interface: steered workload traffic', [rule('tcp', 0, 65535, '10.92.1.0/24')], allOut, [CI.cc], CT('zcc-lab-cc-service')),
+      sg(CSG.mgmt, 'zcc-lab-cc-mgmt', CVPC.c, 'Cloud Connector management interface: outbound only', [], allOut, [CI.cc], CT('zcc-lab-cc-mgmt')),
+      sg(CSG.wl, 'zcc-lab-workload', CVPC.c, 'Workload: no inbound', [], allOut, [CI.wl], CT('zcc-lab-workload')),
+      sg(CSG.ac, 'zcc-lab-app-connector', CVPC.d, 'App Connector: dials outbound only', [], allOut, [CI.ac], CT('zcc-lab-app-connector')),
+      sg(CSG.app, 'zcc-lab-app', CVPC.d, 'Private app: 8080 from the App Connector only', [rule('tcp', 8080, 8080, CSG.ac)], allOut, [CI.app], CT('zcc-lab-app')),
+      sg(CSG.cDef, 'default', CVPC.c, 'default VPC security group', [rule('all', null, null, CSG.cDef)], allOut, [], {}),
+      sg(CSG.dDef, 'default', CVPC.d, 'default VPC security group', [rule('all', null, null, CSG.dDef)], allOut, [], {}),
+    ];
+    const ccSecrets = [{ arn: 'arn:aws:secretsmanager:eu-central-1:257394018842:secret:ZS/CC/credentials/aws-lab-zcc-Ab12Cd', id: 'ZS/CC/credentials/aws-lab-zcc', name: 'ZS/CC/credentials/aws-lab-zcc', description: 'Cloud Connector deployment admin', created: iso(9 * D), last_changed: iso(9 * D), rotation_enabled: false, monthly_usd: RATE.secret, tags: CT('zcc-lab-cc-credentials') }];
+    const region = (r, extra) => Object.assign({ region: r, instances: [], vpcs: [], nat_gateways: [], eips: [], volumes: [], security_groups: [], network_interfaces: [], secrets: [], monthly_usd: 0, resource_count: 0 }, extra || {});
     const defVpc = (r, id) => ({ id, name: null, cidr: '172.31.0.0/16', default: true, state: 'available', dns_hostnames: true, igw: 'igw-' + id.slice(4), nat_gateways: [], subnets: [], route_tables: [], tags: {} });
     const regions = [
-      region('eu-central-1', { instances, vpcs, nat_gateways, eips, volumes, security_groups }),
+      region('eu-central-1', { instances: instances.concat(ccInstances), vpcs: vpcs.concat(ccVpcs), nat_gateways: nat_gateways.concat(ccNats),
+        eips: eips.concat(ccEips), volumes: volumes.concat(ccVolumes), security_groups: security_groups.concat(ccSgs),
+        network_interfaces: ccEnis, secrets: ccSecrets }),
       region('eu-west-1', { vpcs: [defVpc('eu-west-1', 'vpc-1a2b3c4d')], eips: [eip('54.170.12.88', 'eipalloc-2b7c8d9e0f1a2b3c4', null, {})], security_groups: [sg('sg-2b8c9d0e1f2a3b4c5', 'default', 'vpc-1a2b3c4d', 'default VPC security group', [], allOut, [], {})] }),
       region('us-east-1', { vpcs: [defVpc('us-east-1', 'vpc-5e6f7a8b')], volumes: [{ id: 'vol-0ff9a1b2c3d4e5f60', size_gb: 100, type: 'gp2', az: 'us-east-1a', iops: 300, throughput: null, encrypted: false, state: 'available', attached: false, instance: null, attached_to: null, device: null, created: iso(210 * D), name: 'old-jumpbox-root', monthly_usd: r2(100 * RATE.gp2), tags: { Name: 'old-jumpbox-root' } }] }),
       ...REGIONS.filter(r => !['eu-central-1', 'eu-west-1', 'us-east-1'].includes(r)).map(r => region(r, ['eu-west-2', 'us-west-2', 'ap-southeast-1'].includes(r) ? { vpcs: [defVpc(r, 'vpc-' + r.replace(/-/g, '').slice(0, 8))] } : {})),
@@ -3540,6 +3638,7 @@ SB.mock = (function () {
       for (const n of rg.nat_gateways) { line('NAT gateway', rg.region, 730, 'hr', RATE.nat, n.monthly_usd); attribute(rg.region, n, pj(n)); }
       for (const v of rg.volumes) { line('EBS ' + v.type + (v.attached ? '' : ' (unattached)'), rg.region, v.size_gb, 'GB-mo', RATE[v.type], v.monthly_usd); attribute(rg.region, v, pj(v) || (v.attached_to && byId.get(v.attached_to) ? pj(byId.get(v.attached_to)) : null)); }
       for (const e of rg.eips) { line(e.attached ? 'Public IPv4' : 'Elastic IP (idle)', rg.region, 730, 'hr', RATE.ipv4, e.monthly_usd); const via = e.association && e.association.kind === 'instance' ? byId.get(e.association.id) : e.association && e.association.kind === 'nat' ? rg.nat_gateways.find(n => n.id === e.association.id) : null; attribute(rg.region, e, pj(e) || (via ? pj(via) : null)); }
+      for (const sc of rg.secrets || []) { line('Secrets Manager secret', rg.region, 1, 'secret-mo', RATE.secret, sc.monthly_usd); attribute(rg.region, sc, pj(sc)); }
       rg.monthly_usd = r2(lines.filter(l => l.region === rg.region).reduce((s, l) => s + l.monthly_usd, 0));
       rg.resource_count = ['instances', 'vpcs', 'nat_gateways', 'eips', 'volumes', 'security_groups'].reduce((s, k) => s + rg[k].length, 0);
     }
@@ -3571,10 +3670,15 @@ SB.mock = (function () {
       ],
       blocked: [{ from: 'zpa-lab-mcu-client', to: 'zpa-lab-server', label: 'no route' }],
     },
-    'zia-cloud-connector-sandbox': {
-      roles: { 'zia-cc': 'connector', 'zia-workload': 'app' },
-      flows: [{ from: 'zia-workload', to: 'zia-cc', label: 'default route' }, { from: 'zia-cc', to: 'internet', label: 'ZIA tunnel :443', via: ['nat', 'internet'] }],
-      blocked: [],
+    'zcc-aws-workload': {
+      roles: { 'zcc-lab-cc': 'cloud-connector', 'zcc-lab-workload': 'workload', 'zcc-lab-app-connector': 'connector', 'zcc-lab-app': 'app' },
+      flows: [
+        { from: 'zcc-lab-workload', to: 'zcc-lab-cc', label: '0/0 + DNS ~zcc-lab.internal \u2192 service ENI' },
+        { from: 'zcc-lab-cc', to: 'internet', label: 'ZIA + ZPA tunnels :443', via: ['nat', 'internet'] },
+        { from: 'zcc-lab-app-connector', to: 'internet', label: 'dials ZPA :443', via: ['igw', 'internet'] },
+        { from: 'zcc-lab-app-connector', to: 'zcc-lab-app', label: ':8080 brokered' },
+      ],
+      blocked: [{ from: 'zcc-lab-workload', to: 'zcc-lab-app', label: 'no route' }],
     },
   };
   /* ---- v1.4: the plan register. What `tofu show -json <planfile>` would carry for each use case, reduced to
@@ -3633,60 +3737,102 @@ SB.mock = (function () {
     R('aws_key_pair.lab', { key_name: 'zpa-lab' }),
     R('aws_network_acl.app', { tags: { Name: 'zpa-lab-mcu-nacl' } }, { vpc_id: 'aws_vpc.app', subnet_ids: ['aws_subnet.mcu'] }),
   ];
+  // the CC lab as `tofu show -json` sees it: the workload table's default route points at the
+  // Cloud Connector's *service interface*, and the connector itself takes no subnet_id
   const CC_PLAN = [
-    R('aws_vpc.cc', { cidr_block: '10.80.0.0/16', tags: { Name: 'zia-cc-vpc' } }),
-    R('aws_subnet.cc_public', { cidr_block: '10.80.0.0/24', availability_zone: 'eu-central-1a', map_public_ip_on_launch: true, tags: { Name: 'zia-cc-public' } }, { vpc_id: 'aws_vpc.cc' }),
-    R('aws_subnet.workload', { cidr_block: '10.80.10.0/24', availability_zone: 'eu-central-1a', tags: { Name: 'zia-cc-workload' } }, { vpc_id: 'aws_vpc.cc' }),
-    R('aws_internet_gateway.cc', { tags: { Name: 'zia-cc-igw' } }, { vpc_id: 'aws_vpc.cc' }),
-    R('aws_route_table.cc_public', { tags: { Name: 'zia-cc-public-rt' } }, { vpc_id: 'aws_vpc.cc' }),
-    R('aws_route_table.workload', { tags: { Name: 'zia-cc-workload-rt' } }, { vpc_id: 'aws_vpc.cc' }),
-    R('aws_route.cc_default', { destination_cidr_block: '0.0.0.0/0' }, { route_table_id: 'aws_route_table.cc_public', gateway_id: 'aws_internet_gateway.cc' }),
-    R('aws_route.workload_via_cc', { destination_cidr_block: '0.0.0.0/0' }, { route_table_id: 'aws_route_table.workload', network_interface_id: 'aws_instance.cc' }),
-    R('aws_route_table_association.cc_public', {}, { subnet_id: 'aws_subnet.cc_public', route_table_id: 'aws_route_table.cc_public' }),
+    R('aws_vpc.c', { cidr_block: '10.92.0.0/16', enable_dns_hostnames: true, tags: { Name: 'zcc-lab-vpc-c' } }),
+    R('aws_vpc.d', { cidr_block: '10.93.0.0/16', enable_dns_hostnames: true, tags: { Name: 'zcc-lab-vpc-d' } }),
+    R('aws_subnet.public', { cidr_block: '10.92.0.0/24', availability_zone: 'eu-central-1a', map_public_ip_on_launch: true, tags: { Name: 'zcc-lab-public' } }, { vpc_id: 'aws_vpc.c' }),
+    R('aws_subnet.workload', { cidr_block: '10.92.1.0/24', availability_zone: 'eu-central-1a', tags: { Name: 'zcc-lab-workload' } }, { vpc_id: 'aws_vpc.c' }),
+    R('aws_subnet.cc', { cidr_block: '10.92.200.0/24', availability_zone: 'eu-central-1a', tags: { Name: 'zcc-lab-cc' } }, { vpc_id: 'aws_vpc.c' }),
+    R('aws_subnet.connector', { cidr_block: '10.93.10.0/24', availability_zone: 'eu-central-1a', map_public_ip_on_launch: true, tags: { Name: 'zcc-lab-connector' } }, { vpc_id: 'aws_vpc.d' }),
+    R('aws_subnet.app', { cidr_block: '10.93.20.0/24', availability_zone: 'eu-central-1a', tags: { Name: 'zcc-lab-app' } }, { vpc_id: 'aws_vpc.d' }),
+    R('aws_internet_gateway.c', { tags: { Name: 'zcc-lab-igw-c' } }, { vpc_id: 'aws_vpc.c' }),
+    R('aws_internet_gateway.d', { tags: { Name: 'zcc-lab-igw-d' } }, { vpc_id: 'aws_vpc.d' }),
+    R('aws_eip.nat', { domain: 'vpc', tags: { Name: 'zcc-lab-nat-eip' } }),
+    R('aws_nat_gateway.c', { connectivity_type: 'public', tags: { Name: 'zcc-lab-nat' } }, { subnet_id: 'aws_subnet.public', allocation_id: 'aws_eip.nat' }),
+    R('aws_route_table.public', { tags: { Name: 'zcc-lab-public-rt' } }, { vpc_id: 'aws_vpc.c' }),
+    R('aws_route_table.cc', { tags: { Name: 'zcc-lab-cc-rt' } }, { vpc_id: 'aws_vpc.c' }),
+    R('aws_route_table.workload', { tags: { Name: 'zcc-lab-workload-rt' } }, { vpc_id: 'aws_vpc.c' }),
+    R('aws_route_table.d_public', { tags: { Name: 'zcc-lab-connector-rt' } }, { vpc_id: 'aws_vpc.d' }),
+    R('aws_route_table.app', { tags: { Name: 'zcc-lab-app-rt' } }, { vpc_id: 'aws_vpc.d' }),
+    R('aws_route.public_default', { destination_cidr_block: '0.0.0.0/0' }, { route_table_id: 'aws_route_table.public', gateway_id: 'aws_internet_gateway.c' }),
+    R('aws_route.cc_default', { destination_cidr_block: '0.0.0.0/0' }, { route_table_id: 'aws_route_table.cc', nat_gateway_id: 'aws_nat_gateway.c' }),
+    R('aws_route.workload_default', { destination_cidr_block: '0.0.0.0/0' }, { route_table_id: 'aws_route_table.workload', network_interface_id: 'aws_network_interface.cc_service' }),
+    R('aws_route.connector_default', { destination_cidr_block: '0.0.0.0/0' }, { route_table_id: 'aws_route_table.d_public', gateway_id: 'aws_internet_gateway.d' }),
+    R('aws_route_table_association.public', {}, { subnet_id: 'aws_subnet.public', route_table_id: 'aws_route_table.public' }),
+    R('aws_route_table_association.cc', {}, { subnet_id: 'aws_subnet.cc', route_table_id: 'aws_route_table.cc' }),
     R('aws_route_table_association.workload', {}, { subnet_id: 'aws_subnet.workload', route_table_id: 'aws_route_table.workload' }),
-    R('aws_security_group.cc', { name: 'zia-cc', tags: { Name: 'zia-cc' } }, { vpc_id: 'aws_vpc.cc' }),
-    R('aws_security_group.workload', { name: 'zia-workload', tags: { Name: 'zia-workload' } }, { vpc_id: 'aws_vpc.cc' }),
-    R('aws_instance.cc', { instance_type: 't3.medium', source_dest_check: false, tags: { Name: 'zia-cc', Role: 'cloud-connector' } }, { subnet_id: 'aws_subnet.cc_public', vpc_security_group_ids: ['aws_security_group.cc'] }),
-    R('aws_instance.workload', { instance_type: 't3.micro', tags: { Name: 'zia-workload', Role: 'app' } }, { subnet_id: 'aws_subnet.workload', vpc_security_group_ids: ['aws_security_group.workload'] }),
+    R('aws_route_table_association.connector', {}, { subnet_id: 'aws_subnet.connector', route_table_id: 'aws_route_table.d_public' }),
+    R('aws_route_table_association.app', {}, { subnet_id: 'aws_subnet.app', route_table_id: 'aws_route_table.app' }),
+    R('aws_security_group.cc_service', { name: 'zcc-lab-cc-service', description: 'Cloud Connector service interface: steered workload traffic', tags: { Name: 'zcc-lab-cc-service' } }, { vpc_id: 'aws_vpc.c' }),
+    R('aws_security_group.cc_mgmt', { name: 'zcc-lab-cc-mgmt', description: 'Cloud Connector management interface: outbound only', tags: { Name: 'zcc-lab-cc-mgmt' } }, { vpc_id: 'aws_vpc.c' }),
+    R('aws_security_group.workload', { name: 'zcc-lab-workload', description: 'Workload: no inbound', tags: { Name: 'zcc-lab-workload' } }, { vpc_id: 'aws_vpc.c' }),
+    R('aws_security_group.app_connector', { name: 'zcc-lab-app-connector', description: 'App Connector: dials outbound only', tags: { Name: 'zcc-lab-app-connector' } }, { vpc_id: 'aws_vpc.d' }),
+    R('aws_security_group.app', { name: 'zcc-lab-app', description: 'Private app: 8080 from the App Connector only', tags: { Name: 'zcc-lab-app' } }, { vpc_id: 'aws_vpc.d' }),
+    R('aws_vpc_security_group_ingress_rule.cc_service_all', { ip_protocol: 'tcp', from_port: 0, to_port: 65535, cidr_ipv4: '10.92.1.0/24' }, { security_group_id: 'aws_security_group.cc_service' }),
+    R('aws_vpc_security_group_ingress_rule.app_from_connector', { ip_protocol: 'tcp', from_port: 8080, to_port: 8080 }, { security_group_id: 'aws_security_group.app', referenced_security_group_id: 'aws_security_group.app_connector' }),
+    R('aws_network_interface.cc_mgmt', { private_ips: ['10.92.200.11'], private_ip: '10.92.200.11', description: 'zcc-lab Cloud Connector management', tags: { Name: 'zcc-lab-cc-mgmt' } }, { subnet_id: 'aws_subnet.cc', security_groups: ['aws_security_group.cc_mgmt'] }),
+    R('aws_network_interface.cc_service', { private_ips: ['10.92.200.10'], private_ip: '10.92.200.10', source_dest_check: false, description: 'zcc-lab Cloud Connector service', tags: { Name: 'zcc-lab-cc-service' } }, { subnet_id: 'aws_subnet.cc', security_groups: ['aws_security_group.cc_service'] }),
+    R('aws_instance.cc', { instance_type: 'm6i.large', root_block_device: [{ volume_size: 8, volume_type: 'gp3' }], tags: { Name: 'zcc-lab-cc', Role: 'cloud-connector' } }, { network_interface: [{ device_index: 0, network_interface_id: 'aws_network_interface.cc_mgmt' }, { device_index: 1, network_interface_id: 'aws_network_interface.cc_service' }] }),
+    R('aws_instance.workload', { instance_type: 't3.micro', root_block_device: [{ volume_size: 8, volume_type: 'gp3' }], tags: { Name: 'zcc-lab-workload', Role: 'workload' } }, { subnet_id: 'aws_subnet.workload', vpc_security_group_ids: ['aws_security_group.workload'] }),
+    R('aws_instance.app_connector', { instance_type: 't3.medium', root_block_device: [{ volume_size: 80, volume_type: 'gp3' }], tags: { Name: 'zcc-lab-app-connector', Role: 'app-connector' } }, { subnet_id: 'aws_subnet.connector', vpc_security_group_ids: ['aws_security_group.app_connector'] }),
+    R('aws_instance.app', { instance_type: 't3.micro', root_block_device: [{ volume_size: 8, volume_type: 'gp3' }], tags: { Name: 'zcc-lab-app', Role: 'app' } }, { subnet_id: 'aws_subnet.app', vpc_security_group_ids: ['aws_security_group.app'] }),
+    R('aws_iam_role.node', { name: 'zcc-lab-node' }),
+    R('aws_iam_instance_profile.node', { name: 'zcc-lab-node' }, { role: 'aws_iam_role.node' }),
   ];
-  const PLANS = { 'zpa-private-service-edge': PSE_PLAN, 'zia-cloud-connector-sandbox': CC_PLAN };
-  /** Where `resource "<type>" "<name>"` is declared in the mock checkout: {path, line} or null. */
-  function sourceFor(address) {
+  const PLANS = { 'zpa-private-service-edge': PSE_PLAN, 'zcc-aws-workload': CC_PLAN };
+  const CC_PATHS = ['terraform/vpc_c.tf', 'terraform/vpc_d.tf'];  // the CC lab's own checkout
+  /** The mock checkout of one use case: the two labs do not share files. */
+  function filesOf(ucId) {
+    const cc = ucId === 'zcc-aws-workload', shared = p => p === 'usecase.yaml';  // the manifest is per use case (see codeFile)
+    return Object.keys(FILES).filter(p => shared(p) || (CC_PATHS.indexOf(p) >= 0) === cc);
+  }
+  /** Where `resource "<type>" "<name>"` is declared in that checkout: {path, line} or null. */
+  function sourceFor(address, ucId) {
     const m = /^([a-z0-9_]+)\.([a-z0-9_]+)$/.exec(address || ''); if (!m) return null;
     const re = new RegExp('^resource\\s+"' + m[1] + '"\\s+"' + m[2] + '"');
-    for (const path of Object.keys(FILES)) {
+    for (const path of filesOf(ucId)) {
       if (!/\.tf$/.test(path)) continue;
       const i = FILES[path].split('\n').findIndex(l => re.test(l));
       if (i >= 0) return { path, line: i + 1 };
     }
     return null;
   }
-  let srcByName = null; // "<type>:<Name tag>" -> source, so live (deployed) nodes can point at their block too (built on first use; FILES is declared later)
+  const srcByName = {}; // ucId -> "<type>:<Name tag>" -> source, so live (deployed) nodes point at their block too (built on first use; FILES is declared later)
   const KIND_TYPE = { vpc: 'aws_vpc', subnet: 'aws_subnet', instance: 'aws_instance', nat: 'aws_nat_gateway', igw: 'aws_internet_gateway', eip: 'aws_eip' };
-  function sourceByName(kind, name) {
-    if (!srcByName) { srcByName = {}; for (const p of Object.values(PLANS)) for (const r of p) { const nm = r.values.tags && r.values.tags.Name; if (nm) srcByName[r.type + ':' + nm] = sourceFor(r.address); } }
-    return name && KIND_TYPE[kind] ? srcByName[KIND_TYPE[kind] + ':' + name] || null : null;
+  function sourceByName(kind, name, ucId) {
+    if (!srcByName[ucId]) { const m = srcByName[ucId] = {}; for (const r of PLANS[ucId] || []) { const nm = r.values.tags && r.values.tags.Name; if (nm) m[r.type + ':' + nm] = sourceFor(r.address, ucId); } }
+    return name && KIND_TYPE[kind] ? srcByName[ucId][KIND_TYPE[kind] + ':' + name] || null : null;
   }
   /** Build the v1.2 graph from a plan: structure from the expression references, meaning from the manifest. */
-  function planGraph(plan, decl) {
+  function planGraph(plan, decl, ucId) {
     const byAddr = new Map(plan.map(r => [r.address, r]));
     const of = (t) => plan.filter(r => r.type === t);
     const label = r => (r.values.tags && r.values.tags.Name) || r.name;
     const vpcOfSubnet = a => { const sn = byAddr.get(a); return sn ? sn.refs.vpc_id : null; };
     const nodes = [{ id: 'internet', kind: 'internet', label: 'Internet' }], edges = [], unknown = [];
     const roles = (decl && decl.roles) || {};
-    const node = (r, extra) => { nodes.push(Object.assign({ id: r.address, label: label(r), source: sourceFor(r.address), detail: Object.assign({ address: r.address, type: r.type }, r.values) }, extra)); };
+    const node = (r, extra) => { nodes.push(Object.assign({ id: r.address, label: label(r), source: sourceFor(r.address, ucId), detail: Object.assign({ address: r.address, type: r.type }, r.values) }, extra)); };
     // route tables: which subnet is associated with which table, and what the table's default route hits
     const rtOf = {}; for (const a of of('aws_route_table_association')) if (a.refs.subnet_id) rtOf[a.refs.subnet_id] = a.refs.route_table_id;
     const rtDefault = {}; for (const rt of of('aws_route')) if (rt.values.destination_cidr_block === '0.0.0.0/0') rtDefault[rt.refs.route_table_id] = rt.refs.gateway_id || rt.refs.nat_gateway_id || rt.refs.network_interface_id || rt.refs.instance_id || null;
     const kindOf = a => { const r = byAddr.get(a); return r ? r.type : null; };
+    // which instance attaches which interface: an appliance's route target is one of its ENIs
+    const eniOwner = {}, eniOf = {};
+    for (const i of of('aws_instance')) for (const nic of (i.refs.network_interface || [])) { eniOwner[nic.network_interface_id] = i.address; (eniOf[i.address] = eniOf[i.address] || []).push(nic); }
+    for (const a of of('aws_network_interface_attachment')) if (a.refs.network_interface_id && a.refs.instance_id) eniOwner[a.refs.network_interface_id] = a.refs.instance_id;
     for (const v of of('aws_vpc')) node(v, { kind: 'vpc', cidr: v.values.cidr_block, parent: null });
+    const inspected = [];
     for (const sn of of('aws_subnet')) {
       const target = rtDefault[rtOf[sn.address]] || null, k = kindOf(target);
-      const exposure = k === 'aws_internet_gateway' ? 'public' : k === 'aws_nat_gateway' || k === 'aws_instance' ? 'private' : 'isolated';
-      node(sn, { kind: 'subnet', cidr: sn.values.cidr_block, parent: sn.refs.vpc_id, exposure, az: sn.values.availability_zone });
-      if (target) edges.push({ kind: 'route', from: sn.address, to: target, label: '0.0.0.0/0' });
+      const owner = k === 'aws_network_interface' ? eniOwner[target] || null : k === 'aws_instance' ? target : null;
+      const exposure = owner ? 'inspected' : k === 'aws_internet_gateway' ? 'public' : k === 'aws_nat_gateway' ? 'private' : 'isolated';
+      node(sn, { kind: 'subnet', cidr: sn.values.cidr_block, parent: sn.refs.vpc_id, exposure, az: sn.values.availability_zone, default_route: owner || target });
+      if (owner) { const e = byAddr.get(target); inspected.push({ from: sn.address, to: owner, eni: e ? { id: e.address, name: (e.values.tags && e.values.tags.Name) || e.name, private_ip: e.values.private_ip || null } : null }); }
+      else if (target) edges.push({ kind: 'route', from: sn.address, to: target, label: '0.0.0.0/0' });
     }
+    for (const r of inspected) edges.push({ kind: 'route', from: r.from, to: r.to, label: '0.0.0.0/0', inspected: true, eni: r.eni });
     for (const g of of('aws_internet_gateway')) { node(g, { kind: 'igw', label: 'IGW', parent: g.refs.vpc_id }); edges.push({ kind: 'uplink', from: g.address, to: 'internet' }); }
     for (const n of of('aws_nat_gateway')) {
       const vpc = vpcOfSubnet(n.refs.subnet_id);
@@ -3696,9 +3842,13 @@ SB.mock = (function () {
     const byName = {};
     const sgHolders = {}; // sg address -> instance addresses
     for (const i of of('aws_instance')) {
-      node(i, { kind: 'instance', parent: i.refs.subnet_id, role: roles[label(i)] || null, type: i.values.instance_type || null, state: null, private_ip: null, public_ip: null });
+      // an appliance declares interfaces instead of a subnet: it sits where device index 0 does
+      const nics = (eniOf[i.address] || []).slice().sort((a, b) => (a.device_index || 0) - (b.device_index || 0));
+      const viaEni = nics.length ? (byAddr.get(nics[0].network_interface_id) || {}).refs : null;
+      node(i, { kind: 'instance', parent: i.refs.subnet_id || (viaEni ? viaEni.subnet_id : null), role: roles[label(i)] || null, type: i.values.instance_type || null, state: null, private_ip: null, public_ip: null });
       byName[label(i)] = i.address;
       for (const sg of i.refs.vpc_security_group_ids || []) (sgHolders[sg] = sgHolders[sg] || []).push(i.address);
+      for (const nic of nics) for (const sg of ((byAddr.get(nic.network_interface_id) || { refs: {} }).refs.security_groups || [])) (sgHolders[sg] = sgHolders[sg] || []).push(i.address);
     }
     for (const rule of of('aws_vpc_security_group_ingress_rule')) {
       const v = rule.values, src = v.cidr_ipv4 || rule.refs.referenced_security_group_id || null; if (!src) continue;
@@ -3737,7 +3887,7 @@ SB.mock = (function () {
       if (ucId === 'zpa-private-service-edge' && TOPO_MODE === 'planfail') return Object.assign(planBase, { reason: 'The plan failed, so there is nothing to draw', plan: { generated_at: plannedAt.t, resources: 0, error: PLAN_ERROR } });
       const plan = PLANS[ucId];
       if (!plan) return Object.assign(planBase, { reason: 'The plan creates nothing for this use case', plan: { generated_at: plannedAt.t, resources: 0 } });
-      return Object.assign(planBase, planGraph(plan, decl), { plan: { generated_at: plannedAt.t, resources: plan.length } });
+      return Object.assign(planBase, planGraph(plan, decl, ucId), { plan: { generated_at: plannedAt.t, resources: plan.length } });
     }
     if (refresh) inv = inventory(true);
     const r = inv.regions.find(x => x.region === 'eu-central-1');
@@ -3747,14 +3897,20 @@ SB.mock = (function () {
     const vpcs = r.vpcs.filter(tagged);
     const vpcIds = new Set(vpcs.map(v => v.id));
     const instances = r.instances.filter(tagged);
+    // v1.5: a default route can point at a network interface; only the ENI record says whose it is
+    const eniById = {}; for (const e of r.network_interfaces || []) eniById[e.id] = e;
+    const inspected = [];
     if (!vpcs.length && !instances.length) return Object.assign(base, { reason: 'No resources tagged Project=' + project + ' in eu-central-1' + (uc.state === 'turning_on' ? ' yet — the turn-on is still running' : '') });
     const roles = (decl && decl.roles) || {};
     for (const v of vpcs) {
       nodes.push({ id: v.id, kind: 'vpc', label: v.name || v.id, cidr: v.cidr, parent: null, detail: v });
       for (const sn of v.subnets || []) {
-        const t = sn.default_route; const exposure = !t ? 'isolated' : /^igw-/.test(t) ? 'public' : /^nat-/.test(t) ? 'private' : 'isolated';
-        nodes.push({ id: sn.id, kind: 'subnet', label: sn.name || sn.id, cidr: sn.cidr, parent: v.id, exposure, az: sn.az, detail: sn });
-        if (t) edges.push({ kind: 'route', from: sn.id, to: t, label: '0.0.0.0/0' });
+        const t = sn.default_route, e = eniById[t];
+        const owner = (e && e.instance) || null;
+        const exposure = owner ? 'inspected' : !t ? 'isolated' : /^igw-/.test(t) ? 'public' : /^nat-/.test(t) ? 'private' : 'isolated';
+        nodes.push({ id: sn.id, kind: 'subnet', label: sn.name || sn.id, cidr: sn.cidr, parent: v.id, exposure, az: sn.az, default_route: owner || t, detail: sn });
+        if (owner) inspected.push({ from: sn.id, to: owner, eni: { id: e.id, name: e.name, private_ip: e.private_ip } });
+        else if (t) edges.push({ kind: 'route', from: sn.id, to: t, label: '0.0.0.0/0' });
       }
       if (v.igw) { nodes.push({ id: v.igw, kind: 'igw', label: 'IGW', parent: v.id }); edges.push({ kind: 'uplink', from: v.igw, to: 'internet' }); }
     }
@@ -3770,6 +3926,7 @@ SB.mock = (function () {
       for (const g of i.security_groups || []) { const sg = r.security_groups.find(x => x.id === g.id); for (const rule of (sg && sg.ingress) || []) edges.push({ kind: 'allow', from: rule.source, to: i.id, label: (rule.proto === 'all' ? 'all' : rule.proto + '/' + (rule.from === rule.to ? rule.from : rule.from + '-' + rule.to)) }); }
     }
     const instIds = new Set(instances.map(i => i.id)), natIds = new Set(nodes.filter(n => n.kind === 'nat').map(n => n.id));
+    for (const rt of inspected) { if (instIds.has(rt.to)) edges.push({ kind: 'route', from: rt.from, to: rt.to, label: '0.0.0.0/0', inspected: true, eni: rt.eni }); }
     for (const e of r.eips) {
       const a = e.association;
       const to = a && a.kind === 'instance' && instIds.has(a.id) ? a.id : a && a.kind === 'nat' && natIds.has(a.id) ? a.id : null;
@@ -3786,8 +3943,11 @@ SB.mock = (function () {
     }
     for (const b of (decl && decl.blocked) || []) { const from = resolve(b.from, 'blocked pair'), to = resolve(b.to, 'blocked pair'); if (from && to) edges.push({ kind: 'blocked', from, to, label: b.label || 'blocked', declared: true }); }
     const enrolment = {};
-    for (const [k, v] of Object.entries(uc.status || {})) { if (!v || typeof v !== 'object' || !('status' in v)) continue; const id = byName['zpa-lab-' + k.replace(/_/g, '-')]; if (id) enrolment[id] = { authenticated: v.status === 'ZPN_STATUS_AUTHENTICATED', label: k === 'pse' ? 'Private Service Edge' : 'App Connector' }; }
-    for (const n of nodes) { const src = sourceByName(n.kind, n.kind === 'eip' ? (n.detail && n.detail.name) : n.kind === 'igw' ? null : n.label); if (src) n.source = src; }
+    const comps = uc.status && Array.isArray(uc.status.components) ? uc.status.components : null;
+    if (comps) { const byIp = {}; for (const i of instances) if (i.private_ip) byIp[i.private_ip] = i.id;
+      for (const c of comps) { const id = byIp[c.private_ip]; if (id) enrolment[id] = { authenticated: !!c.authenticated, label: c.label, component: c.id, status: c.control_channel, version: c.version, matched_by: 'private_ip' }; } }
+    else for (const [k, v] of Object.entries(uc.status || {})) { if (!v || typeof v !== 'object' || !('status' in v)) continue; const id = byName['zpa-lab-' + k.replace(/_/g, '-')]; if (id) enrolment[id] = { authenticated: v.status === 'ZPN_STATUS_AUTHENTICATED', label: k === 'pse' ? 'Private Service Edge' : 'App Connector' }; }
+    for (const n of nodes) { const src = sourceByName(n.kind, n.kind === 'eip' ? (n.detail && n.detail.name) : n.kind === 'igw' ? null : n.label, ucId); if (src) n.source = src; }
     delete base.declared;
     return Object.assign(base, { register: 'deployed', generated_at: inv.generated_at, nodes, edges, enrolment, unknown });
   }
@@ -3843,12 +4003,49 @@ shared with anything else. See the [lab repository](https://github.com/nilsujma-
   };
   const PROC_CC = {
     on: [
-      { name: 'Register Cloud Connector', run: 'python3 scripts/cc_register.py' },
+      { name: 'Baseline the tenant', run: 'python3 scripts/tenant_snapshot.py' },
+      { name: 'Preflight quotas and secret', run: 'python3 scripts/preflight.py' },
+      { name: 'Create ZPA connector group and app segment', run: 'python3 scripts/zpa_create.py' },
+      { name: 'Create CC admin, templates and secret', run: 'python3 scripts/ztw_create.py && python3 scripts/put_cc_secret.py' },
+      { name: 'Seed provisioning key into SSM', run: 'python3 scripts/put_keys_ssm.py' },
       { name: 'Apply infrastructure', run: 'tofu -chdir=terraform apply -auto-approve -input=false' },
-      { name: 'Smoke test egress', run: 'bash scripts/smoke.sh' },
+      { name: 'Wait for CC and connector registration', run: 'python3 scripts/wait_registered.py --timeout 1200' },
+      { name: 'Forward the app segment to ZPA', run: 'python3 scripts/ztw_policy.py' },
+      { name: 'Allow the lab CC group to the private app', run: 'python3 scripts/zpa_policy.py' },
+      { name: 'ZIA URL and DLP policy', run: 'python3 scripts/zia_policy.py' },
+      { name: 'Verify nothing pre-existing changed', run: 'python3 scripts/tenant_verify.py' },
+      { name: 'Wait for egress and ZPA evidence', run: 'python3 scripts/wait_evidence.py --timeout 600' },
     ],
     off: [{ name: 'Destroy infrastructure', run: 'tofu -chdir=terraform destroy -auto-approve -input=false' }],
   };
+  const CC_DESC = `A reproducible **Zscaler Cloud Connector** lab built end to end in AWS \`eu-central-1\`: one
+migrated workload whose internet egress goes out through ZIA and whose only private application
+lives in a second, unconnected VPC reached through ZPA — both edges through the same Cloud
+Connector, both logged against the workload's own identity. The network is the drawing above.
+
+## What turning it on does
+
+Baselines the tenant, creates the ZPA connector group, server group and the application segment
+\`app.zcc-lab.internal\`, mints a dedicated Cloud Connector deployment admin and stores it in
+Secrets Manager, seeds the connector key into SSM, applies the infrastructure, waits for both
+components to register, then writes the forwarding, access, URL and DLP rules — scoped to the
+lab's own connector group and location — and verifies the evidence on the workload itself.
+
+## What turning it off does
+
+\`tofu destroy\` removes every AWS resource. The Zscaler objects and the Secrets Manager secret
+deliberately survive; the connectors show as disconnected until the next turn-on.
+
+## Cost
+
+About **$192/month** at on-demand list price while on; zero when off. The Cloud Connector is
+licensed on the tenant. The Clouds page shows the live figure under \`Project=zcc-workload-lab\`.
+
+## Sharing
+
+Self-contained. The only shared object is the Zscaler tenant; every object it creates is prefixed
+\`AWS-Lab ZCC\` and every rule names the lab's own group or location, so nothing it writes can match
+traffic that is not this lab's. See the [lab repository](https://github.com/nilsujma-dev/zs-zcc-aws-workload-lab) for the runbook.`;
   const PROC_OT = {
     on: [
       { name: 'Render relay config', run: 'python3 scripts/render.py' },
@@ -3875,13 +4072,19 @@ shared with anything else. See the [lab repository](https://github.com/nilsujma-
       source: { git: 'https://github.com/nilsujma-dev/zs-zpa-branch-pair.git', ref: 'main', commit: '1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b' },
       status: null, runs: [], tags: { Project: 'zpa-branch' },
     },
-    'zia-cloud-connector-sandbox': {
-      id: 'zia-cloud-connector-sandbox', name: 'ZIA Cloud Connector sandbox', provider: 'aws',
-      summary: 'A single Cloud Connector forwarding a workload subnet to ZIA for egress policy demos.',
-      state: 'off', resources: 0, procedure: PROC_CC,
-      description: 'A minimal **Cloud Connector** deployment: one connector, one workload instance, one route table. Useful for showing URL filtering and DLP on server egress.\n\n```yaml\nconnector:\n  size: t3.medium\n  ha: false\n```',
-      source: { git: 'https://github.com/nilsujma-dev/zs-zia-cc-sandbox.git', ref: 'main', commit: null },
-      status: null, runs: [], tags: { Project: 'zia-cc-sandbox' },
+    'zcc-aws-workload': {
+      id: 'zcc-aws-workload', name: 'Cloud Connector — AWS workload zero trust', provider: 'aws',
+      summary: 'A migrated workload keeps internet and private-app access under zero trust through a Cloud Connector.',
+      state: PLANNED ? 'off' : 'on', resources: PLANNED ? 0 : 4, cost_monthly: PLANNED ? 0 : 192.43, procedure: PROC_CC, description: CC_DESC,
+      source: { git: 'https://github.com/nilsujma-dev/zs-zcc-aws-workload-lab.git', ref: 'main', commit: '3f9a1c7e5b2d4068a1c3e5f70982b4d6c8e0a2f4' },
+      status: PLANNED ? null : { healthy: true, summary: 'Cloud Connector and App Connector registered; all six checks pass',
+        region: 'eu-central-1', checked_at: iso(52000),
+        components: [
+          { id: 'cc', label: 'Cloud Connector', authenticated: true, control_channel: 'ACTIVE', private_ip: '10.92.200.11', version: '4.7.1', group: 'AWS-Lab ZCC' },
+          { id: 'connector', label: 'App Connector', authenticated: true, control_channel: 'ZPN_STATUS_AUTHENTICATED', private_ip: '10.93.10.10', version: '25.62.1' }],
+        checks: { egress_is_zia: true, url_blocked: true, dlp_blocked: true, zpa_reach: true, direct_blocked: true, dns_split: true },
+        instances: { running: 4, total: 4 } },
+      runs: [], tags: { Project: 'zcc-workload-lab' },
     },
     'ot-edge-relay': {
       id: 'ot-edge-relay', name: 'OT edge relay', provider: 'aws',
@@ -3900,6 +4103,8 @@ shared with anything else. See the [lab repository](https://github.com/nilsujma-
       status: null, runs: [], tags: {},
     },
   };
+
+  if (REAL_LABS) for (const id of Object.keys(usecases)) { if (id !== 'zpa-private-service-edge' && id !== 'zcc-aws-workload') delete usecases[id]; }
 
   /* ---- job engine ---- */
   function mkJob(ucId, action, opts) {
@@ -3923,7 +4128,17 @@ shared with anything else. See the [lab repository](https://github.com/nilsujma-
     'Seed provisioning keys into SSM': ['put-parameter /zpa-lab/pse/key (SecureString) version 3', 'put-parameter /zpa-lab/connector/key (SecureString) version 3', 'ok'],
     'Create connector group': ['connector group branch-eu-west-1 (lat 53.35, lon -6.26)', 'ok'],
     'Seed provisioning key': ['put-parameter /zpa-branch/connector/key (SecureString) version 1', 'ok'],
-    'Register Cloud Connector': ['ZIA: provisioning URL zscloud.net/…/cc-sandbox', 'ok'],
+    'Baseline the tenant': ['GET /zpa/mgmtconfig/v1/admin/customers/…/appConnectorGroup 200 (14 objects)', 'GET /ztw/api/v1/ecgroup 200 (3 objects)', 'GET /zia/api/v1/urlFilteringRules 200 (22 objects)', 'baseline sha256 8f31c0…e7 written to tenant-snapshot/ (git-ignored)', 'ok'],
+    'Preflight quotas and secret': ['VPC quota eu-central-1: 3/5 used, 2 free', 'elastic IP quota: 3/5 used', 'Marketplace subscription CLOUD_CONNECTOR: entitled', 'AMI zscaler-cloud-connector-4.7.1 resolves to ami-0cc1c2d3e4f5a6b78', 'no CIDR overlap: 10.92.0.0/16, 10.93.0.0/16 free', 'ok'],
+    'Create ZPA connector group and app segment': ['app connector group AWS-Lab ZCC (id 216196257331372004): created', 'provisioning key AWS-Lab ZCC connector: created (maxUsage 25, Root cert)', 'segment group / server group AWS-Lab ZCC: created', 'app segment app.zcc-lab.internal tcp/8080 -> created', 'ok'],
+    'Create CC admin, templates and secret': ['admin AWS-Lab ZCC deploy: created (password not printed)', 'location template AWS-Lab ZCC: created', 'provisioning template AWS-Lab ZCC AWS small: created', 'PUT /ztw/api/v1/ecAdminActivateStatus/activate 200', 'put-parameter /zcc-lab/cc-prov-url (String) version 1', 'secretsmanager: ZS/CC/credentials/aws-lab-zcc created (3 keys, values not logged)', 'ok'],
+    'Seed provisioning key into SSM': ['put-parameter /zcc-lab/connector-provisioning-key (SecureString) version 4', 'ok'],
+    'Wait for CC and connector registration': ['polling ZTW and ZPA (timeout 1200s)', 'cc: no ecVMs yet', 'cc: ecVMs[0].status=booting', 'connector: ZPN_STATUS_DISCONNECTED', 'cc: ecVMs[0].status=active, operationalStatus=active', 'ZIA location AWS-Lab-ZCC-eu-central-1 present', 'connector: ZPN_STATUS_AUTHENTICATED', 'both components registered after 412s', 'ok'],
+    'Forward the app segment to ZPA': ['forwarding rule "AWS-Lab ZCC forward to ZPA": created, order 1', 'scoped to ec_groups=[AWS-Lab ZCC] — never all groups', 'activated', 'ok'],
+    'Allow the lab CC group to the private app': ['access rule "AWS-Lab ZCC workload to private app": created', 'criteria: APP=app.zcc-lab.internal AND EDGE_CONNECTOR_GROUP=AWS-Lab ZCC', 'ok'],
+    'ZIA URL and DLP policy': ['custom URL category AWS-Lab ZCC Blocked: created', 'URL filtering rule AWS-Lab ZCC Block: created, scoped to location AWS-Lab-ZCC-eu-central-1', 'DLP dictionary + engine AWS-Lab ZCC: created', 'web DLP rule AWS-Lab ZCC DLP: created', 'POST /zia/api/v1/status/activate 200', 'ok'],
+    'Verify nothing pre-existing changed': ['re-reading 39 pre-existing objects', 'sha256 8f31c0…e7 == baseline', 'ok — nothing outside the lab was modified'],
+    'Wait for egress and ZPA evidence': ['ssm send-command on i-0a2b3c4d5e6f70819 (timeout 600s)', 'egress_is_zia: ip.zscaler.com says "Your request is arriving ... Zscaler" ✓', 'url_blocked: http://neverssl.com/ -> 403 ✓', 'dlp_blocked: POST AWS-LAB-DLP-418320 -> 403 ✓', 'zpa_reach: http://app.zcc-lab.internal:8080/ -> "zcc-lab private app" ✓', 'direct_blocked: http://10.93.20.10:8080/ -> timeout ✓', 'dns_split: ~zcc-lab.internal -> 185.46.212.88, 185.46.212.89 ✓', 'six of six checks pass', 'ok'],
     'Render relay config': ['rendered relay.conf (14 lines)', 'ok'],
     'Apply infrastructure': ['tofu -chdir=terraform apply -auto-approve -input=false', 'Acquiring state lock. This may take a few moments...', 'aws_vpc.pse: Creating...', 'aws_vpc.app: Creating...', 'aws_vpc.pse: Creation complete after 2s [id=vpc-0f1e2d3c4b5a69788]', 'aws_vpc.app: Creation complete after 2s [id=vpc-0a9b8c7d6e5f41323]', 'aws_subnet.pse_public: Creation complete after 1s', 'aws_internet_gateway.pse: Creation complete after 1s', 'aws_eip.pse: Creation complete after 1s [id=eipalloc-0c2d]', 'aws_nat_gateway.app: Creating...', 'aws_nat_gateway.app: Still creating... [10s elapsed]', 'aws_nat_gateway.app: Still creating... [20s elapsed]', 'aws_nat_gateway.app: Creation complete after 94s [id=nat-0123456789abcdef0]', 'aws_instance.connector[0]: Creating...', 'aws_instance.connector[1]: Creating...', 'aws_instance.pse: Creating...', 'aws_instance.pse: Creation complete after 33s [id=i-0a1b2c3d4e5f60718]', 'aws_instance.connector[0]: Creation complete after 34s', 'aws_instance.connector[1]: Creation complete after 35s', 'Apply complete! Resources: 5 added, 0 changed, 0 destroyed.', 'Releasing state lock. This may take a few moments...', 'Outputs:', 'pse_public_ip = "63.188.16.52"'],
     'Wait for enrolment': ['polling ZPA for enrolment (timeout 900s)', 'pse: ZPN_STATUS_DISCONNECTED (booting)', 'connector-a: not seen yet', 'connector-b: not seen yet', 'pse: ZPN_STATUS_DISCONNECTED', 'connector-a: ZPN_STATUS_DISCONNECTED', 'pse: ZPN_STATUS_AUTHENTICATED', 'connector-b: ZPN_STATUS_DISCONNECTED', 'connector-a: ZPN_STATUS_AUTHENTICATED', 'connector-b: ZPN_STATUS_AUTHENTICATED', 'all components enrolled after 186s', 'ok'],
@@ -3958,7 +4173,7 @@ shared with anything else. See the [lab repository](https://github.com/nilsujma-
     const uc = usecases[job.usecase];
     const run = uc.runs.find(r => r.job_id === job.id); if (run) { run.state = result; run.ended = job.ended; }
     if (result === 'failed') uc.state = 'error';
-    else { uc.state = job.action === 'on' ? 'on' : 'off'; uc.resources = job.action === 'on' ? (uc.id === 'zpa-private-service-edge' ? 5 : uc.id === 'zpa-branch-connector-pair' ? 4 : 3) : 0; }
+    else { uc.state = job.action === 'on' ? 'on' : 'off'; uc.resources = job.action === 'on' ? (uc.id === 'zpa-private-service-edge' ? 5 : uc.id === 'zcc-aws-workload' ? 4 : uc.id === 'zpa-branch-connector-pair' ? 4 : 3) : 0; }
   }
   // completed history for the fixtures
   function backfill(ucId, action, result, endedAgo, failAt) {
@@ -3980,18 +4195,293 @@ shared with anything else. See the [lab repository](https://github.com/nilsujma-
     backfill('zpa-private-service-edge', 'on', 'succeeded', 3 * D + 2 * H);
     usecases['zpa-private-service-edge'].state = 'on'; usecases['zpa-private-service-edge'].resources = 5;
   }
-  backfill('zia-cloud-connector-sandbox', 'off', 'succeeded', 12 * D);
-  usecases['zia-cloud-connector-sandbox'].state = 'off'; usecases['zia-cloud-connector-sandbox'].resources = 0;
-  backfill('ot-edge-relay', 'on', 'failed', 1 * H + 7 * MIN, 2);
-  usecases['ot-edge-relay'].state = 'error'; usecases['ot-edge-relay'].resources = 3;
-  // the live one: a job that is running right now
-  const liveJob = mkJob('zpa-branch-connector-pair', 'on', { started: iso(48000) });
-  for (let n = 0; n < 9; n++) tickJob(liveJob);
-  liveJob.steps.forEach((st, i) => { if (st.started) { st.started = iso(46000 - i * 19000); if (st.ended) st.ended = iso(46000 - i * 19000 - 17000); } });
+  if (PLANNED) {
+    backfill('zcc-aws-workload', 'on', 'succeeded', 12 * D);
+    backfill('zcc-aws-workload', 'off', 'succeeded', 1 * D + 3 * H);
+    usecases['zcc-aws-workload'].state = 'off'; usecases['zcc-aws-workload'].resources = 0; usecases['zcc-aws-workload'].status = null;
+  } else {
+    backfill('zcc-aws-workload', 'off', 'succeeded', 12 * D);
+    backfill('zcc-aws-workload', 'on', 'succeeded', 2 * D + 4 * H);
+    usecases['zcc-aws-workload'].state = 'on'; usecases['zcc-aws-workload'].resources = 4;
+  }
+  if (!REAL_LABS) {
+    backfill('ot-edge-relay', 'on', 'failed', 1 * H + 7 * MIN, 2);
+    usecases['ot-edge-relay'].state = 'error'; usecases['ot-edge-relay'].resources = 3;
+    // the live one: a job that is running right now
+    const liveJob = mkJob('zpa-branch-connector-pair', 'on', { started: iso(48000) });
+    for (let n = 0; n < 9; n++) tickJob(liveJob);
+    liveJob.steps.forEach((st, i) => { if (st.started) { st.started = iso(46000 - i * 19000); if (st.ended) st.ended = iso(46000 - i * 19000 - 17000); } });
+  }
   setInterval(() => { Object.values(jobs).forEach(j => { if (j.state === 'running') tickJob(j); }); }, 1100);
 
   /* ---- code fixtures ---- */
   const FILES = {
+    'terraform/vpc_c.tf': `# VPC C — the cloud VPC: the workload and the Cloud Connector that inspects its traffic.
+resource "aws_vpc" "c" {
+  cidr_block           = "10.92.0.0/16"
+  enable_dns_hostnames = true
+  tags                 = { Name = "zcc-lab-vpc-c" }
+}
+
+resource "aws_internet_gateway" "c" {
+  vpc_id = aws_vpc.c.id
+  tags   = { Name = "zcc-lab-igw-c" }
+}
+
+resource "aws_subnet" "public" {
+  vpc_id                  = aws_vpc.c.id
+  cidr_block              = "10.92.0.0/24"
+  availability_zone       = "eu-central-1a"
+  map_public_ip_on_launch = true
+  tags                    = { Name = "zcc-lab-public" }
+}
+
+resource "aws_subnet" "workload" {
+  vpc_id            = aws_vpc.c.id
+  cidr_block        = "10.92.1.0/24"
+  availability_zone = "eu-central-1a"
+  tags              = { Name = "zcc-lab-workload" }
+}
+
+resource "aws_subnet" "cc" {
+  vpc_id            = aws_vpc.c.id
+  cidr_block        = "10.92.200.0/24"
+  availability_zone = "eu-central-1a"
+  tags              = { Name = "zcc-lab-cc" }
+}
+
+resource "aws_eip" "nat" {
+  domain = "vpc"
+  tags   = { Name = "zcc-lab-nat-eip" }
+}
+
+resource "aws_nat_gateway" "c" {
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.public.id
+  tags          = { Name = "zcc-lab-nat" }
+}
+
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.c.id
+  tags   = { Name = "zcc-lab-public-rt" }
+}
+
+resource "aws_route_table" "cc" {
+  vpc_id = aws_vpc.c.id
+  tags   = { Name = "zcc-lab-cc-rt" }
+}
+
+# The whole point of the lab: the workload's default route is the connector's service interface.
+resource "aws_route_table" "workload" {
+  vpc_id = aws_vpc.c.id
+  tags   = { Name = "zcc-lab-workload-rt" }
+}
+
+resource "aws_route" "public_default" {
+  route_table_id         = aws_route_table.public.id
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id             = aws_internet_gateway.c.id
+}
+
+resource "aws_route" "cc_default" {
+  route_table_id         = aws_route_table.cc.id
+  destination_cidr_block = "0.0.0.0/0"
+  nat_gateway_id         = aws_nat_gateway.c.id
+}
+
+resource "aws_route" "workload_default" {
+  route_table_id         = aws_route_table.workload.id
+  destination_cidr_block = "0.0.0.0/0"
+  network_interface_id   = aws_network_interface.cc_service.id
+}
+
+resource "aws_route_table_association" "public" {
+  subnet_id      = aws_subnet.public.id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "aws_route_table_association" "cc" {
+  subnet_id      = aws_subnet.cc.id
+  route_table_id = aws_route_table.cc.id
+}
+
+resource "aws_route_table_association" "workload" {
+  subnet_id      = aws_subnet.workload.id
+  route_table_id = aws_route_table.workload.id
+}
+
+resource "aws_security_group" "cc_service" {
+  name        = "zcc-lab-cc-service"
+  description = "Cloud Connector service interface: steered workload traffic"
+  vpc_id      = aws_vpc.c.id
+  tags        = { Name = "zcc-lab-cc-service" }
+}
+
+resource "aws_security_group" "cc_mgmt" {
+  name        = "zcc-lab-cc-mgmt"
+  description = "Cloud Connector management interface: outbound only"
+  vpc_id      = aws_vpc.c.id
+  tags        = { Name = "zcc-lab-cc-mgmt" }
+}
+
+resource "aws_security_group" "workload" {
+  name        = "zcc-lab-workload"
+  description = "Workload: no inbound"
+  vpc_id      = aws_vpc.c.id
+  tags        = { Name = "zcc-lab-workload" }
+}
+
+resource "aws_vpc_security_group_ingress_rule" "cc_service_all" {
+  security_group_id = aws_security_group.cc_service.id
+  cidr_ipv4         = aws_subnet.workload.cidr_block
+  ip_protocol       = "tcp"
+  from_port         = 0
+  to_port           = 65535
+}
+
+# upstream: modules/terraform-zscc-ccvm-aws/main.tf@v1.4.3 — mgmt is device 0, service is device 1
+resource "aws_network_interface" "cc_mgmt" {
+  subnet_id       = aws_subnet.cc.id
+  private_ips     = ["10.92.200.11"]
+  security_groups = [aws_security_group.cc_mgmt.id]
+  tags            = { Name = "zcc-lab-cc-mgmt" }
+}
+
+resource "aws_network_interface" "cc_service" {
+  subnet_id         = aws_subnet.cc.id
+  private_ips       = ["10.92.200.10"]
+  security_groups   = [aws_security_group.cc_service.id]
+  source_dest_check = false
+  tags              = { Name = "zcc-lab-cc-service" }
+}
+
+resource "aws_instance" "cc" {
+  ami           = var.cc_ami
+  instance_type = "m6i.large"
+
+  network_interface {
+    device_index         = 0
+    network_interface_id = aws_network_interface.cc_mgmt.id
+  }
+
+  network_interface {
+    device_index         = 1
+    network_interface_id = aws_network_interface.cc_service.id
+  }
+
+  user_data = templatefile("\${path.module}/cc_userdata.tftpl", {
+    cc_url      = data.aws_ssm_parameter.cc_prov_url.value
+    secret_name = "ZS/CC/credentials/aws-lab-zcc"
+  })
+
+  tags = { Name = "zcc-lab-cc", Role = "cloud-connector" }
+}
+
+resource "aws_instance" "workload" {
+  ami                    = data.aws_ami.al2023.id
+  instance_type          = "t3.micro"
+  subnet_id              = aws_subnet.workload.id
+  vpc_security_group_ids = [aws_security_group.workload.id]
+  tags                   = { Name = "zcc-lab-workload", Role = "workload" }
+}
+`,
+    'terraform/vpc_d.tf': `# VPC D — the "legacy datacenter": an App Connector and the private app. No peering, on purpose.
+resource "aws_vpc" "d" {
+  cidr_block           = "10.93.0.0/16"
+  enable_dns_hostnames = true
+  tags                 = { Name = "zcc-lab-vpc-d" }
+}
+
+resource "aws_internet_gateway" "d" {
+  vpc_id = aws_vpc.d.id
+  tags   = { Name = "zcc-lab-igw-d" }
+}
+
+resource "aws_subnet" "connector" {
+  vpc_id                  = aws_vpc.d.id
+  cidr_block              = "10.93.10.0/24"
+  availability_zone       = "eu-central-1a"
+  map_public_ip_on_launch = true
+  tags                    = { Name = "zcc-lab-connector" }
+}
+
+resource "aws_subnet" "app" {
+  vpc_id            = aws_vpc.d.id
+  cidr_block        = "10.93.20.0/24"
+  availability_zone = "eu-central-1a"
+  tags              = { Name = "zcc-lab-app" }
+}
+
+resource "aws_route_table" "d_public" {
+  vpc_id = aws_vpc.d.id
+  tags   = { Name = "zcc-lab-connector-rt" }
+}
+
+# The app subnet has no default route at all: it is reachable only through the App Connector.
+resource "aws_route_table" "app" {
+  vpc_id = aws_vpc.d.id
+  tags   = { Name = "zcc-lab-app-rt" }
+}
+
+resource "aws_route" "connector_default" {
+  route_table_id         = aws_route_table.d_public.id
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id             = aws_internet_gateway.d.id
+}
+
+resource "aws_route_table_association" "connector" {
+  subnet_id      = aws_subnet.connector.id
+  route_table_id = aws_route_table.d_public.id
+}
+
+resource "aws_route_table_association" "app" {
+  subnet_id      = aws_subnet.app.id
+  route_table_id = aws_route_table.app.id
+}
+
+resource "aws_security_group" "app_connector" {
+  name        = "zcc-lab-app-connector"
+  description = "App Connector: dials outbound only"
+  vpc_id      = aws_vpc.d.id
+  tags        = { Name = "zcc-lab-app-connector" }
+}
+
+resource "aws_security_group" "app" {
+  name        = "zcc-lab-app"
+  description = "Private app: 8080 from the App Connector only"
+  vpc_id      = aws_vpc.d.id
+  tags        = { Name = "zcc-lab-app" }
+}
+
+resource "aws_vpc_security_group_ingress_rule" "app_from_connector" {
+  security_group_id            = aws_security_group.app.id
+  referenced_security_group_id = aws_security_group.app_connector.id
+  ip_protocol                  = "tcp"
+  from_port                    = 8080
+  to_port                      = 8080
+}
+
+resource "aws_instance" "app_connector" {
+  ami                    = var.connector_ami
+  instance_type          = "t3.medium"
+  subnet_id              = aws_subnet.connector.id
+  vpc_security_group_ids = [aws_security_group.app_connector.id]
+  tags                   = { Name = "zcc-lab-app-connector", Role = "app-connector" }
+}
+
+resource "aws_instance" "app" {
+  ami                    = data.aws_ami.al2023.id
+  instance_type          = "t3.micro"
+  subnet_id              = aws_subnet.app.id
+  vpc_security_group_ids = [aws_security_group.app.id]
+  user_data              = <<-BASH
+    #!/bin/bash
+    echo '<h1>zcc-lab private app</h1>' > /srv/index.html
+    python3 -m http.server 8080 --directory /srv
+  BASH
+  tags                   = { Name = "zcc-lab-app", Role = "app" }
+}
+`,
     'usecase.yaml': `id: zpa-private-service-edge
 name: ZPA Private Service Edge lab
 provider: aws
@@ -4620,15 +5110,82 @@ tofu -chdir=terraform apply
 > State is in S3 with \`use_lockfile = true\`; never run with local state.
 `,
   };
+  const CC_YAML = `id: zcc-aws-workload                    # [a-z0-9-]+, matches the directory name
+name: Cloud Connector — AWS workload zero trust
+provider: aws                           # must be a registered provider id
+summary: A migrated workload keeps internet and private-app access under zero trust through a Cloud Connector.
+description: |
+  # rendered on the card above
+source:
+  git: https://github.com/nilsujma-dev/zs-zcc-aws-workload-lab.git
+  ref: main
+terraform:
+  dir: terraform                        # relative to checkout
+  state_key: usecases/zcc-aws-workload/terraform.tfstate
+env:                                    # non-secret, applied to every step
+  AWS_DEFAULT_REGION: eu-central-1
+secrets:                                # host-provided; engine maps these in
+  - zscaler_oneapi                      # -> ZS_ISSUER, ZS_CLIENT_ID, ZPA_CUSTOMER_ID env
+                                        #    + ~/.zscaler_api_key symlink to the mounted secret
+                                        #    (the same client is entitled to ZPA, ZTW and ZIA)
+"on":                                   # ordered; stop on first failure (quoted: YAML 1.1 reads bare on/off as booleans)
+  - name: Baseline the tenant
+    run: python3 scripts/tenant_snapshot.py
+  - name: Preflight quotas and secret
+    run: python3 scripts/preflight.py
+  - name: Create ZPA connector group and app segment
+    run: python3 scripts/zpa_create.py
+  - name: Create CC admin, templates and secret
+    run: python3 scripts/ztw_create.py && python3 scripts/put_cc_secret.py
+  - name: Seed provisioning key into SSM
+    run: python3 scripts/put_keys_ssm.py
+  - name: Apply infrastructure
+    run: tofu -chdir=terraform apply -auto-approve -input=false
+  - name: Wait for CC and connector registration
+    run: python3 scripts/wait_registered.py --timeout 1200
+  - name: Forward the app segment to ZPA
+    run: python3 scripts/ztw_policy.py
+  - name: Allow the lab CC group to the private app
+    run: python3 scripts/zpa_policy.py
+  - name: ZIA URL and DLP policy
+    run: python3 scripts/zia_policy.py
+  - name: Verify nothing pre-existing changed
+    run: python3 scripts/tenant_verify.py
+  - name: Wait for egress and ZPA evidence
+    run: python3 scripts/wait_evidence.py --timeout 600
+"off":
+  - name: Destroy infrastructure
+    run: tofu -chdir=terraform destroy -auto-approve -input=false
+status:                                 # optional; must print JSON on stdout
+  run: python3 scripts/status.py --json
+  interval_s: 60
+tags:                                   # inventory grouping + cost attribution
+  Project: zcc-workload-lab
+
+topology:                               # structure comes from AWS; these give it meaning
+  roles:
+    zcc-lab-cc: cloud-connector
+    zcc-lab-workload: workload
+    zcc-lab-app-connector: connector
+    zcc-lab-app: app
+  flows:
+    - {from: zcc-lab-workload,      to: zcc-lab-cc,  label: "0/0 + DNS ~zcc-lab.internal → service ENI"}
+    - {from: zcc-lab-cc,            to: internet,    label: "ZIA + ZPA tunnels :443", via: [nat, internet]}
+    - {from: zcc-lab-app-connector, to: internet,    label: "dials ZPA :443",         via: [igw, internet]}
+    - {from: zcc-lab-app-connector, to: zcc-lab-app, label: ":8080 brokered"}
+  blocked:
+    - {from: zcc-lab-workload, to: zcc-lab-app, label: "no route"}
+`;
   const FILE_LANG = { yaml: 'yaml', tf: 'hcl', py: 'python', tftpl: 'sh', json: 'json', md: 'markdown' };
   function codeTree(ucId) {
-    const paths = ucId === 'zpa-private-service-edge' ? Object.keys(FILES) : Object.keys(FILES).filter(p => !/wait_enrolled|status|zpa_create|userdata/.test(p));
-    return { commit: usecases[ucId].source.commit, files: paths.map(p => ({ path: p, size: FILES[p].length })) };
+    const paths = ucId === 'zpa-private-service-edge' || ucId === 'zcc-aws-workload' ? filesOf(ucId) : filesOf(ucId).filter(p => !/wait_enrolled|status|zpa_create|userdata/.test(p));
+    return { commit: usecases[ucId].source.commit, files: paths.map(p => ({ path: p, size: codeFile(ucId, p).content.length })) };
   }
   function codeFile(ucId, path) {
     if (!FILES[path] || path.includes('..')) throw new ApiError('No such file in the checkout.', 404, 'not_found');
     let content = FILES[path];
-    if (path === 'usecase.yaml' && ucId !== 'zpa-private-service-edge') content = content.replace(/zpa-private-service-edge/g, ucId).replace('ZPA Private Service Edge lab', usecases[ucId].name);
+    if (path === 'usecase.yaml' && ucId === 'zcc-aws-workload') content = CC_YAML;
+    else if (path === 'usecase.yaml' && ucId !== 'zpa-private-service-edge') content = content.replace(/zpa-private-service-edge/g, ucId).replace('ZPA Private Service Edge lab', usecases[ucId].name);
     return { path, language: FILE_LANG[path.split('.').pop()] || 'text', content };
   }
 
@@ -4735,9 +5292,19 @@ tofu -chdir=terraform apply
           'The three SSM parameters under /zpa-lab/ (harmless; overwritten on the next ON)',
           'The S3 state object (versioned, so this OFF is recoverable) and the remote lock'] },
     },
-    'zia-cloud-connector-sandbox': {
-      on: { creates: ['A Cloud Connector registration in ZIA with a provisioning URL — reused if present'], retains: [] },
-      off: { destroys: ['The workload subnet and the connector instance — see the plan'], retains: ['The Cloud Connector entry in ZIA, shown as offline until the next ON'] },
+    'zcc-aws-workload': {
+      on: { creates: [
+        'ZPA: AWS-Lab ZCC App Connector Group and provisioning key, server group, segment group, the application segment app.zcc-lab.internal and one access-policy rule — reused by name, never duplicated',
+        'Cloud & Branch Connector: the AWS-Lab ZCC deployment admin, location and provisioning templates, and one forwarding rule scoped to the lab\u2019s connector group',
+        'ZIA: a custom URL category, a URL filtering block rule, a DLP dictionary and engine and a web DLP block rule, all scoped to the lab\u2019s location',
+        'Secrets Manager ZS/CC/credentials/aws-lab-zcc — created only if absent, never overwritten, never printed',
+        'Two SSM parameters under /zcc-lab/: the connector provisioning key (SecureString) and the Cloud Connector provisioning URL (String)'], retains: [] },
+      off: { destroys: ['Everything OpenTofu manages in this use case: both VPCs with their subnets, routes, NACLs and security groups, the internet gateways, the NAT gateway and its elastic IP, the Cloud Connector\u2019s two network interfaces, all four instances and their volumes, the IAM roles — see the plan'],
+        retains: [
+          'The Secrets Manager secret ZS/CC/credentials/aws-lab-zcc — the next ON reuses it rather than minting a second admin',
+          'Every AWS-Lab ZCC object in ZPA, Cloud & Branch Connector and ZIA, including the auto-created connector group and ZIA location',
+          'The registered Cloud Connector and App Connector entries, which show as disconnected until the next ON',
+          'The two SSM parameters under /zcc-lab/, and the S3 state object (versioned) with its lock'] },
     },
     'ot-edge-relay': {
       on: { creates: ['A rendered relay.conf committed to the checkout (not the repository)'], retains: [] },
@@ -4754,7 +5321,7 @@ tofu -chdir=terraform apply
     const eff = (EFFECTS[ucId] || { on: { creates: [], retains: [] }, off: { destroys: [], retains: [] } })[action];
     const base = { action, plan: null, declared: eff, steps: uc.procedure[action], retained_state: { backend: 's3', bucket: 'zs-lab-tfstate-257394018842', key: 'usecases/' + ucId + '/terraform.tfstate', region: 'eu-central-1' } };
     if (ucId === 'zpa-private-service-edge') { base.plan = uc.state === 'off' ? (action === 'on' ? plan(PSE_ADDRS, [], []) : plan([], [], [])) : (action === 'on' ? plan([], [], PSE_ADDRS) : plan([], PSE_ADDRS, [])); if (uc.state === 'off') base.plan.generated_at = plannedAt.t; }
-    else if (ucId === 'zia-cloud-connector-sandbox') base.plan = action === 'on' ? plan(CC_ADDRS, [], []) : plan([], [], []);
+    else if (ucId === 'zcc-aws-workload') { base.plan = uc.state === 'off' ? (action === 'on' ? plan(CC_ADDRS, [], []) : plan([], [], [])) : (action === 'on' ? plan([], [], CC_ADDRS) : plan([], CC_ADDRS, [])); if (uc.state === 'off') base.plan.generated_at = plannedAt.t; }
     else if (ucId === 'ot-edge-relay') base.plan = { ok: false, generated_at: iso(3000), error: 'tofu plan exited 1: Reference to undeclared input variable: An input variable with the name "relay_host" has not been declared. This variable can be declared with a variable "relay_host" {} block.\n\n  on terraform/main.tf line 41, in resource "aws_instance" "relay":\n  41:   user_data = templatefile("${path.module}/relay.sh.tftpl", { host = var.relay_host })' };
     else if (uc.provider !== 'aws') base.plan = { ok: false, generated_at: iso(1000), error: 'Provider "' + uc.provider + '" is connected for credentials only: capabilities.usecases is false, so no plan can run' };
     else base.plan = plan([], [], []);

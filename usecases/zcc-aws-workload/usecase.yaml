@@ -1,0 +1,157 @@
+id: zcc-aws-workload                    # [a-z0-9-]+, matches the directory name
+name: Cloud Connector — AWS workload zero trust
+provider: aws                           # must be a registered provider id
+summary: A migrated workload keeps internet and private-app access under zero trust through a Cloud Connector.
+description: |                          # markdown; the card shows it
+  A reproducible **Zscaler Cloud Connector** lab built end to end in AWS
+  `eu-central-1`: one migrated workload whose internet egress goes out through ZIA
+  and whose only private application lives in a second, unconnected VPC reached
+  through ZPA — both edges through the same Cloud Connector, both logged against
+  the workload's own identity. Source:
+  [zs-zcc-aws-workload-lab](https://github.com/nilsujma-dev/zs-zcc-aws-workload-lab).
+
+  The drawing above is generated from the live AWS inventory: boxes and lines come from
+  AWS, the dashed flows and the blocked pair are declared in this manifest. Hover anything
+  for its facts; click it to open the region drawer.
+
+  ## What turning it on does
+
+  1. **Baseline the tenant and preflight** — a SHA-hashed baseline of every
+     pre-existing ZPA, Cloud & Branch Connector and ZIA object is taken first and
+     verified afterwards, so the run can prove it touched nothing else. Preflight
+     reports quota headroom, the Marketplace subscription and the CC image; it
+     never requests an increase.
+  2. **Create the Zscaler objects** — an App Connector Group and provisioning key,
+     a server group, a segment group and the application segment
+     `app.zcc-lab.internal`; a dedicated Cloud Connector deployment admin, the
+     location and provisioning templates, and the Secrets Manager secret the
+     connector reads at boot. Everything is prefixed `AWS-Lab ZCC`, created only
+     if missing and resolved by name — the tenant's existing API key is read,
+     never regenerated, because production Branch Connectors use it.
+  3. **Seed the provisioning key into SSM** — the App Connector key goes straight
+     from ZPA into SSM Parameter Store as a `SecureString`. Credentials are never
+     written to disk, never put in `user_data`, never stored in OpenTofu state.
+  4. **Apply infrastructure** — `tofu apply` builds both VPCs, subnets, routing,
+     NACLs, security groups, the NAT gateway, the elastic IP, the Cloud
+     Connector's two interfaces and the four instances. Each instance reads what
+     it needs at boot through its IAM role and registers itself; no console login.
+  5. **Wait for registration, then write policy** — the Cloud Connector group and
+     the ZIA location only exist once the connector dials in, so the forwarding
+     rule, the ZPA access rule and the ZIA URL and DLP rules are written after
+     registration and scoped to the lab's own group and location. A rule with no
+     group would apply to every connector in the tenant; scoping is not optional.
+  6. **Wait for evidence** — runs the demo's checks on the workload itself and
+     reports each one: egress is ZIA, a blocked URL is blocked, a DLP pattern is
+     blocked, the private app answers, the direct path to it does not.
+
+  Every rebuild consumes one use of the connector provisioning key (`maxUsage 25`)
+  and leaves a stale, disconnected entry for the previous instance.
+
+  ## What turning it off does
+
+  `tofu destroy` removes **every AWS resource** in the lab: instances, volumes,
+  network interfaces, NAT gateway, elastic IP, subnets and both VPCs. Nothing
+  keeps billing.
+
+  **Zscaler objects deliberately survive**, and so does the Secrets Manager
+  secret. The groups, templates, application segment and policy rules live
+  outside OpenTofu; the registered Cloud Connector and the enrolled App Connector
+  simply show as disconnected until the next turn-on. Pruning them is manual on
+  purpose.
+
+  ## Cost
+
+  About **$192/month** at on-demand list price while on (EC2 for the four
+  instances, the NAT gateway, one elastic IP, gp3 volumes and one Secrets Manager
+  secret; NAT and Cloud Connector data processing not included). The Cloud
+  Connector is licensed on the tenant, so the AMI is expected to bill
+  infrastructure only. When off, the AWS spend is zero. The Clouds page shows the
+  live figure under `Project=zcc-workload-lab`.
+
+  ## Sharing
+
+  The lab is self-contained. The one thing it shares with other work is the
+  Zscaler tenant, because a tenant is an account-level object and that is where
+  the credentials point. Every object it creates carries the `AWS-Lab ZCC` prefix
+  and every policy rule names the lab's own connector group or location, so
+  nothing it writes can match traffic that is not this lab's. No VPC, subnet,
+  application segment, location or policy rule is shared with anything else.
+source:
+  git: https://github.com/nilsujma-dev/zs-zcc-aws-workload-lab.git
+  ref: main
+terraform:
+  dir: terraform                        # relative to checkout
+  state_key: usecases/zcc-aws-workload/terraform.tfstate
+env:                                    # non-secret, applied to every step
+  AWS_DEFAULT_REGION: eu-central-1
+secrets:                                # host-provided; engine maps these in
+  - zscaler_oneapi                      # -> ZS_ISSUER, ZS_CLIENT_ID, ZPA_CUSTOMER_ID env
+                                        #    + ~/.zscaler_api_key symlink to the mounted secret
+                                        #    (the same client is entitled to ZPA, ZTW and ZIA)
+"on":                                   # ordered; stop on first failure (quoted: YAML 1.1 reads bare on/off as booleans)
+  - name: Baseline the tenant
+    run: python3 scripts/tenant_snapshot.py
+  - name: Preflight quotas and secret
+    run: python3 scripts/preflight.py
+  - name: Create ZPA connector group and app segment
+    run: python3 scripts/zpa_create.py
+  - name: Create CC admin, templates and secret
+    run: python3 scripts/ztw_create.py && python3 scripts/put_cc_secret.py
+  - name: Seed provisioning key into SSM
+    run: python3 scripts/put_keys_ssm.py
+  - name: Apply infrastructure
+    run: tofu -chdir=terraform apply -auto-approve -input=false
+  - name: Wait for CC and connector registration
+    run: python3 scripts/wait_registered.py --timeout 1200
+  - name: Forward the app segment to ZPA
+    run: python3 scripts/ztw_policy.py
+  - name: Allow the lab CC group to the private app
+    run: python3 scripts/zpa_policy.py
+  - name: ZIA URL and DLP policy
+    run: python3 scripts/zia_policy.py
+  - name: Verify nothing pre-existing changed
+    run: python3 scripts/tenant_verify.py
+  - name: Wait for egress and ZPA evidence
+    run: python3 scripts/wait_evidence.py --timeout 600
+"off":
+  - name: Destroy infrastructure
+    run: tofu -chdir=terraform destroy -auto-approve -input=false
+status:                                 # optional; must print JSON on stdout
+  run: python3 scripts/status.py --json
+  interval_s: 60
+tags:                                   # inventory grouping + cost attribution
+  Project: zcc-workload-lab
+
+effects:                                # what happens OUTSIDE OpenTofu; the live plan supplies the rest
+  "on":
+    creates:
+      - "ZPA: AWS-Lab ZCC App Connector Group and provisioning key, server group, segment group, the application segment app.zcc-lab.internal and one access-policy rule — reused by name if they already exist, never duplicated"
+      - "Cloud & Branch Connector: the AWS-Lab ZCC deployment admin, location template and provisioning template, plus one forwarding rule scoped to the lab's connector group; Zscaler creates the CC group and a ZIA location itself at registration"
+      - "ZIA: an AWS-Lab ZCC custom URL category, a URL filtering block rule, a DLP dictionary and engine and a web DLP block rule, all scoped to the lab's location"
+      - "Secrets Manager ZS/CC/credentials/aws-lab-zcc in eu-central-1 holding the deployment admin's credentials — created only if absent, never overwritten, never printed"
+      - "Two SSM parameters under /zcc-lab/: the connector provisioning key (SecureString) and the Cloud Connector provisioning URL (String)"
+      - "A registered Cloud Connector and an enrolled App Connector once the instances boot (~5-10 minutes)"
+    retains: []
+  "off":
+    destroys:
+      - "Everything OpenTofu manages in this use case: both VPCs and all their subnets, routes, NACLs and security groups, the internet gateways, the NAT gateway and its elastic IP, the Cloud Connector's two network interfaces, all four instances and their volumes, the IAM roles and instance profiles — see the plan"
+    retains:
+      - "The Secrets Manager secret ZS/CC/credentials/aws-lab-zcc — the next ON reuses it rather than minting a second admin"
+      - "Every AWS-Lab ZCC object in ZPA, Cloud & Branch Connector and ZIA, including the auto-created connector group and ZIA location — inert while nothing is registered; pruning them is deliberately manual"
+      - "The registered Cloud Connector and App Connector entries, which show as disconnected and accumulate one per rebuild"
+      - "The two SSM parameters under /zcc-lab/ (harmless; overwritten on the next ON)"
+      - "The S3 state object (versioned, so this OFF is recoverable) and the remote lock"
+
+topology:                               # structure comes from AWS; these give it meaning
+  roles:
+    zcc-lab-cc: cloud-connector
+    zcc-lab-workload: workload
+    zcc-lab-app-connector: connector
+    zcc-lab-app: app
+  flows:
+    - {from: zcc-lab-workload,      to: zcc-lab-cc,  label: "0/0 + DNS ~zcc-lab.internal → service ENI"}
+    - {from: zcc-lab-cc,            to: internet,    label: "ZIA + ZPA tunnels :443", via: [nat, internet]}
+    - {from: zcc-lab-app-connector, to: internet,    label: "dials ZPA :443",         via: [igw, internet]}
+    - {from: zcc-lab-app-connector, to: zcc-lab-app, label: ":8080 brokered"}
+  blocked:
+    - {from: zcc-lab-workload, to: zcc-lab-app, label: "no route"}
