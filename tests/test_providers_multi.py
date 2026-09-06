@@ -371,8 +371,8 @@ def test_aws_reconnect_replaces_credentials_only_when_checks_pass(logged_in, dat
     from app.providers.aws import AwsProvider
 
     identity = {"account": "257300000000", "arn": "arn:aws:sts::257300000000:assumed-role/x/y", "alias": None}
-    old = {"access_key_id": "ASIAOLDOLDOLDOLDOLD1", "secret_access_key": "old-secret", "session_token": "old-token"}
-    new = {"access_key_id": "ASIANEWNEWNEWNEWNEW2", "secret_access_key": "new-secret", "session_token": "new-token"}
+    old = {"access_key_id": "asia-old-key-id", "secret_access_key": "old-secret", "session_token": "old-token"}
+    new = {"access_key_id": "asia-new-key-id", "secret_access_key": "new-secret", "session_token": "new-token"}
     _canned(AwsProvider, True, identity, old, ["eu-central-1"], monkeypatch)
     assert logged_in.post("/api/providers/aws/connect", json={"access_key_id": "x", "secret_access_key": "y"}).json()["ok"]
     store = Store(data_dir)
@@ -401,7 +401,7 @@ def test_aws_reconnect_replaces_credentials_only_when_checks_pass(logged_in, dat
     listing = {p["id"]: p for p in logged_in.get("/api/providers").json()}
     assert listing["aws"]["credentials_updated_at"] == "2026-09-05T12:00:00+00:00" and listing["aws"]["identity_label"] == "257300000000"
     raw = (data_dir / "providers.json").read_text()
-    assert "old-secret" not in raw and "new-secret" not in raw and "ASIA" not in raw
+    assert "old-secret" not in raw and "new-secret" not in raw and "asia-old-key-id" not in raw and "asia-new-key-id" not in raw
 
 
 def test_unsupported_provider_usecase_is_explained(logged_in, tmp_path: Path, data_dir) -> None:
