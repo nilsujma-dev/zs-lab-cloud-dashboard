@@ -31,6 +31,8 @@ from app.usecases.topology import DEFAULT_ROUTE, Graph, assemble, rule_label
 
 STRUCTURE_KINDS = ("vpc", "subnet", "instance", "nat", "igw", "eip")
 LINK_KINDS = ("route_table", "route", "association", "security_group", "ingress_rule")
+# Route target attribute -> the kind of node it points at (used when the plan pools a set's references).
+TARGET_KINDS = {"gateway_id": "igw", "nat_gateway_id": "nat"}
 
 
 # ---------------------------------------------------------------------- the provider table
@@ -287,12 +289,27 @@ class _PlanGraph:
     def default_route_target(self, rt_addr: str) -> str | None:
         """Where a route table's 0.0.0.0/0 goes: an inline route, else a standalone route resource."""
         spec = self._spec(rt_addr)
-        for item in self.plan.blocks(rt_addr, spec.blocks.get("routes", "")) if spec.blocks.get("routes") else []:
-            if _Plan.const(item, spec.rule.get("dest", "")) == DEFAULT_ROUTE:
-                for key in spec.rule.get("targets", ()):
-                    for target in self.plan.resolve(item.get(key), self.plan.module_of.get(strip_index(rt_addr), "")):
-                        if self.kind_of.get(target) in ("igw", "nat"):
-                            return target
+        block = spec.blocks.get("routes")
+        module = self.plan.module_of.get(strip_index(rt_addr), "")
+        # Providers that model the nested set as an *attribute* (the AWS provider's `route`) give the
+        # configuration one pooled expression for the whole set rather than per-item blocks; the
+        # planned item then carries its known fields ("" for targets it is not) and omits the unknown
+        # one — and the omitted target key names the kind of the gateway it points at.
+        pooled = self.plan.resolve(self.plan.config.get(strip_index(rt_addr), {}).get(block), module) if block else []
+        for item in self.plan.blocks(rt_addr, block) if block else []:
+            if _Plan.const(item, spec.rule.get("dest", "")) != DEFAULT_ROUTE:
+                continue
+            for key in spec.rule.get("targets", ()):
+                for target in self.plan.resolve(item.get(key), module):
+                    if self.kind_of.get(target) in ("igw", "nat"):
+                        return target
+            for key in spec.rule.get("targets", ()):
+                if key in item:
+                    continue  # known: either "" (not this target) or a literal id we cannot draw
+                wanted = TARGET_KINDS.get(key)
+                for target in pooled:
+                    if wanted and self.kind_of.get(target) == wanted:
+                        return target
         for route in self.of_kind("route"):
             rspec = self._spec(route)
             if self.first_ref(route, "route_table") != rt_addr or self.plan.known(route, rspec.rule.get("dest", "")) != DEFAULT_ROUTE:
