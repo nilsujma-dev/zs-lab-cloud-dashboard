@@ -5,6 +5,10 @@ and the last status-probe output, and returns provider-neutral nodes and edges. 
 calls a cloud, and nothing in it recognises a provider's id formats: gateways and NATs are
 known by the inventory's own cross-references, so only a node's `detail` is provider-shaped.
 
+`Graph` (nodes, edges, the declared-flow resolver, enrolment) and `assemble` (the response
+envelope) are shared with `plan_graph.py`, which fills the same vocabulary from a `tofu plan`
+instead of the cloud (SPEC v1.4): one drawing, two registers.
+
 Node kinds:   internet · vpc · subnet · instance · nat · igw · eip
 Edge kinds:   route (subnet → gateway, its default route) · uplink (nat → igw, igw → internet)
               · allow (security-rule source → instance) · flow / blocked (declared in the manifest)
@@ -89,7 +93,7 @@ def _authenticated(component: dict[str, Any]) -> bool:
     return str(status).upper() == AUTHENTICATED if status else False
 
 
-class _Graph:
+class Graph:
     def __init__(self, manifest: Manifest) -> None:
         self.manifest = manifest
         self.nodes: dict[str, dict[str, Any]] = {}
@@ -352,10 +356,18 @@ def build_graph(manifest: Manifest, inventory: dict[str, Any] | None, status: An
     `nodes` is empty when the inventory holds nothing carrying the manifest's tags; the caller
     decides what `reason` to attach. Never raises on odd inventory data — it degrades to `unknown`.
     """
-    graph = _Graph(manifest)
+    graph = Graph(manifest)
     for region in (inventory or {}).get("regions", []) or []:
         if isinstance(region, dict):
             graph.add_region(region)
+    return assemble(graph, status)
+
+
+def assemble(graph: Graph, status: Any) -> dict[str, Any]:
+    """Finish a graph either builder filled: put the internet node first, resolve the manifest's
+    declared flows and blocked pairs against the nodes present, map enrolment, and wrap it in
+    the response envelope. An empty graph stays empty (no internet node, no flows)."""
+    manifest = graph.manifest
     if graph.nodes:
         graph.nodes = {INTERNET: {"id": INTERNET, "kind": "internet", "label": "Internet", "parent": None}, **graph.nodes}
         graph.add_links(manifest.topology.flows, "flow")

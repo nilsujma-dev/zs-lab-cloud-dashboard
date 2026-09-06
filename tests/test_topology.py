@@ -543,13 +543,30 @@ def test_engine_topology_scans_when_no_inventory_and_on_refresh(env, monkeypatch
     assert engine.topology(manifest)["inventory_at"] == second["inventory_at"] and len(scans) == 2
 
 
-def test_engine_topology_reason_when_off(env) -> None:
+def test_engine_topology_when_off_is_the_planned_register_not_the_inventory(env) -> None:
+    """v1.4: off draws what ON deploys from a plan (see test_plan_graph); the inventory is not consulted."""
+    from tests.plan_fixture import pse_plan_stream, pse_show
+
     store, providers, manifest, root, scans = env
     store.save_inventory("aws", pse_inventory())
-    engine = _TopoEngine(store, providers, JobRunner(store), root, state_output="")
+
+    class _OffEngine(_TopoEngine):
+        def _run(self, args, *, cwd, env, timeout, log_line=None):  # type: ignore[override]
+            self.calls.append(args)
+            if "plan" in args:
+                return 0, pse_plan_stream()
+            if "show" in args:
+                import json
+
+                return 0, json.dumps(pse_show())
+            return 0, ""
+
+    engine = _OffEngine(store, providers, JobRunner(store), root, state_output="")
     out = engine.topology(manifest)
-    assert out["nodes"] == [] and out["edges"] == [] and out["state"] == "off"
-    assert "off" in out["reason"] and out["generated_at"] and out["enrolment"] == {}
+    assert out["state"] == "off" and out["register"] == "planned" and out["reason"] is None
+    assert out["counts"] == {"internet": 1, "vpc": 2, "subnet": 4, "instance": 5, "nat": 1, "igw": 2, "eip": 3}
+    assert out["plan"]["resources"] == 46 and out["enrolment"] == {} and out["inventory_at"] is None
+    assert all(n["id"].startswith(("aws_", "internet")) for n in out["nodes"])
     assert out["declared"]["flows"] and out["usecase"] == manifest.id and out["provider"] == "aws"
     assert scans == []
 

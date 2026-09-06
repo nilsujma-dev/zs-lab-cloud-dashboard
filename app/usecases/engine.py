@@ -19,6 +19,7 @@ from app.jobs import JobConflict, JobRunner, LogWriter, Scrubber, StepSpec
 from app.providers.base import Provider
 from app.store import Store, utcnow_iso
 from app.usecases.manifest import Manifest, load_all
+from app.usecases.plan_graph import SCHEMAS, SourceIndex, build_plan_graph
 from app.usecases.topology import build_graph
 
 log = logging.getLogger("switchboard.engine")
@@ -30,8 +31,10 @@ GIT_TIMEOUT_S = 600
 TOFU_INIT_TIMEOUT_S = 900
 TOFU_STATE_TIMEOUT_S = 120
 TOFU_PLAN_TIMEOUT_S = 900
-OUTLINE_CACHE_TTL_S = 60
+TOFU_SHOW_TIMEOUT_S = 120
+OUTLINE_CACHE_TTL_S = 60  # one plan cache serves the outline and the planned topology (v1.4)
 TOPOLOGY_CACHE_TTL_S = 60
+PLAN_FILE = ".switchboard-{action}.tfplan"  # in the terraform dir of the checkout; deleted after `show`
 PLAN_ACTIONS = {"create": "create", "update": "update", "delete": "destroy", "read": "read", "noop": "unchanged", "no-op": "unchanged"}
 REFRESH_LOOP_S = 5
 CODE_FILE_LIMIT = 512 * 1024
@@ -76,7 +79,9 @@ class Engine:
         self._tofu = tofu_bin
         self._git = git_bin
         self._state_cache: dict[str, dict[str, Any]] = {}
-        self._outline_cache: dict[tuple[str, str], dict[str, Any]] = {}
+        # (usecase, action) -> {"outline", "show", "show_error", "generated_at", "_at"}: one `tofu plan`
+        # feeds both the outline and the planned topology, so their counts come from one run.
+        self._plan_cache: dict[tuple[str, str], dict[str, Any]] = {}
         self._outline_locks: dict[tuple[str, str], threading.Lock] = {}
         self._topology_cache: dict[str, dict[str, Any]] = {}
         # One inventory scan at a time per process; main.py's inventory route shares this lock.
@@ -353,8 +358,8 @@ class Engine:
     def invalidate(self, usecase_id: str) -> None:
         self._state_cache.pop(usecase_id, None)
         self._topology_cache.pop(usecase_id, None)
-        for key in [k for k in self._outline_cache if k[0] == usecase_id]:
-            self._outline_cache.pop(key, None)
+        for key in [k for k in self._plan_cache if k[0] == usecase_id]:
+            self._plan_cache.pop(key, None)
 
     def state(self, manifest: Manifest, *, force: bool = False) -> dict[str, Any]:
         """{"state", "resources", "checked_at", "error"} with a 60s cache of the tofu probe."""
@@ -640,35 +645,42 @@ class Engine:
 
     def outline(self, manifest: Manifest, action: str) -> dict[str, Any]:
         """What ON/OFF will do: a real `tofu plan` (never apply) plus the manifest's declared effects."""
+        return self.plan(manifest, action)["outline"]
+
+    def plan(self, manifest: Manifest, action: str, *, refresh: bool = False) -> dict[str, Any]:
+        """One plan run, two consumers (v1.4): `outline` (the v1.1 shape) and, for ON, `show` (the
+        `tofu show -json` document the planned topology is drawn from). Cached 60 s per action;
+        `refresh` re-plans; `invalidate` drops it when a job ends. 409 while a job runs."""
         if action not in ("on", "off"):
             raise EngineError(f"Unknown action '{action}'", "bad_action", 400)
         if self._jobs.running_job(manifest.id) is not None:
             raise EngineError(f"A job is already running for use case '{manifest.id}'", "job_running", 409)
         key = (manifest.id, action)
         with self._outline_lock(key):
-            cached = self._outline_cache.get(key)
-            if cached is not None and (time.monotonic() - cached["_at"]) < OUTLINE_CACHE_TTL_S:
+            cached = self._plan_cache.get(key)
+            if cached is not None and not refresh and (time.monotonic() - cached["_at"]) < OUTLINE_CACHE_TTL_S:
                 return {k: v for k, v in cached.items() if k != "_at"}
-            result = self._outline(manifest, action)
-            self._outline_cache[key] = {**result, "_at": time.monotonic()}
+            result = self._plan(manifest, action)
+            self._plan_cache[key] = {**result, "_at": time.monotonic()}
             return result
 
-    def _outline(self, manifest: Manifest, action: str) -> dict[str, Any]:
+    def _plan(self, manifest: Manifest, action: str) -> dict[str, Any]:
         provider_rec = self.provider_record(manifest)
         provider = self._providers.get(manifest.provider)
         bucket = provider.state_bucket(provider_rec) if (provider and provider_rec) else None
         steps = manifest.on if action == "on" else manifest.off
-        response: dict[str, Any] = {
+        outline: dict[str, Any] = {
             "action": action,
             "plan": None,
             "declared": manifest.effects(action).to_api(),
             "steps": [s.to_api() for s in steps],
             "retained_state": {"backend": "s3", "bucket": bucket, "key": manifest.state_key, "region": STATE_BACKEND_REGION},
         }
+        result: dict[str, Any] = {"outline": outline, "show": None, "show_error": None, "generated_at": utcnow_iso()}
 
         def failed(error: str) -> dict[str, Any]:
-            response["plan"] = {"ok": False, "generated_at": utcnow_iso(), "error": Scrubber(self.secret_values()).scrub(error)}
-            return response
+            outline["plan"] = {"ok": False, "generated_at": result["generated_at"], "error": Scrubber(self.secret_values()).scrub(error)}
+            return result
 
         problem = self.provider_problem(manifest)
         if problem is not None:
@@ -686,21 +698,45 @@ class Engine:
         except (TofuError, EngineError, OSError) as exc:
             return failed(f"Could not prepare the checkout: {exc}")
 
-        args = [self._tofu, f"-chdir={manifest.terraform_dir}", "plan", "-json", "-input=false", "-lock=false", "-refresh=true"]
+        checkout = self._store.checkout_dir(manifest.id)
+        plan_file = PLAN_FILE.format(action=action)  # relative to -chdir
+        plan_path = checkout / manifest.terraform_dir / plan_file
+        args = [self._tofu, f"-chdir={manifest.terraform_dir}", "plan", "-json", "-input=false", "-lock=false", "-refresh=true", f"-out={plan_file}"]
         if action == "off":
             args.append("-destroy")
         started = time.monotonic()
         try:
-            code, out = self._run(args, cwd=self._store.checkout_dir(manifest.id), env=env, timeout=TOFU_PLAN_TIMEOUT_S)
-        except FileNotFoundError:
-            return failed(f"'{self._tofu}' is not installed or not on PATH; a plan needs OpenTofu")
-        except (TofuError, OSError) as exc:
-            return failed(f"tofu plan failed: {exc}")
-        parsed = self.parse_plan_json(out)
-        if code != 0:
-            tail = parsed["diagnostics"] or parsed["other"]
-            reason = tail[-1] if tail else f"exit code {code}"
-            return failed(f"tofu plan exited {code}: {reason}")
+            try:
+                code, out = self._run(args, cwd=checkout, env=env, timeout=TOFU_PLAN_TIMEOUT_S)
+            except FileNotFoundError:
+                return failed(f"'{self._tofu}' is not installed or not on PATH; a plan needs OpenTofu")
+            except (TofuError, OSError) as exc:
+                return failed(f"tofu plan failed: {exc}")
+            parsed = self.parse_plan_json(out)
+            if code != 0:
+                tail = parsed["diagnostics"] or parsed["other"]
+                reason = tail[-1] if tail else f"exit code {code}"
+                return failed(f"tofu plan exited {code}: {reason}")
+            if action == "on":
+                # The graph needs the plan's values and configuration references: `show -json` on the
+                # plan file. Its failure leaves the outline intact; the topology reports the error.
+                show_args = [self._tofu, f"-chdir={manifest.terraform_dir}", "show", "-json", "-no-color", plan_file]
+                try:
+                    show_code, show_out = self._run(show_args, cwd=checkout, env=env, timeout=TOFU_SHOW_TIMEOUT_S)
+                    if show_code != 0:
+                        raise TofuError(f"tofu show exited {show_code}: {show_out.strip()[-500:]}")
+                    document = json.loads(show_out)
+                    if not isinstance(document, dict):
+                        raise TofuError("tofu show printed no plan document")
+                    result["show"] = document
+                except (TofuError, OSError, ValueError) as exc:
+                    result["show_error"] = Scrubber(self.secret_values()).scrub(f"tofu show failed: {exc}")
+                    log.warning("plan: show failed for %s: %s", manifest.id, result["show_error"])
+        finally:
+            try:
+                plan_path.unlink(missing_ok=True)
+            except OSError as exc:
+                log.warning("could not delete plan file %s: %s", plan_path, exc)
 
         changes = parsed["changes"]
         changed_addrs = {e["address"] for lst in changes.values() for e in lst}
@@ -719,7 +755,7 @@ class Engine:
             unchanged.append({"address": addr, "type": rtype, "name": rname, "module": module})
         plan: dict[str, Any] = {
             "ok": True,
-            "generated_at": utcnow_iso(),
+            "generated_at": result["generated_at"],
             "duration_s": round(time.monotonic() - started, 1),
             "create": self._group_by_type(changes["create"]),
             "update": self._group_by_type(changes["update"]),
@@ -729,9 +765,8 @@ class Engine:
             "change_summary": parsed["summary"],
         }
         plan["summary"] = {k: len(plan[k]) for k in ("create", "update", "destroy", "unchanged", "read")}
-        response["plan"] = plan
-        return response
-
+        outline["plan"] = plan
+        return result
 
     # ------------------------------------------------------------------ topology (v1.2)
     def inventory(self, provider_id: str, *, refresh: bool = False) -> dict[str, Any]:
@@ -776,18 +811,28 @@ class Engine:
         base: dict[str, Any] = {
             "generated_at": utcnow_iso(),
             "state": st["state"],
+            "register": "deployed",
             "inventory_at": None,
             "status_at": status["generated_at"] if status else None,
+            "plan": None,
         }
 
-        def empty(reason: str) -> dict[str, Any]:
-            return {**base, **build_graph(manifest, None, None), "reason": reason}
+        def empty(reason: str, **extra: Any) -> dict[str, Any]:
+            return {**base, **extra, **build_graph(manifest, None, None), "reason": reason}
 
         problem = self.provider_problem(manifest)
         if problem is not None:
-            return empty(problem[1])
-        if st["state"] == "off":
-            return empty("Use case is off; nothing is running to draw")
+            provider = self._providers.get(manifest.provider)
+            reason = problem[1]
+            if problem[0] == "provider_not_connected":
+                reason = f"Connect {provider.name if provider else manifest.provider} to plan what ON deploys ({problem[1]})"
+            return empty(reason, register="declared")  # no plan possible: the frontend sketches the manifest's declared roles
+        # Nothing deployed: draw what ON would deploy, from a real plan (v1.4). A job in flight
+        # invalidated the cache and must not be planned against; it redraws when the job ends.
+        if st["resources"] == 0 and st["state"] in ("off", "error", "turning_on", "turning_off"):
+            if self._jobs.running_job(manifest.id) is not None:
+                return empty("A job is running; the drawing regenerates when it ends", register="planned")
+            return self._planned_topology(manifest, base, refresh)
         try:
             inventory = self.inventory(manifest.provider, refresh=refresh)
         except EngineError as exc:
@@ -807,7 +852,40 @@ class Engine:
         if not graph["nodes"]:
             tags = ", ".join(f"{k}={v}" for k, v in manifest.tags.items()) or "none declared"
             reason = f"No resources carrying the use case's tags ({tags}) in the inventory"
+        else:
+            schema = SCHEMAS.get(manifest.provider)
+            if schema is not None:
+                cached = self._state_cache.get(manifest.id) or {}
+                self.source_index(manifest).attach_live(graph["nodes"], schema, cached.get("resources"))
         return {**base, **graph, "reason": reason}
+
+    def source_index(self, manifest: Manifest) -> SourceIndex:
+        """`resource` blocks in the checkout's terraform dir, for `source: {path, line}` on nodes."""
+        schema = SCHEMAS.get(manifest.provider)
+        return SourceIndex.scan(self._store.checkout_dir(manifest.id), manifest.terraform_dir, name_tag=schema.name_tag if schema else "Name")
+
+    def _planned_topology(self, manifest: Manifest, base: dict[str, Any], refresh: bool) -> dict[str, Any]:
+        """The planned register: the same graph from the ON plan's `show -json` document."""
+        base = {**base, "register": "planned"}
+        try:
+            run = self.plan(manifest, "on", refresh=refresh)
+        except EngineError as exc:
+            return {**base, **build_graph(manifest, None, None), "reason": str(exc)}
+        outline_plan = run["outline"]["plan"] or {}
+        plan_info: dict[str, Any] = {
+            "generated_at": run["generated_at"],
+            "resources": int((outline_plan.get("summary") or {}).get("create", 0)) if outline_plan.get("ok") else 0,
+            "error": None,
+        }
+        if not outline_plan.get("ok"):
+            plan_info["error"] = outline_plan.get("error") or "plan failed"
+            return {**base, "plan": plan_info, **build_graph(manifest, None, None), "reason": f"Plan failed: {plan_info['error']}"}
+        if run["show"] is None:
+            plan_info["error"] = run["show_error"] or "plan produced no document to draw"
+            return {**base, "plan": plan_info, **build_graph(manifest, None, None), "reason": f"Plan could not be drawn: {plan_info['error']}"}
+        graph = build_plan_graph(manifest, run["show"], self.source_index(manifest))
+        reason = None if graph["nodes"] else "The plan declares nothing drawable (no networks, instances or gateways)"
+        return {**base, "plan": plan_info, **graph, "reason": reason}
 
     # ------------------------------------------------------------------ code browser
     def _checkout_root(self, manifest: Manifest) -> Path:

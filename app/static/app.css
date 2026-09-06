@@ -650,7 +650,7 @@ svg { display: inline-block; vertical-align: middle; }
 .drawer { margin-top: 22px; border: 1px solid var(--line); border-radius: var(--radius-lg); overflow: hidden; animation: rise .2s var(--ease); }
 .drawer-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 14px; background: var(--bg-raised); border-bottom: 1px solid var(--line); }
 .drawer-head .mono { font-size: 12px; color: var(--text-dim); }
-.drawer-body { display: grid; grid-template-columns: 260px minmax(0, 1fr); min-height: 380px; max-height: 620px; }
+.drawer-body { display: grid; grid-template-columns: 260px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); height: min(620px, 72vh); min-height: 380px; }
 .tree { border-right: 1px solid var(--line); overflow: auto; padding: 8px 0; background: var(--bg-panel); }
 .tree-dir { font-family: var(--font-mono); font-size: 11px; letter-spacing: .06em; color: var(--text-dim); padding: 8px 14px 3px; display: flex; gap: 6px; align-items: center; }
 .tree-dir svg { width: 13px; height: 13px; }
@@ -663,7 +663,15 @@ svg { display: inline-block; vertical-align: middle; }
 .tree-file.is-active { background: var(--bg-hover); color: var(--accent); }
 .tree-file svg { width: 13px; height: 13px; color: var(--text-faint); flex: none; }
 .tree-file .sz { margin-left: auto; color: var(--text-faint); font-size: 11px; }
-.code-pane { overflow: auto; background: var(--bg-inset); }
+.code-pane { overflow: auto; background: var(--bg-inset); position: relative; }
+.code-pane:focus-visible { outline-offset: -2px; }
+.code-pane .cl { display: block; }
+.code-pane .cl.is-src { background: var(--accent-dim); box-shadow: inset 3px 0 0 var(--accent); }
+.code-pane .cl.is-src .ln { color: var(--accent); }
+.code-pane .cl.is-flash-src { animation: src-flash 1.8s var(--ease); }
+@keyframes src-flash { 0%, 55% { background: var(--accent-glow); } 100% { background: var(--accent-dim); } }
+@media (prefers-reduced-motion: reduce) { .code-pane .cl.is-flash-src { animation: none; } }
+.drawer-target { color: var(--accent); }
 .code-pane pre { margin: 0; padding: 12px 16px; font-size: 12.5px; line-height: 1.55; tab-size: 4; }
 .code-pane .ln { color: var(--text-faint); user-select: none; display: inline-block; width: 4ch; text-align: right; margin-right: 16px; }
 .code-empty { height: 100%; display: grid; place-items: center; color: var(--text-faint); padding: 40px; }
@@ -1109,17 +1117,51 @@ tr.is-flash td { animation: flash-row 1.6s var(--ease); }
 .te-uplink.is-hi .te-line { stroke: var(--text); }
 .te-flow.is-hi .te-line { stroke-dasharray: 6 3; }
 
-/* off-state schematic: greyed, declared only */
-.topo-stage.is-off .topo-canvas { background-image: none; }
-.topo-stage.is-off .topo-svg { filter: grayscale(1); opacity: .72; }
-.topo-stage.is-off .tn-instance .tn-box, .topo-stage.is-off .tn-subnet .tn-box, .topo-stage.is-off .tn-vpc .tn-box { stroke-dasharray: 4 3; }
-.topo-offbar { grid-column: 1 / -1; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 12.5px; padding: 8px 12px; border: 1px dashed var(--line-strong); border-radius: var(--radius); }
-.topo-offbar .dim { color: var(--text-dim); }
-.topo-offbar-run { margin-left: auto; font-size: 11.5px; color: var(--text-dim); }
+/* ---- v1.4: one drawing, two registers. The register bar sits above the canvas in every state. ---- */
+.topo-bar { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12.5px; padding: 7px 12px; border: 1px solid var(--line-strong); border-radius: var(--radius); background: var(--bg-raised); }
+.topo-bar.is-planned, .topo-bar.is-declared { border-style: dashed; }
+.topo-bar-lamp { width: 8px; height: 8px; flex: none; }
+.lamp.planned { background: transparent; border-color: var(--text-dim); }
+.topo-bar-reg { font-family: var(--font-mono); font-size: 11.5px; letter-spacing: .14em; text-transform: uppercase; font-weight: 600; color: var(--text-dim); }
+.topo-bar.is-deployed .topo-bar-reg { color: var(--accent); }
+.topo-bar.is-planned .topo-bar-reg { color: var(--text); }
+.topo-bar-dot { color: var(--text-faint); }
+.topo-bar-seg b { font-weight: 600; color: var(--text); }
+.topo-bar-seg.bad { color: var(--bad); }
+.topo-bar-seg.dim { color: var(--text-faint); }
+.topo-bar-run { margin-left: auto; font-size: 11.5px; color: var(--text-dim); }
+.topo-bar-run .mono, .topo-bar-seg .mono { color: var(--text); }
+.topo-bar-seg.dim .mono { color: var(--text-dim); }
+
+/* planned register: the same shapes in the same places, drawn as intent — dashed containers, hatched subnets, hollow lamps, empty value slots */
+.hatch path { stroke: var(--line-strong); stroke-width: 1; opacity: .55; }
+.tn-hatch { pointer-events: none; stroke: none; }
+.topo-svg.is-planned .tn-vpc .tn-box, .topo-svg.is-planned .tn-subnet .tn-box, .topo-svg.is-planned .tn-instance .tn-box,
+.topo-svg.is-planned .tn-gw .tn-box, .topo-svg.is-planned .tn-eip .tn-box { stroke-dasharray: 5 3; }
+.topo-svg.is-planned .tn-subnet .tn-box { fill: var(--bg-panel); }
+.topo-svg.is-planned .tn-instance .tn-box { fill: var(--bg-raised); }
+.topo-svg.is-planned .tn-exp-isolated .tn-box { stroke-dasharray: 2 3; }
+.topo-svg.is-planned .tn-eip.is-slot .tn-box { fill: transparent; }
+.lamp-planned .tn-lamp { fill: none; stroke: var(--text-dim); stroke-width: 1.2; }
+.tn-slot { fill: var(--text-faint); font-family: var(--font-mono); letter-spacing: .02em; }
+.tn-eip .tn-slot { font-size: 9.5px; }
+.topo-svg.is-planned .te-route .te-line { stroke-dasharray: 3 3; }
+.topo-svg.is-planned .te-uplink .te-line { stroke-dasharray: 4 3; }
+.topo-stage.is-planned .topo-canvas { background-image: radial-gradient(var(--line-faint) 1px, transparent 1px); }
+
+/* declared fallback (provider disconnected): the v1.2 roles schematic, greyed, labelled as manifest-only */
+.topo-stage.is-declared .topo-canvas { background-image: none; }
+.topo-stage.is-declared .topo-svg { filter: grayscale(1); opacity: .72; }
+.topo-svg.is-declared .tn-instance .tn-box, .topo-svg.is-declared .tn-subnet .tn-box, .topo-svg.is-declared .tn-vpc .tn-box { stroke-dasharray: 4 3; }
 .topo-offstate { padding: 28px 24px; border: 1px dashed var(--line-strong); border-radius: var(--radius-lg); text-align: center; }
 .topo-off-title { font-weight: 600; margin-bottom: 4px; }
 .topo-off-reason { color: var(--text-dim); font-size: 13px; }
 .topo-off-hint { color: var(--text-faint); font-size: 12.5px; margin-top: 8px; }
+
+/* plan failed: the error verbatim, then Retry */
+.topo-planfail { text-align: left; padding: 20px 22px; margin-top: 12px; }
+.topo-planerr { margin: 10px 0 0; padding: 12px 14px; font-size: 12px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; color: var(--text); background: var(--bg-inset); border: 1px solid var(--line); border-radius: var(--radius); max-height: 260px; overflow: auto; }
+.topo-planfail .btn { margin-top: 12px; }
 
 /* inspector */
 .topo-inspector { border: 1px solid var(--line); border-radius: var(--radius-lg); background: var(--bg-raised); padding: 12px 14px; min-height: 96px; font-size: 12.5px; }
@@ -1138,6 +1180,14 @@ tr.is-flash td { animation: flash-row 1.6s var(--ease); }
 .ti-list { display: grid; gap: 2px; }
 .ti-world { color: var(--accent); }
 .ti-open { margin-top: 10px; }
+.ti-reg { display: inline-block; font-family: var(--font-mono); font-size: 9.5px; letter-spacing: .14em; text-transform: uppercase; padding: 2px 7px; border-radius: 3px; border: 1px solid var(--line-strong); color: var(--text-dim); margin-bottom: 8px; }
+.ti-reg-deployed { color: var(--accent); border-color: var(--accent); }
+.ti-reg-planned { border-style: dashed; color: var(--text); }
+.ti-reg-declared { border-style: dashed; }
+.ti-v .slot { color: var(--text-faint); font-size: 12px; }
+.ti-src { font: inherit; font-family: var(--font-mono); font-size: 12px; color: var(--accent); background: transparent; border: 0; padding: 0; cursor: pointer; text-decoration: underline dotted; text-underline-offset: 3px; }
+.ti-src:hover { text-decoration-style: solid; }
+.ti-src:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 2px; }
 @media (max-width: 1499px) {
   .topo-insp-body { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 0 24px; align-items: start; }
   .ti-rows { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 0 20px; }
@@ -1147,6 +1197,14 @@ tr.is-flash td { animation: flash-row 1.6s var(--ease); }
 /* legend */
 .topo-legend { display: flex; align-items: center; gap: 6px 16px; flex-wrap: wrap; margin-top: 10px; font-size: 11.5px; color: var(--text-dim); }
 .lg-item { display: inline-flex; align-items: center; gap: 6px; }
+.lg-register { color: var(--text-faint); }
+.lg-register.is-current { color: var(--text); font-weight: 600; }
+.lg-reg { width: 30px; height: 16px; }
+.lg-reg-box { fill: var(--bg-panel); stroke: var(--line-strong); stroke-width: 1.2; }
+.lg-reg-planned .lg-reg-box { stroke-dasharray: 4 2.5; }
+.lg-reg-hatch { stroke: none; }
+.lg-register.is-current .lg-reg-box { stroke: var(--text); }
+.lg-lamp.planned { background: transparent; border-color: var(--text-dim); }
 .lg-sw { width: 44px; height: 14px; }
 .lg-sw path { fill: none; }
 .lg-route { stroke: var(--line-strong); stroke-width: 1; }

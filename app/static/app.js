@@ -268,7 +268,7 @@ const state = {
   outlines: {},                 // id -> {on:{loading,data,err}, off:{…}}
   jobs: {},                     // jobId -> {job, lines, next}
   jobFor: {},                   // usecaseId -> jobId being tailed
-  code: {},                     // usecaseId -> {open, tree, commit, active, file, loading, err}
+  code: {},                     // usecaseId -> {open, tree, commit, active, file, loading, err, target:{path,line,label,flash}}
   flipping: {},                 // usecaseId -> true while POST in flight
 };
 SB.state = state;
@@ -461,12 +461,14 @@ function render() {
   $('.wordmark').href = KEEP_QUERY + '#/clouds';
   const act = document.activeElement;
   const keepTile = act && act.dataset ? act.dataset.providerTile : null; // a focused rail tile must survive the rebuild (polls re-render the page)
+  const keepPane = !!(act && act.classList && act.classList.contains('code-pane')); // so must a focused code pane (the outline arriving, a job tick)
   const view = clear($('#view'));
   if (state.route === 'login') view.appendChild(renderLogin());
   else if (state.route === 'clouds') view.appendChild(renderClouds());
   else view.appendChild(renderUsecases());
   renderDrawerRoot();
   if (keepTile) { const el = $('[data-provider-tile="' + CSS.escape(keepTile) + '"]'); if (el) el.focus({ preventScroll: true }); }
+  if (keepPane) { const el = $('.code-pane'); if (el) el.focus({ preventScroll: true }); }
 }
 
 function renderLogin() {
@@ -2013,6 +2015,8 @@ function s(tag, attrs, ...children) {
 const ROLE_RANK = { pse: 0, connector: 1, app: 2, client: 3 };
 const EXPOSURE_RANK = { public: 0, private: 1, isolated: 2 };
 const ROLE_WORD = { pse: 'Private Service Edge', connector: 'App Connector', app: 'Application', client: 'Client' };
+const SLOT_TEXT = 'assigned at ON'; // the planned register's value slot: never an invented address
+const SLOT_CHIP = 'eip · at ON';    // the same slot on an address chip, where there is no room for the full phrase
 
 async function loadTopology(id, refresh) {
   const t = state.topo[id] || (state.topo[id] = { loading: false, data: null, err: null, width: 0, sel: null, refocus: null });
@@ -2177,7 +2181,7 @@ function topoLayout(g, avail) {
     if (n.kind !== 'eip' || !n.attached_to || N[n.id]) continue;
     const host = N[n.attached_to];
     if (!host) { L.unplaced.push({ label: n.label + ' (address)', reason: 'attached to ' + n.attached_to + ', which is not drawn' }); continue; }
-    const cw = Math.max(64, String(n.label || '').length * 6.4 + 14);
+    const cw = Math.max(64, String(n.label || SLOT_CHIP).length * 6.4 + 14);
     if (host.kind === 'instance') N[n.id] = { kind: 'eip', node: n, x: host.x + host.w - cw - 8, y: host.y + host.h - C.CHIP_H / 2 - 1, w: cw, h: C.CHIP_H, host: n.attached_to };
     else N[n.id] = { kind: 'eip', node: n, x: host.cx - cw / 2, y: host.cy + C.GW_H / 2 + 3, w: cw, h: C.CHIP_H, host: n.attached_to };
   }
@@ -2339,13 +2343,17 @@ function roleGlyph(role) {
 function topoSvg(g, L, ctx) {
   const C = TOPO, N = L.nodes;
   const uid = 'tp' + (topoSvg.seq = (topoSvg.seq || 0) + 1);
-  const svg = s('svg', { class: 'topo-svg', viewBox: '0 0 ' + L.w + ' ' + L.h, width: Math.round(L.w * L.scale), height: Math.round(L.h * L.scale), role: 'group', 'aria-label': 'Network drawing' });
+  const planned = g.register === 'planned';
+  const svg = s('svg', { class: 'topo-svg' + (planned ? ' is-planned' : '') + (g.schematic ? ' is-declared' : ''), viewBox: '0 0 ' + L.w + ' ' + L.h, width: Math.round(L.w * L.scale), height: Math.round(L.h * L.scale), role: 'group', 'aria-label': planned ? 'Planned network drawing — nothing here is deployed yet' : 'Network drawing' });
   const defs = s('defs');
   const arrow = (id, cls) => s('marker', { id: uid + '-' + id, class: 'mk ' + cls, viewBox: '0 0 10 10', refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: 'auto-start-reverse' }, s('path', { d: 'M0 0.5L10 5 0 9.5z' }));
   defs.appendChild(arrow('flow', 'mk-flow')); defs.appendChild(arrow('flowhi', 'mk-flow-hi'));
+  // the planned register hatches subnet fills: a diagonal line pattern, the same in both themes
+  if (planned) defs.appendChild(s('pattern', { id: uid + '-hatch', class: 'hatch', patternUnits: 'userSpaceOnUse', width: 7, height: 7, patternTransform: 'rotate(45)' }, s('path', { d: 'M0 0V7' })));
   svg.appendChild(defs);
   const strip = L.strip;
-  const idOf = n => n.id;
+  const pre = planned ? 'Planned ' : '';
+  const slot = text => s('tspan', { class: 'tn-slot' }, text || SLOT_TEXT);
   const gEdges = s('g', { class: 'topo-edges' });
   const gBoxes = s('g', { class: 'topo-nodes topo-containers' });
   const gNodes = s('g', { class: 'topo-nodes topo-leaves' });
@@ -2353,7 +2361,7 @@ function topoSvg(g, L, ctx) {
   // VPCs, subnets, instances (DOM order = focus order: vpc, its subnets, their instances, then the gateways)
   for (const vid of L.vpcs) {
     const V = N[vid], v = V.node;
-    const gv = s('g', { class: 'tn tn-vpc', dataset: { node: vid, kind: 'vpc' }, tabindex: 0, role: 'button', 'aria-label': 'VPC ' + (v.label || vid) + (v.cidr ? ' ' + v.cidr : '') });
+    const gv = s('g', { class: 'tn tn-vpc', dataset: { node: vid, kind: 'vpc' }, tabindex: 0, role: 'button', 'aria-label': pre + 'VPC ' + (v.label || vid) + (v.cidr ? ' ' + v.cidr : '') });
     gv.appendChild(s('rect', { class: 'tn-box', x: V.x, y: V.y, width: V.w, height: V.h, rx: 8 }));
     const tx = V.side === 'right' ? V.x + 14 : V.subLeft;
     gv.appendChild(s('text', { class: 'tn-vpc-name', x: tx, y: V.y + 22 }, strip(v.label) || v.id));
@@ -2362,8 +2370,9 @@ function topoSvg(g, L, ctx) {
     gBoxes.appendChild(gv);
     for (const sid of V.subnets) {
       const S = N[sid], sn = S.node;
-      const gs = s('g', { class: 'tn tn-subnet tn-exp-' + (sn.exposure || 'unknown'), dataset: { node: sid, kind: 'subnet' }, tabindex: 0, role: 'button', 'aria-label': 'Subnet ' + (sn.label || sid) + ' ' + (sn.cidr || '') + ' ' + (sn.exposure || '') });
+      const gs = s('g', { class: 'tn tn-subnet tn-exp-' + (sn.exposure || 'unknown'), dataset: { node: sid, kind: 'subnet' }, tabindex: 0, role: 'button', 'aria-label': pre + 'Subnet ' + (sn.label || sid) + ' ' + (sn.cidr || '') + ' ' + (sn.exposure || '') });
       gs.appendChild(s('rect', { class: 'tn-box', x: S.x, y: S.y, width: S.w, height: S.h, rx: 6 }));
+      if (planned) gs.appendChild(s('rect', { class: 'tn-hatch', x: S.x, y: S.y, width: S.w, height: S.h, rx: 6, fill: 'url(#' + uid + '-hatch)' }));
       gs.appendChild(s('text', { class: 'tn-sub-name', x: S.x + 10, y: S.y + 18 }, strip(sn.label) || sn.id));
       const nameW = Math.min(S.w - 30, String(strip(sn.label) || sn.id).length * 7.2) + 8;
       if (sn.cidr) gs.appendChild(S.headH > C.SUB_HEAD ? s('text', { class: 'tn-sub-cidr mono', x: S.x + 10, y: S.y + 35 }, sn.cidr) : s('text', { class: 'tn-sub-cidr mono', x: S.x + 10 + nameW, y: S.y + 18 }, sn.cidr));
@@ -2380,20 +2389,25 @@ function topoSvg(g, L, ctx) {
       for (const iid of S.insts) {
         const I = N[iid], inst = I.node;
         const en = (g.enrolment || {})[iid];
-        const lamp = en ? (en.authenticated ? 'on' : 'bad') : (inst.state === 'running' ? 'running' : 'off');
+        const lamp = en ? (en.authenticated ? 'on' : 'bad') : (inst.state === 'running' ? 'running' : planned ? 'planned' : 'off');
         const gi = s('g', { class: 'tn tn-instance tn-role-' + (inst.role || 'none') + ' lamp-' + lamp, dataset: { node: iid, kind: 'instance' }, tabindex: 0, role: 'button',
-          'aria-label': (ROLE_WORD[inst.role] ? ROLE_WORD[inst.role] + ' ' : '') + (inst.label || iid) + (en ? (en.authenticated ? ', enrolled' : ', not enrolled') : '') });
+          'aria-label': pre + (ROLE_WORD[inst.role] ? ROLE_WORD[inst.role] + ' ' : '') + (inst.label || iid) + (en ? (en.authenticated ? ', enrolled' : ', not enrolled') : planned ? ', enrols after ON' : '') });
         gi.appendChild(s('rect', { class: 'tn-box', x: I.x, y: I.y, width: I.w, height: I.h, rx: 5 }));
         const gl = roleGlyph(inst.role); gl.setAttribute('transform', 'translate(' + (I.x + 10) + ',' + (I.y + 9) + ')'); gi.appendChild(gl);
         gi.appendChild(s('text', { class: 'tn-name', x: I.x + 34, y: I.y + 22 }, trimTo(strip(inst.label) || iid, 17)));
         gi.appendChild(s('circle', { class: 'tn-lamp', cx: I.x + I.w - 13, cy: I.y + 14, r: 4 }));
-        gi.appendChild(s('text', { class: 'tn-sub mono', x: I.x + 10, y: I.y + 44 }, inst.pseudo ? (ROLE_WORD[inst.role] || 'declared role').toLowerCase() : ([inst.type, inst.private_ip].filter(Boolean).join(' · ') || inst.id)));
+        // second line: type · private IP; in the planned register the address is a value slot, never an invented number
+        const sub = s('text', { class: 'tn-sub mono', x: I.x + 10, y: I.y + 44 });
+        if (inst.pseudo) sub.appendChild(document.createTextNode((ROLE_WORD[inst.role] || 'declared role').toLowerCase()));
+        else if (planned) { if (inst.type) sub.appendChild(document.createTextNode(inst.type + ' · ')); if (inst.private_ip) sub.appendChild(document.createTextNode(inst.private_ip)); else sub.appendChild(slot()); }
+        else sub.appendChild(document.createTextNode([inst.type, inst.private_ip].filter(Boolean).join(' · ') || inst.id));
+        gi.appendChild(sub);
         gNodes.appendChild(gi);
       }
     }
     for (const gid of V.gws) {
       const G = N[gid], gw = G.node;
-      const gg = s('g', { class: 'tn tn-gw tn-' + gw.kind, dataset: { node: gid, kind: gw.kind }, tabindex: 0, role: 'button', 'aria-label': (gw.kind === 'nat' ? 'NAT gateway ' : 'Internet gateway ') + (gw.label || gid) });
+      const gg = s('g', { class: 'tn tn-gw tn-' + gw.kind, dataset: { node: gid, kind: gw.kind }, tabindex: 0, role: 'button', 'aria-label': pre + (gw.kind === 'nat' ? 'NAT gateway ' : 'Internet gateway ') + (gw.label || gid) });
       gg.appendChild(s('rect', { class: 'tn-box', x: G.x, y: G.y, width: G.w, height: G.h, rx: 4 }));
       gg.appendChild(s('text', { class: 'tn-gw-name', x: G.cx, y: G.cy + 4, 'text-anchor': 'middle' }, gw.kind === 'nat' ? 'NAT' : 'IGW'));
       gNodes.appendChild(gg);
@@ -2419,9 +2433,9 @@ function topoSvg(g, L, ctx) {
   for (const n of g.nodes) {
     if (n.kind !== 'eip' || !N[n.id]) continue;
     const E = N[n.id];
-    const ge = s('g', { class: 'tn tn-eip' + (E.idle ? ' is-idle' : ''), dataset: { node: n.id, kind: 'eip' }, tabindex: 0, role: 'button', 'aria-label': 'Elastic IP ' + n.label + (E.idle ? ', unattached' : '') });
+    const ge = s('g', { class: 'tn tn-eip' + (E.idle ? ' is-idle' : '') + (n.label ? '' : ' is-slot'), dataset: { node: n.id, kind: 'eip' }, tabindex: 0, role: 'button', 'aria-label': pre + 'Elastic IP ' + (n.label || SLOT_TEXT) + (E.idle ? ', unattached' : '') });
     ge.appendChild(s('rect', { class: 'tn-box', x: E.x, y: E.y, width: E.w, height: E.h, rx: 9 }));
-    ge.appendChild(s('text', { class: 'tn-eip-ip mono', x: E.x + E.w / 2, y: E.y + 13, 'text-anchor': 'middle' }, n.label));
+    ge.appendChild(s('text', { class: 'tn-eip-ip mono', x: E.x + E.w / 2, y: E.y + 13, 'text-anchor': 'middle' }, n.label ? n.label : slot(SLOT_CHIP)));
     gNodes.appendChild(ge);
   }
 
@@ -2461,7 +2475,7 @@ function topoSvg(g, L, ctx) {
   svg.appendChild(gBoxes);
   svg.appendChild(gEdges);
   svg.appendChild(gNodes);
-  void idOf;
+  void ctx;
   return svg;
 }
 
@@ -2493,96 +2507,112 @@ function schematicGraph(decl) {
 function topoInspector(g, L, sel, uc) {
   const box = h('div', { class: 'topo-insp-body' });
   const byId = new Map(g.nodes.map(n => [n.id, n]));
+  const planned = g.register === 'planned', declared = !!g.schematic;
+  const add = el => { if (el) box.appendChild(el); return el; }; // row() is null for an empty value
   const row = (k, v) => v === null || v === undefined || v === '' ? null : h('div', { class: 'ti-row' }, h('span', { class: 'ti-k' }, k), h('span', { class: 'ti-v' }, v));
   const mono = v => h('span', { class: 'mono' }, v);
-  const nameOf = id => { const n = byId.get(id); return n ? (n.label || id) : id; };
+  const slot = () => h('span', { class: 'slot mono' }, SLOT_TEXT);
+  const nameOf = id => { const n = byId.get(id); return n ? (n.label || (n.kind === 'eip' ? SLOT_TEXT : id)) : id; };
   const kindWord = { instance: 'Instance', subnet: 'Subnet', vpc: 'VPC', nat: 'NAT gateway', igw: 'Internet gateway', eip: 'Elastic IP', internet: 'Internet' };
+  // the register is the first thing the inspector says, whatever is selected
+  box.appendChild(h('span', { class: 'ti-reg ti-reg-' + (declared ? 'declared' : planned ? 'planned' : 'deployed') }, declared ? 'Declared · not deployed' : planned ? 'Planned · not deployed' : 'Deployed'));
   if (!sel) {
     const count = k => g.nodes.filter(n => n.kind === k).length;
-    box.appendChild(h('div', { class: 'ti-title' }, g.schematic ? 'Declared topology' : 'Drawing'));
-    box.appendChild(h('div', { class: 'ti-hint' }, g.schematic ? 'Roles and flows from the manifest. Structure appears when the use case is on.' : 'Hover or focus anything for its facts. Click to open it in the region drawer.'));
-    if (!g.schematic) {
-      box.appendChild(row('Region', mono(g.region || '—')));
-      box.appendChild(row('Generated', g.generated_at ? h('span', { title: g.generated_at, dataset: { rel: g.generated_at } }, fmtRel(g.generated_at)) : '—'));
-      box.appendChild(row('VPCs', mono(String(count('vpc')))));
-      box.appendChild(row('Subnets', mono(String(count('subnet')))));
-      box.appendChild(row('Instances', mono(String(count('instance')))));
-      box.appendChild(row('Gateways', mono(count('igw') + ' IGW · ' + count('nat') + ' NAT')));
-      box.appendChild(row('Addresses', mono(count('eip') + (g.nodes.some(n => n.kind === 'eip' && !n.attached_to) ? ' (' + g.nodes.filter(n => n.kind === 'eip' && !n.attached_to).length + ' idle)' : ''))));
+    box.appendChild(h('div', { class: 'ti-title' }, declared ? 'Declared topology' : planned ? 'What ON deploys' : 'Drawing'));
+    box.appendChild(h('div', { class: 'ti-hint' }, declared ? 'Roles and flows from the manifest only. Connect the provider to plan the real network.' : planned ? 'Hover or focus anything for its facts. Click to open its source in the code view.' : 'Hover or focus anything for its facts. Click to open it in the region drawer.'));
+    if (!declared) {
+      add(row('Region', mono(g.region || '—')));
+      if (planned) {
+        const p = g.plan || {};
+        add(row('Plan', p.generated_at || g.generated_at ? h('span', { title: p.generated_at || g.generated_at, dataset: { rel: p.generated_at || g.generated_at } }, fmtRel(p.generated_at || g.generated_at)) : '—'));
+        add(row('Resources', mono(typeof p.resources === 'number' ? fmtNum(p.resources) + ' to create' : '—')));
+      } else add(row('Generated', g.generated_at ? h('span', { title: g.generated_at, dataset: { rel: g.generated_at } }, fmtRel(g.generated_at)) : '—'));
+      add(row('VPCs', mono(String(count('vpc')))));
+      add(row('Subnets', mono(String(count('subnet')))));
+      add(row('Instances', mono(String(count('instance')))));
+      add(row('Gateways', mono(count('igw') + ' IGW · ' + count('nat') + ' NAT')));
+      add(row('Addresses', planned ? (count('eip') ? [mono(String(count('eip'))), ' ', slot()] : mono('0')) : mono(count('eip') + (g.nodes.some(n => n.kind === 'eip' && !n.attached_to) ? ' (' + g.nodes.filter(n => n.kind === 'eip' && !n.attached_to).length + ' idle)' : ''))));
     }
-    box.appendChild(row('Flows', mono(g.edges.filter(e => e.kind === 'flow').length + ' declared')));
-    box.appendChild(row('Blocked', mono(String(g.edges.filter(e => e.kind === 'blocked').length))));
-    if (L && L.prefix) box.appendChild(row('Names', ['shown without the ', mono(L.prefix), ' prefix']));
+    add(row('Flows', mono(g.edges.filter(e => e.kind === 'flow').length + ' declared')));
+    add(row('Blocked', mono(String(g.edges.filter(e => e.kind === 'blocked').length))));
+    if (L && L.prefix) add(row('Names', ['shown without the ', mono(L.prefix), ' prefix']));
     return packInspector(box);
   }
   if (sel.edge !== undefined) {
     const e = g.edges[sel.edge]; if (!e) return packInspector(box);
     const words = { route: 'Default route', uplink: 'Uplink', flow: 'Declared flow', blocked: 'Blocked pair' };
     box.appendChild(h('div', { class: 'ti-title ti-edge-' + e.kind }, words[e.kind] || e.kind));
-    box.appendChild(row('From', nameOf(e.from)));
-    box.appendChild(row('To', nameOf(e.to)));
-    box.appendChild(row('Label', e.label ? mono(e.label) : null));
-    if (e.via && e.via.length) box.appendChild(row('Via', e.via.map(nameOf).join(' → ')));
-    box.appendChild(row('Source', e.kind === 'flow' || e.kind === 'blocked' ? 'manifest' : 'cloud inventory'));
+    add(row('From', nameOf(e.from)));
+    add(row('To', nameOf(e.to)));
+    add(row('Label', e.label ? mono(e.label) : null));
+    if (e.via && e.via.length) add(row('Via', e.via.map(nameOf).join(' → ')));
+    add(row('Source', e.kind === 'flow' || e.kind === 'blocked' ? 'manifest' : planned ? 'plan' : 'cloud inventory'));
     return packInspector(box);
   }
   const n = byId.get(sel.node); if (!n) return packInspector(box);
-  const G = L.nodes[n.id] || {};
   box.appendChild(h('div', { class: 'ti-kicker' }, kindWord[n.kind] || n.kind, n.role && ROLE_WORD[n.role] ? ' · ' + ROLE_WORD[n.role] : ''));
-  box.appendChild(h('div', { class: 'ti-title' }, n.label || n.id));
+  box.appendChild(h('div', { class: 'ti-title' }, n.label || (n.kind === 'eip' && planned ? SLOT_TEXT : n.id)));
   const en = (g.enrolment || {})[n.id];
+  const idRow = () => n.pseudo ? null : row(planned ? 'Address' : 'Id', mono(n.id));
   if (n.kind === 'instance') {
     const sn = byId.get(n.parent), v = sn ? byId.get(sn.parent) : null;
     const eip = g.nodes.find(x => x.kind === 'eip' && x.attached_to === n.id);
-    box.appendChild(row('Enrolment', en ? h('span', { class: en.authenticated ? 'ok' : 'bad' }, (en.authenticated ? 'authenticated' : 'not authenticated') + (en.label ? ' · ' + en.label : '')) : (n.pseudo ? null : h('span', { class: 'dim' }, 'not an enrolling component'))));
-    box.appendChild(row('State', n.state ? h('span', { class: n.state === 'running' ? 'ok' : '' }, n.state) : null));
-    box.appendChild(row('Type', n.type ? mono(n.type) : null));
-    box.appendChild(row('Private IP', n.private_ip ? mono(n.private_ip) : null));
-    box.appendChild(row('Public IP', n.public_ip ? [mono(n.public_ip), eip ? h('span', { class: 'dim' }, ' elastic') : h('span', { class: 'dim' }, ' auto-assigned')] : (n.pseudo ? null : h('span', { class: 'dim' }, 'none'))));
-    box.appendChild(row('Subnet', sn ? [sn.label || sn.id, sn.cidr ? [' ', mono(sn.cidr)] : null, sn.exposure ? [' · ', sn.exposure] : null] : null));
-    box.appendChild(row('VPC', v ? [v.label || v.id, v.cidr ? [' ', mono(v.cidr)] : null] : null));
+    const enrols = n.role === 'pse' || n.role === 'connector';
+    add(row('Enrolment', en ? h('span', { class: en.authenticated ? 'ok' : 'bad' }, (en.authenticated ? 'authenticated' : 'not authenticated') + (en.label ? ' · ' + en.label : '')) : (n.pseudo ? null : planned && enrols ? h('span', { class: 'dim' }, 'enrols after ON') : h('span', { class: 'dim' }, 'not an enrolling component'))));
+    add(row('State', n.state ? h('span', { class: n.state === 'running' ? 'ok' : '' }, n.state) : null));
+    add(row('Type', n.type ? mono(n.type) : null));
+    add(row('Private IP', n.private_ip ? mono(n.private_ip) : planned ? slot() : null));
+    const autoPublic = planned && sn && sn.detail && sn.detail.map_public_ip_on_launch === true;
+    add(row('Public IP', n.public_ip ? [mono(n.public_ip), eip ? h('span', { class: 'dim' }, ' elastic') : h('span', { class: 'dim' }, ' auto-assigned')]
+      : planned ? (eip ? [slot(), h('span', { class: 'dim' }, ' elastic')] : autoPublic ? [slot(), h('span', { class: 'dim' }, ' auto-assigned')] : h('span', { class: 'dim' }, 'none'))
+      : (n.pseudo ? null : h('span', { class: 'dim' }, 'none'))));
+    add(row('Subnet', sn ? [sn.label || sn.id, sn.cidr ? [' ', mono(sn.cidr)] : null, sn.exposure ? [' · ', sn.exposure] : null] : null));
+    add(row('VPC', v ? [v.label || v.id, v.cidr ? [' ', mono(v.cidr)] : null] : null));
     const allows = g.edges.filter(e => e.kind === 'allow' && e.to === n.id);
-    if (allows.length) box.appendChild(row('Allowed in', h('div', { class: 'ti-list' }, allows.map(a => h('div', null, mono(a.label || 'all'), h('span', { class: 'dim' }, ' from '), mono(nameOf(a.from)), /^(0\.0\.0\.0\/0|::\/0)$/.test(a.from) ? h('span', { class: 'ti-world' }, ' anywhere') : null)))));
-    box.appendChild(row('Id', n.pseudo ? null : mono(n.id)));
+    if (allows.length) add(row('Allowed in', h('div', { class: 'ti-list' }, allows.map(a => h('div', null, mono(a.label || 'all'), h('span', { class: 'dim' }, ' from '), mono(nameOf(a.from)), /^(0\.0\.0\.0\/0|::\/0)$/.test(a.from) ? h('span', { class: 'ti-world' }, ' anywhere') : null)))));
+    add(idRow());
   } else if (n.kind === 'subnet') {
     const v = byId.get(n.parent);
     const route = g.edges.find(e => e.kind === 'route' && e.from === n.id);
-    box.appendChild(row('CIDR', n.cidr ? mono(n.cidr) : null));
-    box.appendChild(row('Exposure', n.exposure ? [n.exposure, h('span', { class: 'dim' }, n.exposure === 'public' ? ' — default route to an internet gateway' : n.exposure === 'private' ? ' — default route through a NAT' : ' — no default route')] : null));
-    box.appendChild(row('Default route', route ? [mono(route.label || '0.0.0.0/0'), ' → ', nameOf(route.to)] : (n.pseudo ? null : h('span', { class: 'dim' }, 'none'))));
-    box.appendChild(row('AZ', n.az ? mono(n.az) : null));
-    box.appendChild(row('Instances', mono(String(g.nodes.filter(x => x.kind === 'instance' && x.parent === n.id).length))));
-    box.appendChild(row('VPC', v ? [v.label || v.id, v.cidr ? [' ', mono(v.cidr)] : null] : null));
-    box.appendChild(row('Id', n.pseudo ? null : mono(n.id)));
+    add(row('CIDR', n.cidr ? mono(n.cidr) : null));
+    add(row('Exposure', n.exposure ? [n.exposure, h('span', { class: 'dim' }, n.exposure === 'public' ? ' — default route to an internet gateway' : n.exposure === 'private' ? ' — default route through a NAT' : ' — no default route')] : null));
+    add(row('Default route', route ? [mono(route.label || '0.0.0.0/0'), ' → ', nameOf(route.to)] : (n.pseudo ? null : h('span', { class: 'dim' }, 'none'))));
+    add(row('AZ', n.az ? mono(n.az) : null));
+    add(row('Instances', mono(String(g.nodes.filter(x => x.kind === 'instance' && x.parent === n.id).length))));
+    add(row('VPC', v ? [v.label || v.id, v.cidr ? [' ', mono(v.cidr)] : null] : null));
+    add(idRow());
   } else if (n.kind === 'vpc') {
     const subs = g.nodes.filter(x => x.kind === 'subnet' && x.parent === n.id);
     const insts = g.nodes.filter(x => x.kind === 'instance' && subs.some(sn => sn.id === x.parent));
-    box.appendChild(row('CIDR', n.cidr ? mono(n.cidr) : null));
-    box.appendChild(row('Subnets', mono(subs.length + (subs.length ? ' (' + subs.map(x => x.exposure || '?').join(', ') + ')' : ''))));
-    box.appendChild(row('Instances', mono(String(insts.length))));
-    box.appendChild(row('Gateways', g.nodes.filter(x => (x.kind === 'igw' || x.kind === 'nat') && x.parent === n.id).map(x => x.kind === 'nat' ? 'NAT' : 'IGW').join(' · ') || h('span', { class: 'dim' }, 'none — isolated')));
-    box.appendChild(row('Id', n.pseudo ? null : mono(n.id)));
+    add(row('CIDR', n.cidr ? mono(n.cidr) : null));
+    add(row('Subnets', mono(subs.length + (subs.length ? ' (' + subs.map(x => x.exposure || '?').join(', ') + ')' : ''))));
+    add(row('Instances', mono(String(insts.length))));
+    add(row('Gateways', g.nodes.filter(x => (x.kind === 'igw' || x.kind === 'nat') && x.parent === n.id).map(x => x.kind === 'nat' ? 'NAT' : 'IGW').join(' · ') || h('span', { class: 'dim' }, 'none — isolated')));
+    add(idRow());
   } else if (n.kind === 'nat' || n.kind === 'igw') {
     const v = byId.get(n.parent);
     const eip = g.nodes.find(x => x.kind === 'eip' && x.attached_to === n.id);
-    box.appendChild(row('Public IP', n.public_ip || (eip && eip.label) ? mono(n.public_ip || eip.label) : null));
-    box.appendChild(row('Serves', g.edges.filter(e => e.kind === 'route' && e.to === n.id).map(e => nameOf(e.from)).join(', ') || (n.pseudo ? null : h('span', { class: 'dim' }, 'no subnet routes here'))));
-    box.appendChild(row('VPC', v ? [v.label || v.id, v.cidr ? [' ', mono(v.cidr)] : null] : null));
-    box.appendChild(row('Id', n.pseudo ? null : mono(n.id)));
+    add(row('Public IP', n.public_ip || (eip && eip.label) ? mono(n.public_ip || eip.label) : planned && eip ? [slot(), h('span', { class: 'dim' }, ' elastic')] : null));
+    add(row('Serves', g.edges.filter(e => e.kind === 'route' && e.to === n.id).map(e => nameOf(e.from)).join(', ') || (n.pseudo ? null : h('span', { class: 'dim' }, 'no subnet routes here'))));
+    add(row('VPC', v ? [v.label || v.id, v.cidr ? [' ', mono(v.cidr)] : null] : null));
+    add(idRow());
   } else if (n.kind === 'eip') {
-    box.appendChild(row('Address', mono(n.label)));
-    box.appendChild(row('Attached to', n.attached_to ? nameOf(n.attached_to) : h('span', { class: 'flag' }, icon('flag'), 'nothing — idle, billed hourly')));
-    box.appendChild(row('Id', mono(n.id)));
+    add(row('Address', n.label ? mono(n.label) : slot()));
+    add(row('Attached to', n.attached_to ? nameOf(n.attached_to) : h('span', { class: 'flag' }, icon('flag'), 'nothing — idle, billed hourly')));
+    add(row(planned ? 'Resource' : 'Id', mono(n.id)));
   } else if (n.kind === 'internet') {
-    box.appendChild(row('Meaning', 'Everything outside the VPCs. A line through here crosses the public internet.'));
-    box.appendChild(row('Flows', mono(String(g.edges.filter(e => e.kind === 'flow' && (e.to === n.id || (e.via || []).includes(n.id))).length))));
+    add(row('Meaning', 'Everything outside the VPCs. A line through here crosses the public internet.'));
+    add(row('Flows', mono(String(g.edges.filter(e => e.kind === 'flow' && (e.to === n.id || (e.via || []).includes(n.id))).length))));
   }
   const flows = g.edges.filter(e => (e.kind === 'flow' || e.kind === 'blocked') && (e.from === n.id || e.to === n.id));
-  if (flows.length) box.appendChild(row('Traffic', h('div', { class: 'ti-list' }, flows.map(e => h('div', { class: e.kind === 'blocked' ? 'bad' : '' }, e.from === n.id ? ['→ ', nameOf(e.to)] : ['← ', nameOf(e.from)], e.label ? [' ', mono(e.label)] : null, e.kind === 'blocked' ? ' (blocked)' : null)))));
-  if (!n.pseudo && n.kind !== 'internet' && n.kind !== 'igw' && uc) {
-    box.appendChild(h('button', { class: 'btn btn-sm ti-open', type: 'button', onclick: () => openTopoNode(uc, g, n) }, icon('link'), 'Open in region drawer'));
+  if (flows.length) add(row('Traffic', h('div', { class: 'ti-list' }, flows.map(e => h('div', { class: e.kind === 'blocked' ? 'bad' : '' }, e.from === n.id ? ['→ ', nameOf(e.to)] : ['← ', nameOf(e.from)], e.label ? [' ', mono(e.label)] : null, e.kind === 'blocked' ? ' (blocked)' : null)))));
+  // where it is declared: every node that carries a source points at its resource block
+  if (n.source && n.source.path && uc) add(row('Source', h('button', { class: 'ti-src mono', type: 'button', title: 'Open ' + n.source.path + ' at line ' + n.source.line, onclick: () => openTopoSource(uc, g, n) }, n.source.path + ':' + n.source.line)));
+  if (uc && canOpenTopoNode(g, n)) {
+    box.appendChild(planned
+      ? h('button', { class: 'btn btn-sm ti-open', type: 'button', onclick: () => openTopoSource(uc, g, n) }, icon('code'), 'Open source')
+      : h('button', { class: 'btn btn-sm ti-open', type: 'button', onclick: () => openTopoNode(uc, g, n) }, icon('link'), 'Open in region drawer'));
   }
-  void G;
   return packInspector(box);
 }
 
@@ -2593,12 +2623,31 @@ function packInspector(box) {
   clear(box); box.appendChild(head); box.appendChild(rows); if (btn) head.appendChild(btn);
   return box;
 }
-/** Click / Enter on a node: the region drawer, deep-linked to that resource. */
+/** Whether click / Enter does something for this node: deployed → the region drawer; planned → its source. */
+function canOpenTopoNode(g, n) {
+  if (!n || n.pseudo || n.kind === 'internet') return false;
+  if (g.register === 'planned') return !!(n.source && n.source.path);
+  return n.kind !== 'igw' && !!g.region;
+}
+/** Click / Enter on a node. Deployed: the region drawer, deep-linked to that resource. Planned: nothing exists in the cloud, so the source. */
 function openTopoNode(uc, g, n) {
-  if (!n || n.pseudo || n.kind === 'internet' || !g.region) return;
+  if (!canOpenTopoNode(g, n)) return;
+  if (g.register === 'planned') { openTopoSource(uc, g, n); return; }
   const kind = { instance: 'inst', subnet: 'subnet', vpc: 'vpc', nat: 'nat', eip: 'eip' }[n.kind];
   if (!kind) return;
   openResourceDrawer(uc.provider || g.provider || 'aws', g.region, kind, n.id, { returnTo: ucHash(), returnFocus: n.id });
+}
+/** Open the card's code view at the node's resource block: file selected, scrolled to the line, block flashed. */
+async function openTopoSource(uc, g, n) {
+  const src = n && n.source; if (!src || !src.path) return;
+  const cs = codeState(uc.id);
+  cs.open = true;
+  cs.target = { path: src.path, line: src.line || 1, label: n.id, flash: true };
+  render();
+  await ensureCodeTree(uc);
+  if (!cs.tree || !cs.open) return;
+  if (cs.active === src.path && cs.file) { cs.target.flash = true; render(); }
+  else await openFile(uc, src.path);
 }
 
 /* ---- the block in the card ---- */
@@ -2606,18 +2655,19 @@ function renderTopology(uc, d) {
   const t = state.topo[uc.id] || (state.topo[uc.id] = { loading: false, data: null, err: null, width: 0, sel: null, refocus: null });
   const block = h('div', { class: 'detail-block topo-block' });
   const data = t.data;
-  const live = data && data.nodes && data.nodes.length > 0;
+  const live = !!(data && data.nodes && data.nodes.length > 0);
+  const planned = !!(data && data.register === 'planned');
+  const planning = uc.state === 'off' || planned;
   const head = h('div', { class: 'section-head topo-head' },
     h('div', { class: 'topo-headings' },
       h('span', { class: 'section-title' }, 'Topology'),
-      h('span', { class: 'topo-hint' }, live ? 'Boxes and lines come from the cloud; dashed flows and blocked pairs are declared in the manifest.' : 'Structure from the cloud, meaning from the manifest.')),
+      h('span', { class: 'topo-hint' }, planned ? 'Boxes and lines come from a plan of the use case; dashed flows and blocked pairs are declared in the manifest.' : live ? 'Boxes and lines come from the cloud; dashed flows and blocked pairs are declared in the manifest.' : 'Structure from the cloud or its plan, meaning from the manifest.')),
     h('div', { class: 'topo-tools' },
-      data && data.generated_at && live ? h('span', { class: 'topo-when mono', title: data.generated_at }, data.region ? data.region + ' · ' : '', 'generated ', h('span', { dataset: { rel: data.generated_at } }, fmtRel(data.generated_at))) : null,
-      h('button', { class: 'btn btn-sm', type: 'button', disabled: !!t.loading, title: 'Rebuild the drawing from the cloud now', onclick: () => loadTopology(uc.id, true) }, icon('refresh'), t.loading ? 'Drawing' : 'Redraw')));
+      h('button', { class: 'btn btn-sm', type: 'button', disabled: !!t.loading, title: planning ? 'Run the plan again and redraw' : 'Rebuild the drawing from the cloud now', onclick: () => loadTopology(uc.id, true) }, icon('refresh'), planning ? (t.loading ? 'Planning' : 'Replan') : (t.loading ? 'Drawing' : 'Redraw'))));
   block.appendChild(head);
 
   if (!data && t.loading) {
-    block.appendChild(h('div', { class: 'topo-stage is-loading' }, h('div', { class: 'skeleton', style: 'height:300px' }), h('span', { class: 'loading topo-loading' }, 'Reading the inventory')));
+    block.appendChild(h('div', { class: 'topo-stage is-loading' }, h('div', { class: 'skeleton', style: 'height:300px' }), h('span', { class: 'loading topo-loading' }, planning ? 'Planning the use case' : 'Reading the inventory')));
     return block;
   }
   if (!data && t.err) {
@@ -2626,36 +2676,42 @@ function renderTopology(uc, d) {
     return block;
   }
   if (!data) {
-    block.appendChild(h('div', { class: 'state-box' }, h('div', { class: 'title' }, 'Not drawn yet'), h('button', { class: 'btn', type: 'button', onclick: () => loadTopology(uc.id) }, 'Draw')));
+    block.appendChild(h('div', { class: 'state-box' }, h('div', { class: 'title' }, 'Not drawn yet'), h('button', { class: 'btn', type: 'button', onclick: () => loadTopology(uc.id) }, planning ? 'Plan and draw' : 'Draw')));
     return block;
   }
-  let g = data, off = false;
+  let g = data, mode = planned ? 'planned' : 'deployed';
   if (!live) {
+    if (planned) {
+      // the plan is the drawing's only source when off; if it failed there is nothing honest to draw
+      const err = data.plan && data.plan.error;
+      block.appendChild(topoBar('planned', data, uc, null));
+      if (err) block.appendChild(h('div', { class: 'state-box is-error topo-planfail' },
+        h('div', { class: 'title' }, 'The plan failed, so there is nothing to draw'),
+        h('pre', { class: 'topo-planerr mono' }, err),
+        h('button', { class: 'btn', type: 'button', onclick: () => loadTopology(uc.id, true) }, icon('refresh'), 'Retry the plan')));
+      else block.appendChild(h('div', { class: 'state-box' }, h('div', { class: 'title' }, data.plan ? 'The plan creates nothing to draw' : 'Nothing to draw yet'), h('div', null, data.reason || 'No network resources are planned for this use case.')));
+      return block;
+    }
+    // last fallback: no plan can be made (provider disconnected) — the manifest's declared roles and flows, labelled as such
     const decl = data.declared || data.topology || (d && d.topology) || null;
     const sk = schematicGraph(decl);
-    off = true;
     if (!sk) {
-      block.appendChild(h('div', { class: 'topo-stage is-off' },
+      block.appendChild(h('div', { class: 'topo-stage is-declared' },
         h('div', { class: 'topo-offstate' },
           h('div', { class: 'topo-off-title' }, 'Nothing to draw'),
           h('div', { class: 'topo-off-reason' }, data.reason || 'The inventory carries nothing for this use case.'),
-          h('div', { class: 'topo-off-hint' }, uc.state === 'off' ? 'Turn it on to draw the network from the cloud. The manifest declares no roles or flows to sketch meanwhile.' : 'The drawing appears once tagged resources exist in the inventory.'))));
+          h('div', { class: 'topo-off-hint' }, uc.state === 'off' ? 'Connect the provider and the drawing comes from a plan of what ON deploys. The manifest declares no roles or flows to sketch meanwhile.' : 'The drawing appears once tagged resources exist in the inventory.'))));
       return block;
     }
-    g = Object.assign(sk, { region: data.region || null, provider: data.provider || uc.provider, generated_at: data.generated_at, reason: data.reason });
+    mode = 'declared';
+    g = Object.assign(sk, { register: 'declared', region: data.region || null, provider: data.provider || uc.provider, generated_at: data.generated_at, reason: data.reason });
   }
-  if (t.err) block.appendChild(h('div', { class: 'form-error', style: 'margin-bottom:10px' }, 'Redraw failed: ' + t.err + ' — showing the previous drawing.'));
+  if (t.err) block.appendChild(h('div', { class: 'form-error', style: 'margin-bottom:10px' }, (planned ? 'Replan failed: ' : 'Redraw failed: ') + t.err + ' — showing the previous drawing.'));
 
-  const stage = h('div', { class: 'topo-stage' + (off ? ' is-off' : '') });
-  const canvas = h('div', { class: 'topo-canvas', tabindex: '-1', 'aria-label': 'Topology drawing, scrolls horizontally when wider than the card' });
+  const stage = h('div', { class: 'topo-stage is-' + mode });
+  const canvas = h('div', { class: 'topo-canvas', tabindex: '-1', 'aria-label': (mode === 'planned' ? 'Planned topology drawing' : 'Topology drawing') + ', scrolls horizontally when wider than the card' });
   const aside = h('aside', { class: 'topo-inspector', 'aria-live': 'polite' });
-  if (off) {
-    const lr = uc.last_run;
-    stage.appendChild(h('div', { class: 'topo-offbar' },
-      h('span', { class: 'lamp' }), h('span', { class: 'state-word off' }, 'not running'),
-      h('span', { class: 'dim' }, data.reason || 'The use case is off.'),
-      h('span', { class: 'topo-offbar-run mono' }, lr ? ['last run: ' + lr.action + ' ' + lr.state + ' · ', h('span', { dataset: { rel: lr.ended || lr.started }, title: lr.ended || lr.started }, fmtRel(lr.ended || lr.started))] : 'never run')));
-  }
+  stage.appendChild(topoBar(mode, data, uc, g));
   stage.appendChild(canvas);
   stage.appendChild(aside);
   block.appendChild(stage);
@@ -2689,17 +2745,56 @@ function renderTopology(uc, d) {
 }
 window.addEventListener('resize', () => { clearTimeout(renderTopology._rt); renderTopology._rt = setTimeout(() => { $$('.topo-canvas').forEach(c => c._topoRedraw && c._topoRedraw()); }, 120); });
 
+/** The register bar above the drawing — one bar, three registers: DEPLOYED (the cloud), PLANNED (what ON deploys), DECLARED (manifest only). */
+function topoBar(mode, data, uc, g) {
+  const lr = uc.last_run;
+  const seg = (cls, ...c) => h('span', { class: 'topo-bar-seg' + (cls ? ' ' + cls : '') }, ...c);
+  const rel = iso => h('span', { class: 'mono', dataset: { rel: iso }, title: iso }, fmtRel(iso));
+  const segs = [];
+  if (mode === 'deployed') {
+    segs.push(seg('', h('span', { class: 'mono' }, data.region || 'region unknown')));
+    if (data.generated_at) segs.push(seg('', 'generated ', rel(data.generated_at)));
+  } else if (mode === 'planned') {
+    const p = data.plan || {};
+    segs.push(seg('', 'this is what ON deploys'));
+    if (p.error) segs.push(seg('bad', 'plan failed'));
+    else { const n = typeof p.resources === 'number' ? p.resources : (g ? g.nodes.filter(x => x.kind !== 'internet').length : 0); segs.push(seg('', h('b', { class: 'mono' }, fmtNum(n)), ' ' + plural(n, 'resource'))); }
+    const when = p.generated_at || data.generated_at;
+    if (when) segs.push(seg('', 'plan ', rel(when)));
+  } else {
+    segs.push(seg('', 'roles and flows from the manifest only'));
+    segs.push(seg('dim', data.reason || 'nothing planned or deployed'));
+  }
+  const word = { deployed: 'Deployed', planned: 'Planned', declared: 'Declared' }[mode];
+  return h('div', { class: 'topo-bar is-' + mode, role: 'status' },
+    h('span', { class: 'lamp topo-bar-lamp ' + (mode === 'deployed' ? 'on' : mode === 'planned' ? 'planned' : 'unknown') }),
+    h('span', { class: 'topo-bar-reg' }, word),
+    segs.map(x => [h('span', { class: 'topo-bar-dot', 'aria-hidden': 'true' }, '·'), x]),
+    h('span', { class: 'topo-bar-run mono' }, lr ? ['last run: ' + lr.action + ' ' + lr.state + ' · ', rel(lr.ended || lr.started)] : 'never run'));
+}
+
 function topoLegend(g, uc) {
   const sw = (cls, d) => s('svg', { class: 'lg-sw', viewBox: '0 0 44 14', 'aria-hidden': 'true' }, s('path', { class: cls, d: d || 'M2 7H42' }));
-  const item = (svgEl, text) => h('span', { class: 'lg-item' }, svgEl, text);
+  const item = (svgEl, text, cls) => h('span', { class: 'lg-item' + (cls ? ' ' + cls : '') }, svgEl, text);
   const lamp = cls => h('span', { class: 'lg-lamp ' + cls });
   const badge = exp => h('span', { class: 'lg-badge lg-exp-' + exp }, exp);
+  // the register pair: one solid, one dashed and hatched; the drawing's own register is the lit one
+  const uid = 'lg' + (topoLegend.seq = (topoLegend.seq || 0) + 1);
+  const reg = kind => s('svg', { class: 'lg-reg lg-reg-' + kind, viewBox: '0 0 30 16', 'aria-hidden': 'true' },
+    kind === 'planned' ? s('defs', null, s('pattern', { id: uid + '-hatch', class: 'hatch', patternUnits: 'userSpaceOnUse', width: 5, height: 5, patternTransform: 'rotate(45)' }, s('path', { d: 'M0 0V5' }))) : null,
+    s('rect', { class: 'lg-reg-box', x: 1.5, y: 1.5, width: 27, height: 13, rx: 3 }),
+    kind === 'planned' ? s('rect', { class: 'lg-reg-hatch', x: 1.5, y: 1.5, width: 27, height: 13, rx: 3, fill: 'url(#' + uid + '-hatch)' }) : null);
+  const current = g.register === 'planned' ? 'planned' : g.schematic ? null : 'deployed';
   const legend = h('div', { class: 'topo-legend' },
+    item(reg('deployed'), 'deployed', 'lg-register' + (current === 'deployed' ? ' is-current' : '')),
+    item(reg('planned'), 'planned', 'lg-register' + (current === 'planned' ? ' is-current' : '')),
+    h('span', { class: 'lg-sep' }),
     item(sw('lg-route'), 'default route'),
     item(sw('lg-uplink'), 'uplink to the internet'),
     item(sw('lg-flow', 'M2 7H36'), 'declared flow'),
     item(s('svg', { class: 'lg-sw', viewBox: '0 0 44 14', 'aria-hidden': 'true' }, s('path', { class: 'lg-blocked', d: 'M2 7H42' }), s('path', { class: 'lg-strike', d: 'M18 3l8 8M26 3l-8 8' })), 'blocked'),
     h('span', { class: 'lg-sep' }),
+    current === 'planned' ? item(lamp('planned'), 'enrols after ON') : null,
     item(lamp('on'), 'enrolled'), item(lamp('bad'), 'not enrolled'), item(lamp('running'), 'running'),
     h('span', { class: 'lg-sep' }),
     badge('public'), badge('private'), badge('isolated'),
@@ -2708,7 +2803,7 @@ function topoLegend(g, uc) {
     item(s('svg', { class: 'lg-glyph', viewBox: '0 0 18 18', 'aria-hidden': 'true' }, roleGlyph('connector')), 'connector'),
     item(s('svg', { class: 'lg-glyph', viewBox: '0 0 18 18', 'aria-hidden': 'true' }, roleGlyph('app')), 'app'),
     item(s('svg', { class: 'lg-glyph', viewBox: '0 0 18 18', 'aria-hidden': 'true' }, roleGlyph('client')), 'client'));
-  void g; void uc;
+  void uc;
   return legend;
 }
 
@@ -2757,15 +2852,16 @@ function wireTopology(svg, canvas, aside, g, L, t, uc) {
   svg.addEventListener('focusout', e => { if (!svg.contains(e.relatedTarget)) { highlight(sticky); showInsp(sticky); } });
   svg.addEventListener('click', e => {
     const sel = selOf(e.target); if (!sel) return;
-    if (sel.node !== undefined) { const n = byId.get(sel.node); sticky = sel; t.sel = sel; if (n && !n.pseudo && n.kind !== 'internet' && n.kind !== 'igw') openTopoNode(uc, g, n); else { highlight(sel); showInsp(sel); } }
-    else { sticky = sel; t.sel = sel; highlight(sel); showInsp(sel); }
+    sticky = sel; t.sel = sel;
+    if (sel.node !== undefined) { const n = byId.get(sel.node); if (canOpenTopoNode(g, n)) openTopoNode(uc, g, n); else { highlight(sel); showInsp(sel); } }
+    else { highlight(sel); showInsp(sel); }
   });
   svg.addEventListener('keydown', e => {
     if (e.key !== 'Enter' && e.key !== ' ') return;
     const sel = selOf(e.target); if (!sel || sel.node === undefined) return;
     e.preventDefault();
     const n = byId.get(sel.node);
-    if (n && !n.pseudo && n.kind !== 'internet' && n.kind !== 'igw') openTopoNode(uc, g, n);
+    if (canOpenTopoNode(g, n)) openTopoNode(uc, g, n);
   });
   if (sticky) { highlight(sticky); showInsp(sticky); }
 }
@@ -3006,34 +3102,60 @@ function langFor(path, hint) {
   return (m && EXT_LANG[m[1].toLowerCase()]) || 'text';
 }
 
+function codeState(id) {
+  return state.code[id] || (state.code[id] = { open: false, tree: null, commit: null, active: null, file: null, loading: false, err: null, target: null });
+}
+/** Load the checkout's file list once; resolves when it is there (or failed). */
+async function ensureCodeTree(uc) {
+  const cs = codeState(uc.id);
+  if (cs.tree || cs.loading) { while (cs.loading) await sleep(60); return; }
+  cs.loading = true; cs.err = null; render();
+  try {
+    const t = await api.codeTree(uc.id);
+    cs.tree = t.files || []; cs.commit = t.commit || null;
+  } catch (e) { if (e.status === 401) return; cs.err = e.message; }
+  cs.loading = false; render();
+}
+
 async function toggleCode(uc) {
-  const cs = state.code[uc.id] || (state.code[uc.id] = { open: false, tree: null, commit: null, active: null, file: null, loading: false, err: null });
+  const cs = codeState(uc.id);
   cs.open = !cs.open;
   render();
   if (cs.open && !cs.tree) {
-    cs.loading = true; cs.err = null; render();
-    try {
-      const t = await api.codeTree(uc.id);
-      cs.tree = t.files || []; cs.commit = t.commit || null;
-      cs.loading = false; render();
-      const pref = cs.tree.find(f => /(^|\/)usecase\.ya?ml$/.test(f.path)) || cs.tree.find(f => /main\.tf$/.test(f.path)) || cs.tree[0];
-      if (pref) openFile(uc, pref.path);
-    } catch (e) { if (e.status === 401) return; cs.loading = false; cs.err = e.message; render(); }
+    await ensureCodeTree(uc);
+    if (!cs.tree || cs.active) return;
+    const pref = cs.tree.find(f => /(^|\/)usecase\.ya?ml$/.test(f.path)) || cs.tree.find(f => /main\.tf$/.test(f.path)) || cs.tree[0];
+    if (pref) openFile(uc, pref.path);
   }
 }
 
 async function openFile(uc, path) {
-  const cs = state.code[uc.id];
-  cs.active = path; cs.file = null; cs.fileErr = null; cs.fileLoading = true; render();
+  const cs = codeState(uc.id);
+  if (cs.target && cs.target.path !== path) cs.target = null; // moving to another file drops the source target
+  cs.active = path; cs.file = null; cs.fileErr = null; cs.fileLoading = true; cs.scrollTop = 0; render();
   try { cs.file = await api.codeFile(uc.id, path); }
   catch (e) { if (e.status === 401) return; cs.fileErr = e.message; }
   cs.fileLoading = false; render();
 }
 
+/** [first, last] line of the block that opens at `line` (1-based): braces counted outside strings and comments. Good enough for HCL and YAML-ish blocks. */
+function blockRange(content, line) {
+  const lines = String(content || '').split('\n');
+  let depth = 0, started = false;
+  for (let i = Math.max(0, line - 1); i < lines.length; i++) {
+    const l = lines[i].replace(/"(?:[^"\\]|\\.)*"/g, '""').replace(/(#|\/\/).*$/, '');
+    for (const ch of l) { if (ch === '{') { depth++; started = true; } else if (ch === '}') depth--; }
+    if (started && depth <= 0) return [line, i + 1];
+    if (!started && i > line + 1) break; // not a braced block: mark the line alone
+  }
+  return [line, line];
+}
+
 function renderDrawer(uc, cs) {
   const d = h('div', { class: 'drawer' });
+  const tgt = cs.target && cs.file && cs.target.path === cs.file.path ? cs.target : null;
   d.appendChild(h('div', { class: 'drawer-head' },
-    h('span', { class: 'mono' }, cs.active || 'checkout'),
+    h('span', { class: 'mono' }, cs.active || 'checkout', tgt ? [':' + tgt.line, h('span', { class: 'drawer-target' }, ' · ', tgt.label)] : null),
     h('span', { class: 'mono' }, cs.commit ? 'commit ' + String(cs.commit).slice(0, 10) : '', cs.file && cs.file.language ? ' · ' + cs.file.language : '')));
   const body = h('div', { class: 'drawer-body' });
   const tree = h('div', { class: 'tree', role: 'tree', 'aria-label': 'Files' });
@@ -3059,15 +3181,32 @@ function renderDrawer(uc, cs) {
     }
   }
   body.appendChild(tree);
-  const pane = h('div', { class: 'code-pane' });
+  const pane = h('div', { class: 'code-pane', tabindex: '-1', 'aria-label': cs.active ? 'Contents of ' + cs.active : 'File contents',
+    onscroll: () => { cs.scrollTop = pane.scrollTop; } });
   if (cs.fileLoading) pane.appendChild(h('div', { class: 'code-empty' }, h('span', { class: 'loading' }, 'Opening ' + cs.active)));
   else if (cs.fileErr) pane.appendChild(h('div', { class: 'code-empty', style: 'color:var(--bad)' }, cs.fileErr));
   else if (cs.file) {
     const lang = langFor(cs.file.path, cs.file.language);
     const lines = SB.highlight.highlight(cs.file.content || '', lang).split('\n');
-    const pre = h('pre');
-    pre.innerHTML = lines.map((l, i) => '<span class="ln">' + (i + 1) + '</span>' + l).join('\n');
+    const range = tgt ? blockRange(cs.file.content || '', tgt.line) : null;
+    const pre = h('pre', { class: range ? 'has-target' : '' });
+    // one block-level span per line so a range of lines can be marked and scrolled to; the newline lives inside it so copy keeps line breaks
+    pre.innerHTML = lines.map((l, i) => { const ln = i + 1; const inR = range && ln >= range[0] && ln <= range[1]; return '<span class="cl' + (inR ? ' is-src' : '') + (inR && ln === range[0] ? ' is-src-start' : '') + (inR && ln === range[1] ? ' is-src-end' : '') + '" data-ln="' + ln + '"><span class="ln">' + ln + '</span>' + l + '\n</span>'; }).join('');
     pane.appendChild(pre);
+    if (tgt && tgt.flash) {
+      tgt.flash = false;
+      setTimeout(() => {
+        if (!pane.isConnected) return;
+        const first = $('.cl.is-src-start', pane);
+        if (first) {
+          cs.scrollTop = Math.max(0, first.offsetTop - 44); pane.scrollTop = cs.scrollTop;
+          $$('.cl.is-src', pane).forEach(x => x.classList.add('is-flash-src'));
+        }
+        const reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        d.scrollIntoView({ block: 'start', behavior: reduce ? 'auto' : 'smooth' });
+        pane.focus({ preventScroll: true });
+      });
+    } else if (cs.scrollTop) setTimeout(() => { if (pane.isConnected) pane.scrollTop = cs.scrollTop; }); // a re-render must not lose the reader's place (focus is kept by render())
   } else pane.appendChild(h('div', { class: 'code-empty' }, 'Select a file.'));
   body.appendChild(pane);
   d.appendChild(body);
@@ -3295,6 +3434,9 @@ SB.mock = (function () {
   const MIN = 60000, H = 3600000, D = 86400000;
   let authed = PARAMS.get('authed') === '1';
   const connected = new Set((PARAMS.get('connected') === '1' ? 'aws' : PARAMS.get('connected') || '').split(',').filter(Boolean));
+  // ?topo=planned (alias: off) draws the PSE lab from its plan; planfail = the plan errors; disconnected = AWS unplugged, declared fallback
+  const TOPO_MODE = { off: 'planned', planned: 'planned', planfail: 'planfail', disconnected: 'disconnected' }[PARAMS.get('topo')] || null;
+  if (TOPO_MODE === 'disconnected') connected.delete('aws');
   const connectedAtBoot = iso(2 * H);
   const jobs = {};
   let jobSeq = 100;
@@ -3435,13 +3577,168 @@ SB.mock = (function () {
       blocked: [],
     },
   };
+  /* ---- v1.4: the plan register. What `tofu show -json <planfile>` would carry for each use case, reduced to
+          what the graph needs: address, planned values, and the expression references that give structure.
+          `planGraph` turns it into the same node/edge vocabulary the live builder produces — ids are addresses,
+          anything unknown until apply is null, every node points at its resource block in the checkout. ---- */
+  const R = (address, values, refs) => { const m = /^([a-z0-9_]+)\.([a-z0-9_]+)$/.exec(address); return { address, type: m[1], name: m[2], values: values || {}, refs: refs || {} }; };
+  const PSE_PLAN = [
+    R('aws_vpc.pse', { cidr_block: '10.91.0.0/16', enable_dns_hostnames: true, tags: { Name: 'zpa-lab-vpc-a' } }),
+    R('aws_vpc.app', { cidr_block: '10.90.0.0/16', enable_dns_hostnames: true, tags: { Name: 'zpa-lab-vpc-b' } }),
+    R('aws_subnet.public', { cidr_block: '10.91.10.0/24', availability_zone: 'eu-central-1a', map_public_ip_on_launch: true, tags: { Name: 'zpa-lab-public' } }, { vpc_id: 'aws_vpc.pse' }),
+    R('aws_subnet.b_public', { cidr_block: '10.90.0.0/24', availability_zone: 'eu-central-1a', map_public_ip_on_launch: true, tags: { Name: 'zpa-lab-b-public' } }, { vpc_id: 'aws_vpc.app' }),
+    R('aws_subnet.priv', { cidr_block: '10.90.20.0/24', availability_zone: 'eu-central-1a', map_public_ip_on_launch: false, tags: { Name: 'zpa-lab-priv' } }, { vpc_id: 'aws_vpc.app' }),
+    R('aws_subnet.mcu', { cidr_block: '10.90.30.0/24', availability_zone: 'eu-central-1a', map_public_ip_on_launch: false, tags: { Name: 'zpa-lab-mcu' } }, { vpc_id: 'aws_vpc.app' }),
+    R('aws_internet_gateway.pse', { tags: { Name: 'zpa-lab-igw-a' } }, { vpc_id: 'aws_vpc.pse' }),
+    R('aws_internet_gateway.app', { tags: { Name: 'zpa-lab-igw-b' } }, { vpc_id: 'aws_vpc.app' }),
+    R('aws_eip.pse', { domain: 'vpc', tags: { Name: 'zpa-lab-pse-eip' } }, { instance: 'aws_instance.pse' }),
+    R('aws_eip.nat', { domain: 'vpc', tags: { Name: 'zpa-lab-nat-eip' } }),
+    R('aws_nat_gateway.app', { connectivity_type: 'public', tags: { Name: 'zpa-lab-nat' } }, { subnet_id: 'aws_subnet.b_public', allocation_id: 'aws_eip.nat' }),
+    R('aws_route_table.pse_public', { tags: { Name: 'zpa-lab-public-rt' } }, { vpc_id: 'aws_vpc.pse' }),
+    R('aws_route_table.app_public', { tags: { Name: 'zpa-lab-b-public-rt' } }, { vpc_id: 'aws_vpc.app' }),
+    R('aws_route_table.app_private', { tags: { Name: 'zpa-lab-b-private-rt' } }, { vpc_id: 'aws_vpc.app' }),
+    R('aws_route.pse_default', { destination_cidr_block: '0.0.0.0/0' }, { route_table_id: 'aws_route_table.pse_public', gateway_id: 'aws_internet_gateway.pse' }),
+    R('aws_route.app_public_default', { destination_cidr_block: '0.0.0.0/0' }, { route_table_id: 'aws_route_table.app_public', gateway_id: 'aws_internet_gateway.app' }),
+    R('aws_route.app_private_default', { destination_cidr_block: '0.0.0.0/0' }, { route_table_id: 'aws_route_table.app_private', nat_gateway_id: 'aws_nat_gateway.app' }),
+    R('aws_route_table_association.pse_public', {}, { subnet_id: 'aws_subnet.public', route_table_id: 'aws_route_table.pse_public' }),
+    R('aws_route_table_association.app_public', {}, { subnet_id: 'aws_subnet.b_public', route_table_id: 'aws_route_table.app_public' }),
+    R('aws_route_table_association.app_private', {}, { subnet_id: 'aws_subnet.priv', route_table_id: 'aws_route_table.app_private' }),
+    R('aws_route_table_association.app_client', {}, { subnet_id: 'aws_subnet.mcu', route_table_id: 'aws_route_table.app_private' }),
+    R('aws_security_group.pse', { name: 'zpa-lab-pse', description: 'Private Service Edge: client TLS in, SSH from inside the VPC', tags: { Name: 'zpa-lab-pse' } }, { vpc_id: 'aws_vpc.pse' }),
+    R('aws_security_group.connector', { name: 'zpa-lab-connector', description: 'App Connector: outbound only, SSH from inside the VPC', tags: { Name: 'zpa-lab-connector' } }, { vpc_id: 'aws_vpc.pse' }),
+    R('aws_security_group.priv_connector', { name: 'zpa-lab-priv-connector', description: 'PRIV App Connector: outbound only', tags: { Name: 'zpa-lab-priv-connector' } }, { vpc_id: 'aws_vpc.app' }),
+    R('aws_security_group.server', { name: 'zpa-lab-server', description: 'Protected app: 8080 from the PRIV connector only', tags: { Name: 'zpa-lab-server' } }, { vpc_id: 'aws_vpc.app' }),
+    R('aws_security_group.client', { name: 'zpa-lab-mcu-client', description: 'Windows client: RDP for the demo operator', tags: { Name: 'zpa-lab-mcu-client' } }, { vpc_id: 'aws_vpc.app' }),
+    R('aws_vpc_security_group_ingress_rule.pse_tls_tcp', { ip_protocol: 'tcp', from_port: 443, to_port: 443, cidr_ipv4: '0.0.0.0/0' }, { security_group_id: 'aws_security_group.pse' }),
+    R('aws_vpc_security_group_ingress_rule.pse_tls_udp', { ip_protocol: 'udp', from_port: 443, to_port: 443, cidr_ipv4: '0.0.0.0/0' }, { security_group_id: 'aws_security_group.pse' }),
+    R('aws_vpc_security_group_ingress_rule.pse_ssh', { ip_protocol: 'tcp', from_port: 22, to_port: 22, cidr_ipv4: '10.91.0.0/16' }, { security_group_id: 'aws_security_group.pse' }),
+    R('aws_vpc_security_group_ingress_rule.connector_ssh', { ip_protocol: 'tcp', from_port: 22, to_port: 22, cidr_ipv4: '10.91.0.0/16' }, { security_group_id: 'aws_security_group.connector' }),
+    R('aws_vpc_security_group_ingress_rule.priv_connector_ssh', { ip_protocol: 'tcp', from_port: 22, to_port: 22, cidr_ipv4: '10.90.0.0/16' }, { security_group_id: 'aws_security_group.priv_connector' }),
+    R('aws_vpc_security_group_ingress_rule.server_app', { ip_protocol: 'tcp', from_port: 8080, to_port: 8080 }, { security_group_id: 'aws_security_group.server', referenced_security_group_id: 'aws_security_group.priv_connector' }),
+    R('aws_vpc_security_group_ingress_rule.server_ssh', { ip_protocol: 'tcp', from_port: 22, to_port: 22, cidr_ipv4: '10.90.20.0/24' }, { security_group_id: 'aws_security_group.server' }),
+    R('aws_vpc_security_group_ingress_rule.client_rdp', { ip_protocol: 'tcp', from_port: 3389, to_port: 3389, cidr_ipv4: '0.0.0.0/0' }, { security_group_id: 'aws_security_group.client' }),
+    R('aws_vpc_security_group_egress_rule.pse', { ip_protocol: '-1', cidr_ipv4: '0.0.0.0/0' }, { security_group_id: 'aws_security_group.pse' }),
+    R('aws_vpc_security_group_egress_rule.connector', { ip_protocol: '-1', cidr_ipv4: '0.0.0.0/0' }, { security_group_id: 'aws_security_group.connector' }),
+    R('aws_vpc_security_group_egress_rule.priv_connector', { ip_protocol: '-1', cidr_ipv4: '0.0.0.0/0' }, { security_group_id: 'aws_security_group.priv_connector' }),
+    R('aws_vpc_security_group_egress_rule.server', { ip_protocol: '-1', cidr_ipv4: '0.0.0.0/0' }, { security_group_id: 'aws_security_group.server' }),
+    R('aws_vpc_security_group_egress_rule.client', { ip_protocol: '-1', cidr_ipv4: '0.0.0.0/0' }, { security_group_id: 'aws_security_group.client' }),
+    R('aws_instance.pse', { instance_type: 'm5.large', root_block_device: [{ volume_size: 80, volume_type: 'gp3' }], tags: { Name: 'zpa-lab-pse', Role: 'pse' } }, { subnet_id: 'aws_subnet.public', vpc_security_group_ids: ['aws_security_group.pse'], iam_instance_profile: 'aws_iam_instance_profile.zpa', key_name: 'aws_key_pair.lab' }),
+    R('aws_instance.connector', { instance_type: 't3.medium', root_block_device: [{ volume_size: 80, volume_type: 'gp3' }], tags: { Name: 'zpa-lab-connector', Role: 'app-connector' } }, { subnet_id: 'aws_subnet.public', vpc_security_group_ids: ['aws_security_group.connector'], iam_instance_profile: 'aws_iam_instance_profile.zpa', key_name: 'aws_key_pair.lab' }),
+    R('aws_instance.priv_connector', { instance_type: 't3.medium', root_block_device: [{ volume_size: 80, volume_type: 'gp3' }], tags: { Name: 'zpa-lab-priv-connector', Role: 'app-connector' } }, { subnet_id: 'aws_subnet.priv', vpc_security_group_ids: ['aws_security_group.priv_connector'], iam_instance_profile: 'aws_iam_instance_profile.zpa', key_name: 'aws_key_pair.lab' }),
+    R('aws_instance.server', { instance_type: 't3.micro', tags: { Name: 'zpa-lab-server', Role: 'app' } }, { subnet_id: 'aws_subnet.priv', vpc_security_group_ids: ['aws_security_group.server'], key_name: 'aws_key_pair.lab' }),
+    R('aws_instance.mcu_client', { instance_type: 't3.medium', get_password_data: true, root_block_device: [{ volume_size: 50, volume_type: 'gp3' }], tags: { Name: 'zpa-lab-mcu-client', Role: 'client' } }, { subnet_id: 'aws_subnet.mcu', vpc_security_group_ids: ['aws_security_group.client'], key_name: 'aws_key_pair.lab' }),
+    R('aws_iam_role.zpa', { name: 'zpa-lab-node' }),
+    R('aws_iam_instance_profile.zpa', { name: 'zpa-lab-node' }, { role: 'aws_iam_role.zpa' }),
+    R('aws_iam_role_policy.ssm_read', { name: 'zpa-lab-ssm-read' }, { role: 'aws_iam_role.zpa' }),
+    R('aws_key_pair.lab', { key_name: 'zpa-lab' }),
+    R('aws_network_acl.app', { tags: { Name: 'zpa-lab-mcu-nacl' } }, { vpc_id: 'aws_vpc.app', subnet_ids: ['aws_subnet.mcu'] }),
+  ];
+  const CC_PLAN = [
+    R('aws_vpc.cc', { cidr_block: '10.80.0.0/16', tags: { Name: 'zia-cc-vpc' } }),
+    R('aws_subnet.cc_public', { cidr_block: '10.80.0.0/24', availability_zone: 'eu-central-1a', map_public_ip_on_launch: true, tags: { Name: 'zia-cc-public' } }, { vpc_id: 'aws_vpc.cc' }),
+    R('aws_subnet.workload', { cidr_block: '10.80.10.0/24', availability_zone: 'eu-central-1a', tags: { Name: 'zia-cc-workload' } }, { vpc_id: 'aws_vpc.cc' }),
+    R('aws_internet_gateway.cc', { tags: { Name: 'zia-cc-igw' } }, { vpc_id: 'aws_vpc.cc' }),
+    R('aws_route_table.cc_public', { tags: { Name: 'zia-cc-public-rt' } }, { vpc_id: 'aws_vpc.cc' }),
+    R('aws_route_table.workload', { tags: { Name: 'zia-cc-workload-rt' } }, { vpc_id: 'aws_vpc.cc' }),
+    R('aws_route.cc_default', { destination_cidr_block: '0.0.0.0/0' }, { route_table_id: 'aws_route_table.cc_public', gateway_id: 'aws_internet_gateway.cc' }),
+    R('aws_route.workload_via_cc', { destination_cidr_block: '0.0.0.0/0' }, { route_table_id: 'aws_route_table.workload', network_interface_id: 'aws_instance.cc' }),
+    R('aws_route_table_association.cc_public', {}, { subnet_id: 'aws_subnet.cc_public', route_table_id: 'aws_route_table.cc_public' }),
+    R('aws_route_table_association.workload', {}, { subnet_id: 'aws_subnet.workload', route_table_id: 'aws_route_table.workload' }),
+    R('aws_security_group.cc', { name: 'zia-cc', tags: { Name: 'zia-cc' } }, { vpc_id: 'aws_vpc.cc' }),
+    R('aws_security_group.workload', { name: 'zia-workload', tags: { Name: 'zia-workload' } }, { vpc_id: 'aws_vpc.cc' }),
+    R('aws_instance.cc', { instance_type: 't3.medium', source_dest_check: false, tags: { Name: 'zia-cc', Role: 'cloud-connector' } }, { subnet_id: 'aws_subnet.cc_public', vpc_security_group_ids: ['aws_security_group.cc'] }),
+    R('aws_instance.workload', { instance_type: 't3.micro', tags: { Name: 'zia-workload', Role: 'app' } }, { subnet_id: 'aws_subnet.workload', vpc_security_group_ids: ['aws_security_group.workload'] }),
+  ];
+  const PLANS = { 'zpa-private-service-edge': PSE_PLAN, 'zia-cloud-connector-sandbox': CC_PLAN };
+  /** Where `resource "<type>" "<name>"` is declared in the mock checkout: {path, line} or null. */
+  function sourceFor(address) {
+    const m = /^([a-z0-9_]+)\.([a-z0-9_]+)$/.exec(address || ''); if (!m) return null;
+    const re = new RegExp('^resource\\s+"' + m[1] + '"\\s+"' + m[2] + '"');
+    for (const path of Object.keys(FILES)) {
+      if (!/\.tf$/.test(path)) continue;
+      const i = FILES[path].split('\n').findIndex(l => re.test(l));
+      if (i >= 0) return { path, line: i + 1 };
+    }
+    return null;
+  }
+  let srcByName = null; // "<type>:<Name tag>" -> source, so live (deployed) nodes can point at their block too (built on first use; FILES is declared later)
+  const KIND_TYPE = { vpc: 'aws_vpc', subnet: 'aws_subnet', instance: 'aws_instance', nat: 'aws_nat_gateway', igw: 'aws_internet_gateway', eip: 'aws_eip' };
+  function sourceByName(kind, name) {
+    if (!srcByName) { srcByName = {}; for (const p of Object.values(PLANS)) for (const r of p) { const nm = r.values.tags && r.values.tags.Name; if (nm) srcByName[r.type + ':' + nm] = sourceFor(r.address); } }
+    return name && KIND_TYPE[kind] ? srcByName[KIND_TYPE[kind] + ':' + name] || null : null;
+  }
+  /** Build the v1.2 graph from a plan: structure from the expression references, meaning from the manifest. */
+  function planGraph(plan, decl) {
+    const byAddr = new Map(plan.map(r => [r.address, r]));
+    const of = (t) => plan.filter(r => r.type === t);
+    const label = r => (r.values.tags && r.values.tags.Name) || r.name;
+    const vpcOfSubnet = a => { const sn = byAddr.get(a); return sn ? sn.refs.vpc_id : null; };
+    const nodes = [{ id: 'internet', kind: 'internet', label: 'Internet' }], edges = [], unknown = [];
+    const roles = (decl && decl.roles) || {};
+    const node = (r, extra) => { nodes.push(Object.assign({ id: r.address, label: label(r), source: sourceFor(r.address), detail: Object.assign({ address: r.address, type: r.type }, r.values) }, extra)); };
+    // route tables: which subnet is associated with which table, and what the table's default route hits
+    const rtOf = {}; for (const a of of('aws_route_table_association')) if (a.refs.subnet_id) rtOf[a.refs.subnet_id] = a.refs.route_table_id;
+    const rtDefault = {}; for (const rt of of('aws_route')) if (rt.values.destination_cidr_block === '0.0.0.0/0') rtDefault[rt.refs.route_table_id] = rt.refs.gateway_id || rt.refs.nat_gateway_id || rt.refs.network_interface_id || rt.refs.instance_id || null;
+    const kindOf = a => { const r = byAddr.get(a); return r ? r.type : null; };
+    for (const v of of('aws_vpc')) node(v, { kind: 'vpc', cidr: v.values.cidr_block, parent: null });
+    for (const sn of of('aws_subnet')) {
+      const target = rtDefault[rtOf[sn.address]] || null, k = kindOf(target);
+      const exposure = k === 'aws_internet_gateway' ? 'public' : k === 'aws_nat_gateway' || k === 'aws_instance' ? 'private' : 'isolated';
+      node(sn, { kind: 'subnet', cidr: sn.values.cidr_block, parent: sn.refs.vpc_id, exposure, az: sn.values.availability_zone });
+      if (target) edges.push({ kind: 'route', from: sn.address, to: target, label: '0.0.0.0/0' });
+    }
+    for (const g of of('aws_internet_gateway')) { node(g, { kind: 'igw', label: 'IGW', parent: g.refs.vpc_id }); edges.push({ kind: 'uplink', from: g.address, to: 'internet' }); }
+    for (const n of of('aws_nat_gateway')) {
+      const vpc = vpcOfSubnet(n.refs.subnet_id);
+      node(n, { kind: 'nat', parent: vpc, subnet: n.refs.subnet_id, public_ip: null });
+      const igw = of('aws_internet_gateway').find(g => g.refs.vpc_id === vpc); if (igw) edges.push({ kind: 'uplink', from: n.address, to: igw.address });
+    }
+    const byName = {};
+    const sgHolders = {}; // sg address -> instance addresses
+    for (const i of of('aws_instance')) {
+      node(i, { kind: 'instance', parent: i.refs.subnet_id, role: roles[label(i)] || null, type: i.values.instance_type || null, state: null, private_ip: null, public_ip: null });
+      byName[label(i)] = i.address;
+      for (const sg of i.refs.vpc_security_group_ids || []) (sgHolders[sg] = sgHolders[sg] || []).push(i.address);
+    }
+    for (const rule of of('aws_vpc_security_group_ingress_rule')) {
+      const v = rule.values, src = v.cidr_ipv4 || rule.refs.referenced_security_group_id || null; if (!src) continue;
+      const lbl = v.ip_protocol === '-1' ? 'all' : v.ip_protocol + '/' + (v.from_port === v.to_port ? v.from_port : v.from_port + '-' + v.to_port);
+      for (const inst of sgHolders[rule.refs.security_group_id] || []) edges.push({ kind: 'allow', from: src, to: inst, label: lbl });
+    }
+    for (const e of of('aws_eip')) {
+      const nat = of('aws_nat_gateway').find(n => n.refs.allocation_id === e.address);
+      node(e, { kind: 'eip', label: null, attached_to: e.refs.instance || (nat ? nat.address : null) });
+    }
+    const natOf = instAddr => { const i = byAddr.get(instAddr); const vpc = i ? vpcOfSubnet(i.refs.subnet_id) : null; return nodes.find(n => n.kind === 'nat' && n.parent === vpc) || null; };
+    const resolve = (name, what) => { if (name === 'internet') return 'internet'; if (byName[name]) return byName[name]; unknown.push({ kind: what, label: name, reason: 'no planned instance named ' + name }); return null; };
+    for (const f of (decl && decl.flows) || []) {
+      const from = resolve(f.from, 'flow'), to = resolve(f.to, 'flow'); if (!from || !to) continue;
+      const via = []; let bad = null;
+      for (const v of f.via || []) { if (v === 'internet') via.push('internet'); else if (v === 'nat') { const n = natOf(from); if (n) via.push(n.id); else bad = 'no NAT gateway planned in the VPC of ' + f.from; } else via.push(v); }
+      if (bad) { unknown.push({ kind: 'flow', label: f.from + ' → ' + f.to, reason: bad }); continue; }
+      edges.push({ kind: 'flow', from, to, via, label: f.label, declared: true });
+    }
+    for (const b of (decl && decl.blocked) || []) { const from = resolve(b.from, 'blocked pair'), to = resolve(b.to, 'blocked pair'); if (from && to) edges.push({ kind: 'blocked', from, to, label: b.label || 'blocked', declared: true }); }
+    return { nodes, edges, enrolment: {}, unknown };
+  }
+  const PLAN_ERROR = 'tofu plan exited 1: Error: Reference to undeclared input variable\n\n  on terraform/main.tf line 47, in resource "aws_key_pair" "lab":\n  47:   public_key = var.ssh_public_key\n\nAn input variable with the name "ssh_public_key" has not been declared. This variable can be declared with a variable "ssh_public_key" {} block.';
+  const plannedAt = { t: iso(2 * MIN + 20000) };
   function topologyFor(ucId, refresh) {
     const uc = usecases[ucId];
     const decl = MANIFEST_TOPO[ucId] || null;
     const base = { generated_at: inv.generated_at, usecase: ucId, provider: uc.provider, region: uc.provider === 'aws' ? 'eu-central-1' : null, nodes: [], edges: [], enrolment: {}, unknown: [], declared: decl };
     if (uc.provider !== 'aws') return Object.assign(base, { reason: 'Inventory is not built for ' + uc.provider + ' yet, so there is nothing to draw from' });
-    if (!connected.has('aws')) return Object.assign(base, { reason: 'Amazon Web Services is not connected' });
-    if (uc.state === 'off' || (ucId === 'zpa-private-service-edge' && PARAMS.get('topo') === 'off')) return Object.assign(base, { reason: 'The use case is off — nothing tagged ' + 'Project=' + uc.tags.Project + ' is running in eu-central-1' });
+    if (!connected.has('aws')) return Object.assign(base, { reason: 'Connect Amazon Web Services to plan ' + uc.name + '; until then only the manifest\u2019s declared roles and flows can be drawn' });
+    if (uc.state === 'off' || uc.state === 'error' && !uc.resources) {
+      // v1.4: off means "what ON deploys" — the graph comes from a plan, not the inventory
+      if (refresh) plannedAt.t = iso(0);
+      const planBase = Object.assign(base, { register: 'planned', generated_at: plannedAt.t });
+      delete planBase.declared;
+      if (ucId === 'zpa-private-service-edge' && TOPO_MODE === 'planfail') return Object.assign(planBase, { reason: 'The plan failed, so there is nothing to draw', plan: { generated_at: plannedAt.t, resources: 0, error: PLAN_ERROR } });
+      const plan = PLANS[ucId];
+      if (!plan) return Object.assign(planBase, { reason: 'The plan creates nothing for this use case', plan: { generated_at: plannedAt.t, resources: 0 } });
+      return Object.assign(planBase, planGraph(plan, decl), { plan: { generated_at: plannedAt.t, resources: plan.length } });
+    }
     if (refresh) inv = inventory(true);
     const r = inv.regions.find(x => x.region === 'eu-central-1');
     const project = uc.tags.Project;
@@ -3490,7 +3787,9 @@ SB.mock = (function () {
     for (const b of (decl && decl.blocked) || []) { const from = resolve(b.from, 'blocked pair'), to = resolve(b.to, 'blocked pair'); if (from && to) edges.push({ kind: 'blocked', from, to, label: b.label || 'blocked', declared: true }); }
     const enrolment = {};
     for (const [k, v] of Object.entries(uc.status || {})) { if (!v || typeof v !== 'object' || !('status' in v)) continue; const id = byName['zpa-lab-' + k.replace(/_/g, '-')]; if (id) enrolment[id] = { authenticated: v.status === 'ZPN_STATUS_AUTHENTICATED', label: k === 'pse' ? 'Private Service Edge' : 'App Connector' }; }
-    return Object.assign(base, { generated_at: inv.generated_at, nodes, edges, enrolment, unknown });
+    for (const n of nodes) { const src = sourceByName(n.kind, n.kind === 'eip' ? (n.detail && n.detail.name) : n.kind === 'igw' ? null : n.label); if (src) n.source = src; }
+    delete base.declared;
+    return Object.assign(base, { register: 'deployed', generated_at: inv.generated_at, nodes, edges, enrolment, unknown });
   }
 
 
@@ -3563,9 +3862,9 @@ shared with anything else. See the [lab repository](https://github.com/nilsujma-
     'zpa-private-service-edge': {
       id: 'zpa-private-service-edge', name: 'ZPA Private Service Edge lab', provider: 'aws',
       summary: 'A Private Service Edge in an isolated VPC, plus a segmented client/server VPC.',
-      state: 'on', resources: 5, cost_monthly: 284.89, description: PSE_DESC, procedure: PROC_PSE,
+      state: TOPO_MODE === 'planned' || TOPO_MODE === 'planfail' ? 'off' : 'on', resources: TOPO_MODE === 'planned' || TOPO_MODE === 'planfail' ? 0 : 5, cost_monthly: TOPO_MODE === 'planned' || TOPO_MODE === 'planfail' ? 0 : 284.89, description: PSE_DESC, procedure: PROC_PSE,
       source: { git: 'https://github.com/nilsujma-dev/zs-zpa-private-service-edge-lab.git', ref: 'main', commit: '8c1f4e2a9b3d7c6e5f4a3b2c1d0e9f8a7b6c5d4e' },
-      status: { pse: { enrolled: true, status: 'ZPN_STATUS_AUTHENTICATED', version: '25.62.1' }, connector: { status: 'ZPN_STATUS_AUTHENTICATED' }, priv_connector: { status: PARAMS.get('enrol') === 'partial' ? 'ZPN_STATUS_DISCONNECTED' : 'ZPN_STATUS_AUTHENTICATED' }, client: { app_segment: 'zpa-lab-server', reachable: true }, checked_at: iso(40000) },
+      status: TOPO_MODE === 'planned' || TOPO_MODE === 'planfail' ? null : { pse: { enrolled: true, status: 'ZPN_STATUS_AUTHENTICATED', version: '25.62.1' }, connector: { status: 'ZPN_STATUS_AUTHENTICATED' }, priv_connector: { status: PARAMS.get('enrol') === 'partial' ? 'ZPN_STATUS_DISCONNECTED' : 'ZPN_STATUS_AUTHENTICATED' }, client: { app_segment: 'zpa-lab-server', reachable: true }, checked_at: iso(40000) },
       runs: [], tags: { Project: 'zpa-pse-lab' },
     },
     'zpa-branch-connector-pair': {
@@ -3671,9 +3970,16 @@ shared with anything else. See the [lab repository](https://github.com/nilsujma-
     job.steps.forEach((s, i) => { if (s.started) { s.started = iso(endedAgo + (job.steps.length - i) * 40000); s.ended = iso(endedAgo + (job.steps.length - i - 1) * 40000 + 2000); } });
     return job;
   }
-  backfill('zpa-private-service-edge', 'off', 'succeeded', 9 * D);
-  backfill('zpa-private-service-edge', 'on', 'succeeded', 3 * D + 2 * H);
-  usecases['zpa-private-service-edge'].state = 'on'; usecases['zpa-private-service-edge'].resources = 5;
+  if (TOPO_MODE === 'planned' || TOPO_MODE === 'planfail') {
+    // the lab was on, then switched off two days ago: the drawing must now come from a plan
+    backfill('zpa-private-service-edge', 'on', 'succeeded', 9 * D);
+    backfill('zpa-private-service-edge', 'off', 'succeeded', 2 * D + 5 * H);
+    usecases['zpa-private-service-edge'].state = 'off'; usecases['zpa-private-service-edge'].resources = 0; usecases['zpa-private-service-edge'].status = null;
+  } else {
+    backfill('zpa-private-service-edge', 'off', 'succeeded', 9 * D);
+    backfill('zpa-private-service-edge', 'on', 'succeeded', 3 * D + 2 * H);
+    usecases['zpa-private-service-edge'].state = 'on'; usecases['zpa-private-service-edge'].resources = 5;
+  }
   backfill('zia-cloud-connector-sandbox', 'off', 'succeeded', 12 * D);
   usecases['zia-cloud-connector-sandbox'].state = 'off'; usecases['zia-cloud-connector-sandbox'].resources = 0;
   backfill('ot-edge-relay', 'on', 'failed', 1 * H + 7 * MIN, 2);
@@ -3739,55 +4045,396 @@ provider "aws" {
 }
 
 locals {
-  pse_cidr = "10.91.0.0/16"
-  app_cidr = "10.90.0.0/16"
-  name     = "zpa-lab"
+  name = "zpa-lab"
 }
 
-/* Isolated VPC for the Private Service Edge */
-resource "aws_vpc" "pse" {
-  cidr_block           = local.pse_cidr
-  enable_dns_hostnames = true
-  tags                 = { Name = "\${local.name}-pse-vpc" }
+data "aws_ami" "zpa_pse" {
+  most_recent = true
+  owners      = ["aws-marketplace"]
+  filter { name = "name", values = ["zpa-private-service-edge-el9-*"] }
 }
 
-resource "aws_vpc" "app" {
-  cidr_block           = local.app_cidr
-  enable_dns_hostnames = true
-  tags                 = { Name = "\${local.name}-app-vpc" }
+data "aws_ami" "zpa_connector" {
+  most_recent = true
+  owners      = ["aws-marketplace"]
+  filter { name = "name", values = ["zpa-connector-el9-*"] }
 }
 
-resource "aws_eip" "pse" {
-  domain = "vpc"
-  tags   = { Name = "\${local.name}-pse" }
+data "aws_ami" "al2023" {
+  most_recent = true
+  owners      = ["amazon"]
+  filter { name = "name", values = ["al2023-ami-2023.*-x86_64"] }
 }
 
+data "aws_ami" "windows" {
+  most_recent = true
+  owners      = ["amazon"]
+  filter { name = "name", values = [var.windows_ami_name] }
+}
+
+resource "aws_key_pair" "lab" {
+  key_name   = "\${local.name}"
+  public_key = var.ssh_public_key
+}
+
+/* Every node reads its own provisioning key from SSM at boot through this role */
+resource "aws_iam_role" "zpa" {
+  name               = "\${local.name}-node"
+  assume_role_policy = data.aws_iam_policy_document.ec2_assume.json
+}
+
+resource "aws_iam_role_policy" "ssm_read" {
+  name = "\${local.name}-ssm-read"
+  role = aws_iam_role.zpa.id
+  policy = jsonencode({
+    Version   = "2012-10-17"
+    Statement = [{ Effect = "Allow", Action = ["ssm:GetParameter"], Resource = "arn:aws:ssm:*:*:parameter/zpa-lab/*" }]
+  })
+}
+
+resource "aws_iam_instance_profile" "zpa" {
+  name = "\${local.name}-node"
+  role = aws_iam_role.zpa.name
+}
+
+/* VPC A: the Private Service Edge and its local App Connector, one public subnet */
 resource "aws_instance" "pse" {
-  ami                    = data.aws_ami.al2023.id
+  ami                    = data.aws_ami.zpa_pse.id
   instance_type          = "m5.large"
-  subnet_id              = aws_subnet.pse_public.id
+  subnet_id              = aws_subnet.public.id
   vpc_security_group_ids = [aws_security_group.pse.id]
   iam_instance_profile   = aws_iam_instance_profile.zpa.name
+  key_name               = aws_key_pair.lab.key_name
   user_data              = templatefile("\${path.module}/userdata/pse.sh.tftpl", { ssm_key = "/zpa-lab/pse/key" })
   root_block_device { volume_size = 80, volume_type = "gp3" }
   tags = { Name = "\${local.name}-pse", Role = "pse" }
 }
 
 resource "aws_instance" "connector" {
-  count                  = 2
-  ami                    = data.aws_ami.al2023.id
+  ami                    = data.aws_ami.zpa_connector.id
   instance_type          = "t3.medium"
-  subnet_id              = aws_subnet.app_private.id
+  subnet_id              = aws_subnet.public.id
   vpc_security_group_ids = [aws_security_group.connector.id]
   iam_instance_profile   = aws_iam_instance_profile.zpa.name
+  key_name               = aws_key_pair.lab.key_name
   user_data              = templatefile("\${path.module}/userdata/connector.sh.tftpl", { ssm_key = "/zpa-lab/connector/key" })
-  tags = { Name = "\${local.name}-connector-\${count.index == 0 ? "a" : "b"}", Role = "app-connector" }
+  root_block_device { volume_size = 80, volume_type = "gp3" }
+  tags = { Name = "\${local.name}-connector", Role = "app-connector" }
+}
+
+/* VPC B, PRIV zone: the second App Connector and the protected application */
+resource "aws_instance" "priv_connector" {
+  ami                    = data.aws_ami.zpa_connector.id
+  instance_type          = "t3.medium"
+  subnet_id              = aws_subnet.priv.id
+  vpc_security_group_ids = [aws_security_group.priv_connector.id]
+  iam_instance_profile   = aws_iam_instance_profile.zpa.name
+  key_name               = aws_key_pair.lab.key_name
+  user_data              = templatefile("\${path.module}/userdata/connector.sh.tftpl", { ssm_key = "/zpa-lab/priv-connector/key" })
+  root_block_device { volume_size = 80, volume_type = "gp3" }
+  tags = { Name = "\${local.name}-priv-connector", Role = "app-connector" }
   depends_on = [aws_nat_gateway.app]
+}
+
+resource "aws_instance" "server" {
+  ami                    = data.aws_ami.al2023.id
+  instance_type          = "t3.micro"
+  subnet_id              = aws_subnet.priv.id
+  vpc_security_group_ids = [aws_security_group.server.id]
+  key_name               = aws_key_pair.lab.key_name
+  user_data              = file("\${path.module}/userdata/server.sh")
+  tags = { Name = "\${local.name}-server", Role = "app" }
+}
+
+/* VPC B, MCU zone: the Windows client that only ever reaches the app through ZPA */
+resource "aws_instance" "mcu_client" {
+  ami                    = data.aws_ami.windows.id
+  instance_type          = "t3.medium"
+  subnet_id              = aws_subnet.mcu.id
+  vpc_security_group_ids = [aws_security_group.client.id]
+  key_name               = aws_key_pair.lab.key_name
+  get_password_data      = true
+  root_block_device { volume_size = 50, volume_type = "gp3" }
+  tags = { Name = "\${local.name}-mcu-client", Role = "client" }
+  depends_on = [aws_nat_gateway.app]
+}
+`,
+    'terraform/network.tf': `/* Two VPCs, deliberately not peered: the only path between them is the public internet */
+resource "aws_vpc" "pse" {
+  cidr_block           = "10.91.0.0/16"
+  enable_dns_hostnames = true
+  tags                 = { Name = "\${local.name}-vpc-a" }
+}
+
+resource "aws_vpc" "app" {
+  cidr_block           = "10.90.0.0/16"
+  enable_dns_hostnames = true
+  tags                 = { Name = "\${local.name}-vpc-b" }
+}
+
+resource "aws_subnet" "public" {
+  vpc_id                  = aws_vpc.pse.id
+  cidr_block              = "10.91.10.0/24"
+  availability_zone       = "\${var.region}a"
+  map_public_ip_on_launch = true
+  tags                    = { Name = "\${local.name}-public" }
+}
+
+resource "aws_subnet" "b_public" {
+  vpc_id                  = aws_vpc.app.id
+  cidr_block              = "10.90.0.0/24"
+  availability_zone       = "\${var.region}a"
+  map_public_ip_on_launch = true
+  tags                    = { Name = "\${local.name}-b-public" }
+}
+
+resource "aws_subnet" "priv" {
+  vpc_id            = aws_vpc.app.id
+  cidr_block        = "10.90.20.0/24"
+  availability_zone = "\${var.region}a"
+  tags              = { Name = "\${local.name}-priv" }
+}
+
+resource "aws_subnet" "mcu" {
+  vpc_id            = aws_vpc.app.id
+  cidr_block        = "10.90.30.0/24"
+  availability_zone = "\${var.region}a"
+  tags              = { Name = "\${local.name}-mcu" }
+}
+
+resource "aws_internet_gateway" "pse" {
+  vpc_id = aws_vpc.pse.id
+  tags   = { Name = "\${local.name}-igw-a" }
+}
+
+resource "aws_internet_gateway" "app" {
+  vpc_id = aws_vpc.app.id
+  tags   = { Name = "\${local.name}-igw-b" }
+}
+
+/* The Service Edge keeps one stable address; the ZPA cloud pins it */
+resource "aws_eip" "pse" {
+  domain   = "vpc"
+  instance = aws_instance.pse.id
+  tags     = { Name = "\${local.name}-pse-eip" }
+}
+
+resource "aws_eip" "nat" {
+  domain = "vpc"
+  tags   = { Name = "\${local.name}-nat-eip" }
+}
+
+resource "aws_nat_gateway" "app" {
+  subnet_id         = aws_subnet.b_public.id
+  allocation_id     = aws_eip.nat.id
+  connectivity_type = "public"
+  tags              = { Name = "\${local.name}-nat" }
+  depends_on        = [aws_internet_gateway.app]
+}
+
+resource "aws_route_table" "pse_public" {
+  vpc_id = aws_vpc.pse.id
+  tags   = { Name = "\${local.name}-public-rt" }
+}
+
+resource "aws_route_table" "app_public" {
+  vpc_id = aws_vpc.app.id
+  tags   = { Name = "\${local.name}-b-public-rt" }
+}
+
+resource "aws_route_table" "app_private" {
+  vpc_id = aws_vpc.app.id
+  tags   = { Name = "\${local.name}-b-private-rt" }
+}
+
+resource "aws_route" "pse_default" {
+  route_table_id         = aws_route_table.pse_public.id
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id             = aws_internet_gateway.pse.id
+}
+
+resource "aws_route" "app_public_default" {
+  route_table_id         = aws_route_table.app_public.id
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id             = aws_internet_gateway.app.id
+}
+
+resource "aws_route" "app_private_default" {
+  route_table_id         = aws_route_table.app_private.id
+  destination_cidr_block = "0.0.0.0/0"
+  nat_gateway_id         = aws_nat_gateway.app.id
+}
+
+resource "aws_route_table_association" "pse_public" {
+  subnet_id      = aws_subnet.public.id
+  route_table_id = aws_route_table.pse_public.id
+}
+
+resource "aws_route_table_association" "app_public" {
+  subnet_id      = aws_subnet.b_public.id
+  route_table_id = aws_route_table.app_public.id
+}
+
+resource "aws_route_table_association" "app_private" {
+  subnet_id      = aws_subnet.priv.id
+  route_table_id = aws_route_table.app_private.id
+}
+
+resource "aws_route_table_association" "app_client" {
+  subnet_id      = aws_subnet.mcu.id
+  route_table_id = aws_route_table.app_private.id
+}
+
+/* Belt and braces: the MCU zone may never talk to the PRIV zone directly */
+resource "aws_network_acl" "app" {
+  vpc_id     = aws_vpc.app.id
+  subnet_ids = [aws_subnet.mcu.id]
+  ingress { rule_no = 100, protocol = "-1", action = "deny", cidr_block = "10.90.20.0/24", from_port = 0, to_port = 0 }
+  ingress { rule_no = 200, protocol = "-1", action = "allow", cidr_block = "0.0.0.0/0", from_port = 0, to_port = 0 }
+  egress  { rule_no = 100, protocol = "-1", action = "deny", cidr_block = "10.90.20.0/24", from_port = 0, to_port = 0 }
+  egress  { rule_no = 200, protocol = "-1", action = "allow", cidr_block = "0.0.0.0/0", from_port = 0, to_port = 0 }
+  tags = { Name = "\${local.name}-mcu-nacl" }
+}
+`,
+    'terraform/security.tf': `resource "aws_security_group" "pse" {
+  name        = "\${local.name}-pse"
+  description = "Private Service Edge: client TLS in, SSH from inside the VPC"
+  vpc_id      = aws_vpc.pse.id
+  tags        = { Name = "\${local.name}-pse" }
+}
+
+resource "aws_security_group" "connector" {
+  name        = "\${local.name}-connector"
+  description = "App Connector: outbound only, SSH from inside the VPC"
+  vpc_id      = aws_vpc.pse.id
+  tags        = { Name = "\${local.name}-connector" }
+}
+
+resource "aws_security_group" "priv_connector" {
+  name        = "\${local.name}-priv-connector"
+  description = "PRIV App Connector: outbound only"
+  vpc_id      = aws_vpc.app.id
+  tags        = { Name = "\${local.name}-priv-connector" }
+}
+
+resource "aws_security_group" "server" {
+  name        = "\${local.name}-server"
+  description = "Protected app: 8080 from the PRIV connector only"
+  vpc_id      = aws_vpc.app.id
+  tags        = { Name = "\${local.name}-server" }
+}
+
+resource "aws_security_group" "client" {
+  name        = "\${local.name}-mcu-client"
+  description = "Windows client: RDP for the demo operator"
+  vpc_id      = aws_vpc.app.id
+  tags        = { Name = "\${local.name}-mcu-client" }
+}
+
+/* Service Edge: Z-Tunnel on 443, both transports, from anywhere */
+resource "aws_vpc_security_group_ingress_rule" "pse_tls_tcp" {
+  security_group_id = aws_security_group.pse.id
+  ip_protocol       = "tcp"
+  from_port         = 443
+  to_port           = 443
+  cidr_ipv4         = "0.0.0.0/0"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "pse_tls_udp" {
+  security_group_id = aws_security_group.pse.id
+  ip_protocol       = "udp"
+  from_port         = 443
+  to_port           = 443
+  cidr_ipv4         = "0.0.0.0/0"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "pse_ssh" {
+  security_group_id = aws_security_group.pse.id
+  ip_protocol       = "tcp"
+  from_port         = 22
+  to_port           = 22
+  cidr_ipv4         = aws_vpc.pse.cidr_block
+}
+
+resource "aws_vpc_security_group_ingress_rule" "connector_ssh" {
+  security_group_id = aws_security_group.connector.id
+  ip_protocol       = "tcp"
+  from_port         = 22
+  to_port           = 22
+  cidr_ipv4         = aws_vpc.pse.cidr_block
+}
+
+resource "aws_vpc_security_group_ingress_rule" "priv_connector_ssh" {
+  security_group_id = aws_security_group.priv_connector.id
+  ip_protocol       = "tcp"
+  from_port         = 22
+  to_port           = 22
+  cidr_ipv4         = aws_vpc.app.cidr_block
+}
+
+/* The app answers the PRIV connector and nothing else */
+resource "aws_vpc_security_group_ingress_rule" "server_app" {
+  security_group_id            = aws_security_group.server.id
+  ip_protocol                  = "tcp"
+  from_port                    = 8080
+  to_port                      = 8080
+  referenced_security_group_id = aws_security_group.priv_connector.id
+}
+
+resource "aws_vpc_security_group_ingress_rule" "server_ssh" {
+  security_group_id = aws_security_group.server.id
+  ip_protocol       = "tcp"
+  from_port         = 22
+  to_port           = 22
+  cidr_ipv4         = aws_subnet.priv.cidr_block
+}
+
+resource "aws_vpc_security_group_ingress_rule" "client_rdp" {
+  security_group_id = aws_security_group.client.id
+  ip_protocol       = "tcp"
+  from_port         = 3389
+  to_port           = 3389
+  cidr_ipv4         = var.allowed_rdp_cidr
+}
+
+resource "aws_vpc_security_group_egress_rule" "pse" {
+  security_group_id = aws_security_group.pse.id
+  ip_protocol       = "-1"
+  cidr_ipv4         = "0.0.0.0/0"
+}
+
+resource "aws_vpc_security_group_egress_rule" "connector" {
+  security_group_id = aws_security_group.connector.id
+  ip_protocol       = "-1"
+  cidr_ipv4         = "0.0.0.0/0"
+}
+
+resource "aws_vpc_security_group_egress_rule" "priv_connector" {
+  security_group_id = aws_security_group.priv_connector.id
+  ip_protocol       = "-1"
+  cidr_ipv4         = "0.0.0.0/0"
+}
+
+resource "aws_vpc_security_group_egress_rule" "server" {
+  security_group_id = aws_security_group.server.id
+  ip_protocol       = "-1"
+  cidr_ipv4         = "0.0.0.0/0"
+}
+
+resource "aws_vpc_security_group_egress_rule" "client" {
+  security_group_id = aws_security_group.client.id
+  ip_protocol       = "-1"
+  cidr_ipv4         = "0.0.0.0/0"
 }
 `,
     'terraform/variables.tf': `variable "region" {
   type    = string
   default = "eu-central-1"
+}
+
+variable "ssh_public_key" {
+  description = "Public half of the lab key pair; the private half never leaves the operator's machine."
+  type        = string
 }
 
 variable "allowed_rdp_cidr" {
@@ -3806,11 +4453,11 @@ variable "windows_ami_name" {
 }
 
 output "connector_private_ips" {
-  value = aws_instance.connector[*].private_ip
+  value = { a = aws_instance.connector.private_ip, priv = aws_instance.priv_connector.private_ip }
 }
 
-output "nginx_private_ip" {
-  value = aws_instance.nginx.private_ip
+output "server_private_ip" {
+  value = aws_instance.server.private_ip
 }
 `,
     'scripts/zpa_create.py': `#!/usr/bin/env python3
@@ -4072,24 +4719,8 @@ tofu -chdir=terraform apply
   }
 
   /* ---- outline fixtures: a real-looking plan per use case and action ---- */
-  const PSE_ADDRS = [
-    'aws_vpc.pse', 'aws_vpc.app',
-    'aws_subnet.public', 'aws_subnet.b_public', 'aws_subnet.priv', 'aws_subnet.mcu',
-    'aws_internet_gateway.pse', 'aws_internet_gateway.app',
-    'aws_nat_gateway.app',
-    'aws_eip.pse', 'aws_eip.nat',
-    'aws_route_table.pse_public', 'aws_route_table.app_public', 'aws_route_table.app_private', 'aws_route_table.app_client',
-    'aws_route.pse_default', 'aws_route.app_public_default', 'aws_route.app_private_default', 'aws_route.app_client_default',
-    'aws_route_table_association.pse_public', 'aws_route_table_association.app_public', 'aws_route_table_association.app_private', 'aws_route_table_association.app_server', 'aws_route_table_association.app_client',
-    'aws_security_group.pse', 'aws_security_group.connector', 'aws_security_group.nginx', 'aws_security_group.client',
-    'aws_vpc_security_group_ingress_rule.pse_tls_tcp', 'aws_vpc_security_group_ingress_rule.pse_tls_udp', 'aws_vpc_security_group_ingress_rule.pse_ssh', 'aws_vpc_security_group_ingress_rule.connector_ssh', 'aws_vpc_security_group_ingress_rule.nginx_http', 'aws_vpc_security_group_ingress_rule.nginx_https',
-    'aws_vpc_security_group_egress_rule.pse', 'aws_vpc_security_group_egress_rule.connector', 'aws_vpc_security_group_egress_rule.nginx', 'aws_vpc_security_group_egress_rule.client',
-    'aws_instance.pse', 'aws_instance.connector', 'aws_instance.priv_connector', 'aws_instance.server', 'aws_instance.mcu_client',
-    'aws_iam_role.zpa', 'aws_iam_instance_profile.zpa', 'aws_iam_role_policy.ssm_read',
-    'aws_key_pair.lab',
-    'aws_network_acl.app',
-  ];
-  const CC_ADDRS = ['aws_vpc.cc', 'aws_subnet.cc_public', 'aws_subnet.workload', 'aws_internet_gateway.cc', 'aws_route_table.cc_public', 'aws_route_table.workload', 'aws_route.cc_default', 'aws_route.workload_via_cc', 'aws_route_table_association.cc_public', 'aws_route_table_association.workload', 'aws_security_group.cc', 'aws_security_group.workload', 'aws_instance.cc', 'aws_instance.workload'];
+  const PSE_ADDRS = PSE_PLAN.map(r => r.address);
+  const CC_ADDRS = CC_PLAN.map(r => r.address);
   const entry = a => { const m = /^([a-z0-9_]+)\.([^\[]+)(\[.*\])?$/.exec(a); return { address: a, type: m[1], name: m[2], module: null }; };
   const EFFECTS = {
     'zpa-private-service-edge': {
@@ -4122,7 +4753,7 @@ tofu -chdir=terraform apply
     const uc = usecases[ucId];
     const eff = (EFFECTS[ucId] || { on: { creates: [], retains: [] }, off: { destroys: [], retains: [] } })[action];
     const base = { action, plan: null, declared: eff, steps: uc.procedure[action], retained_state: { backend: 's3', bucket: 'zs-lab-tfstate-257394018842', key: 'usecases/' + ucId + '/terraform.tfstate', region: 'eu-central-1' } };
-    if (ucId === 'zpa-private-service-edge') base.plan = action === 'on' ? plan([], [], PSE_ADDRS) : plan([], PSE_ADDRS, []);
+    if (ucId === 'zpa-private-service-edge') { base.plan = uc.state === 'off' ? (action === 'on' ? plan(PSE_ADDRS, [], []) : plan([], [], [])) : (action === 'on' ? plan([], [], PSE_ADDRS) : plan([], PSE_ADDRS, [])); if (uc.state === 'off') base.plan.generated_at = plannedAt.t; }
     else if (ucId === 'zia-cloud-connector-sandbox') base.plan = action === 'on' ? plan(CC_ADDRS, [], []) : plan([], [], []);
     else if (ucId === 'ot-edge-relay') base.plan = { ok: false, generated_at: iso(3000), error: 'tofu plan exited 1: Reference to undeclared input variable: An input variable with the name "relay_host" has not been declared. This variable can be declared with a variable "relay_host" {} block.\n\n  on terraform/main.tf line 41, in resource "aws_instance" "relay":\n  41:   user_data = templatefile("${path.module}/relay.sh.tftpl", { host = var.relay_host })' };
     else if (uc.provider !== 'aws') base.plan = { ok: false, generated_at: iso(1000), error: 'Provider "' + uc.provider + '" is connected for credentials only: capabilities.usecases is false, so no plan can run' };
@@ -4132,7 +4763,8 @@ tofu -chdir=terraform apply
 
   /* ---- scenes: ?scene=checklist&provider=gcp&shown=3&fail=1  ?scene=form&provider=azure&mode=rotate
           ?page=usecases&expand=<id>&code=1&confirm=1  ?region=eu-central-1&inst=<instance id>
-          ?topo=off (PSE drawing in its off state)  ?topo=fail (OT relay drawing errors)  ?enrol=partial (one lamp red)  ?node=<id> (a node selected in the drawing) ---- */
+          ?topo=planned|off (PSE off: the drawing from its plan)  ?topo=planfail  ?topo=disconnected (AWS unplugged: declared fallback)  ?topo=fail (OT relay drawing errors)
+          ?enrol=partial (one lamp red)  ?node=<id> (a node selected in the drawing)  ?src=<node id> (click-through to that node's source) ---- */
   function scene(state) {
     const page = PARAMS.get('page');
     if (page === 'usecases' || page === 'clouds') location.hash = '#/' + page;
@@ -4159,6 +4791,8 @@ tofu -chdir=terraform apply
       await loadDetail(id);
       loadOutline(id, 'on'); loadOutline(id, 'off'); await loadTopology(id);
       if (PARAMS.get('code') === '1') await toggleCode(usecases[id]);
+      const srcNode = PARAMS.get('src'), tg = state.topo[id] && state.topo[id].data;
+      if (srcNode && tg && tg.nodes) { const n = tg.nodes.find(x => x.id === srcNode); if (n) { state.topo[id].sel = { node: n.id }; await openTopoSource(usecases[id], tg, n); } }
       if (PARAMS.get('confirm') === '1') { if (!ucById(id)) await loadUsecases(true); if (ucById(id)) requestFlip(ucById(id)); }
     }
   }
