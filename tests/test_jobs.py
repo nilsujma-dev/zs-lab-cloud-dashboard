@@ -73,11 +73,18 @@ def test_stop_on_first_failure(store: Store, tmp_path: Path) -> None:
 
 def test_one_job_per_usecase(store: Store, tmp_path: Path) -> None:
     runner = JobRunner(store)
-    job_id = runner.start("uc", "on", [StepSpec("sleep", "sleep 1")], cwd=tmp_path, env=_env(), scrubber=Scrubber())
-    with pytest.raises(JobConflict):
-        runner.start("uc", "off", [StepSpec("x", "true")], cwd=tmp_path, env=_env(), scrubber=Scrubber())
-    other = runner.start("other", "on", [StepSpec("x", "true")], cwd=tmp_path, env=_env(), scrubber=Scrubber())
-    assert runner.running_job("uc")["id"] == job_id
+    # The first job blocks on a sentinel the test releases after asserting, so it is provably
+    # still running when the conflict and running_job checks happen (a timed sleep raced them).
+    gate = tmp_path / "release"
+    hold = StepSpec("hold", f'until [ -e "{gate}" ]; do sleep 0.02; done')
+    job_id = runner.start("uc", "on", [hold], cwd=tmp_path, env=_env(), scrubber=Scrubber())
+    try:
+        with pytest.raises(JobConflict):
+            runner.start("uc", "off", [StepSpec("x", "true")], cwd=tmp_path, env=_env(), scrubber=Scrubber())
+        other = runner.start("other", "on", [StepSpec("x", "true")], cwd=tmp_path, env=_env(), scrubber=Scrubber())
+        assert runner.running_job("uc")["id"] == job_id
+    finally:
+        gate.touch()
     _wait(runner, job_id)
     _wait(runner, other)
     assert runner.running_job("uc") is None
