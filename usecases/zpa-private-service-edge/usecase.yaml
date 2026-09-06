@@ -91,7 +91,7 @@ secrets:                                # host-provided; engine maps these in
   - name: Destroy infrastructure
     run: tofu -chdir=terraform destroy -auto-approve -input=false
   - name: Prune stale entries
-    run: python3 scripts/prune.py --phase off --apply
+    run: python3 scripts/prune.py --phase off --apply --max 20
 status:                                 # optional; must print JSON on stdout
   run: python3 scripts/status.py --json
   interval_s: 60
