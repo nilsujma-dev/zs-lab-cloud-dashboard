@@ -104,15 +104,15 @@ secrets:                                # host-provided; engine maps these in
   - name: Wait for CC and connector registration
     run: python3 scripts/wait_registered.py --timeout 1200
   - name: Forward the app segment to ZPA
-    run: python3 scripts/ztw_policy.py
+    run: python3 scripts/ztw_policy.py --allow-unlinked
   - name: Allow the lab CC group to the private app
-    run: python3 scripts/zpa_policy.py
+    run: python3 scripts/zpa_policy.py --allow-unlinked
   - name: ZIA URL and DLP policy
     run: python3 scripts/zia_policy.py
   - name: Verify nothing pre-existing changed
     run: python3 scripts/tenant_verify.py
   - name: Wait for egress and ZPA evidence
-    run: python3 scripts/wait_evidence.py --timeout 600
+    run: python3 scripts/wait_evidence.py --timeout 600 --allow-unlinked
 "off":
   - name: Destroy infrastructure
     run: tofu -chdir=terraform destroy -auto-approve -input=false
